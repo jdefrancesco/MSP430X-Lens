@@ -1,0 +1,42 @@
+# macOS
+.DS_Store
+._*
+
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Python environments and packaging output
+.venv/
+venv/
+env/
+dist/
+*.egg-info/
+
+# Local build and test output
+build/
+
+# Binary Ninja analysis databases
+*.bndb
+*.bndb-shm
+*.bndb-wal
+
+# Editor and local analysis state
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.codeinsight/
+
+# Local environment overrides
+.env
+.env.*
+!.env.example

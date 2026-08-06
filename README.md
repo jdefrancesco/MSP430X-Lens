@@ -118,6 +118,12 @@ erased flash, restart Binary Ninja and reopen the firmware as
 `MSP430F5438 Raw Firmware (MSP430X)` so the split map is present before initial
 analysis.
 
+Small backed code islands between those erased spans are also seeded as
+functions when they have a conservative MSP430 prologue-and-return shape. This
+is done during initial mapped-raw loading and by `Re-run MSP430X analysis` for
+existing mapped or ELF views, including executable segments outside the
+F5438-specific flash range.
+
 Printable, null-terminated ASCII runs in flash are defined as data during
 mapped-view creation. Re-running analysis also removes stale functions that
 start inside those strings or in short zero padding next to them, which prevents
@@ -139,14 +145,14 @@ register label.
 
 ## Test
 
-Run the Binary Ninja-backed tests with `bnpython3`:
+Run all Binary Ninja-backed unit and loader-integration tests:
 
 ```sh
-BN_DISABLE_USER_PLUGINS=1 bnpython3 -m unittest -v \
-  tests.test_msp430x_arch tests.test_msp430f5438_memory_map
+make test
 ```
 
-More test details and known Binary Ninja headless quirks are in
+Generate a deterministic raw image for visual testing with `make fixture`.
+More details, including the guarded `make dev-link` setup, are in
 [docs/TESTING.md](docs/TESTING.md).
 
 ## Known Limitations
@@ -163,4 +169,3 @@ tracked in [docs/CPUX_SIDE_EFFECT_AUDIT.md](docs/CPUX_SIDE_EFFECT_AUDIT.md).
 The plugin is released under the [MIT License](LICENSE). Bundled Texas
 Instruments headers retain their BSD 3-Clause terms; see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-

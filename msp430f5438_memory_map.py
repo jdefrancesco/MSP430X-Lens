@@ -141,6 +141,8 @@ READ_WRITE_DATA = (
 
 ERASED_FLASH_MIN_RUN = 32
 ERASED_FUNCTION_MIN_BYTES = 8
+SPARSE_CODE_ISLAND_RETURN_SCAN_BYTES = 0x1000
+EXECUTABLE_SEGMENT_SCAN_MAX_BYTES = 0x200000
 ASCII_STRING_MIN_LEN = 5
 ASCII_STRING_PADDING_MAX_LEN = 4
 ASCII_STRING_CLUSTER_MAX_GAP = 0x80
@@ -633,6 +635,28 @@ def _erased_spans(data: bytes, min_run: int = ERASED_FLASH_MIN_RUN) -> tuple[Add
     if start is not None and len(data) - start >= min_run:
         spans.append((start, len(data)))
     return tuple(spans)
+
+
+def _backed_island_spans(
+    data: bytes,
+    base: int = 0,
+    min_erased_run: int = ERASED_FLASH_MIN_RUN,
+) -> tuple[AddressSpan, ...]:
+    """Return non-erased islands separated by long runs of erased flash."""
+
+    erased = _erased_spans(data, min_erased_run)
+    if not erased:
+        return ((base, base + len(data)),) if data else ()
+
+    islands = []
+    cursor = 0
+    for erased_start, erased_end in erased:
+        if cursor < erased_start:
+            islands.append((base + cursor, base + erased_start))
+        cursor = erased_end
+    if cursor < len(data):
+        islands.append((base + cursor, base + len(data)))
+    return tuple(islands)
 
 
 def _add_region_chunk(
@@ -2214,6 +2238,129 @@ def _is_backed_code_word(bv: BinaryView, addr: int) -> bool:
     return word not in (0x0000, 0xFFFF)
 
 
+def _looks_like_msp430_function_entry(data: bytes) -> bool:
+    """Recognize conservative compiler function-entry shapes.
+
+    Sparse firmware images often contain one function between long erased
+    ranges.  Binary Ninja's recursive analysis has no edge with which to enter
+    those islands, so a strong entry signature is useful.  Keep this narrow:
+    an arbitrary MSP430 word decodes too easily to be a safe code/data test.
+    """
+
+    if len(data) < 2:
+        return False
+    word = _u16_from_le(data, 0)
+    if _is_ext_word(word):
+        if len(data) < 4:
+            return False
+        word = _u16_from_le(data, 2)
+
+    # PUSH R4-R15 and PUSHM.A/PUSHM.W are the usual saved-register prologues.
+    if (word & 0xFFF0) == 0x1200 and (word & 0xF) >= 4:
+        return True
+    if (word & 0xFF00) in (0x1400, 0x1500) and (word & 0xF) >= 4:
+        return True
+
+    # Frame setup without a saved register: SUB <constant>, SP or MOV SP, Rn.
+    opcode = (word >> 12) & 0xF
+    src_reg = (word >> 8) & 0xF
+    src_mode = (word >> 4) & 0x3
+    dst_reg = word & 0xF
+    if opcode == 0x8 and dst_reg == 1 and (
+        (src_reg == 0 and src_mode == 3) or src_reg in (2, 3)
+    ):
+        return True
+    return (word & 0xFFF0) == 0x4100 and dst_reg >= 4
+
+
+def _looks_like_msp430_function_island(data: bytes) -> bool:
+    """Require both a strong entry and a return inside a small backed island."""
+
+    if len(data) < 4 or not _looks_like_msp430_function_entry(data):
+        return False
+    scan = data[:SPARSE_CODE_ISLAND_RETURN_SCAN_BYTES]
+    # RET (MOV @SP+,PC), RETA (MOVA @SP+,PC), and RETI.  Looking only at
+    # word-aligned positions and requiring a prologue keeps embedded constants
+    # and lookup tables from becoming functions merely because they are backed.
+    return any(
+        _u16_from_le(scan, offset) in (0x4130, 0x0110, 0x1300)
+        for offset in range(2, len(scan) - 1, 2)
+    )
+
+
+def _executable_backed_islands(bv: BinaryView) -> tuple[AddressSpan, ...]:
+    """Find backed islands in every executable segment, including ELF ranges."""
+
+    islands = []
+    seen = set()
+    for segment in getattr(bv, "segments", ()):
+        if not getattr(segment, "executable", False):
+            continue
+        start = getattr(segment, "start", None)
+        end = getattr(segment, "end", None)
+        if start is None or end is None or end <= start:
+            continue
+        backed_length = getattr(segment, "data_length", end - start)
+        try:
+            backed_length = int(backed_length)
+        except (TypeError, ValueError):
+            backed_length = end - start
+        length = min(end - start, max(0, backed_length), EXECUTABLE_SEGMENT_SCAN_MAX_BYTES)
+        if length <= 0:
+            continue
+        key = (start, length)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            data = bytes(bv.read(start, length))
+        except Exception:
+            continue
+        islands.extend(_backed_island_spans(data, start))
+    return tuple(_merge_spans(islands))
+
+
+def _seed_sparse_code_island_functions(bv: BinaryView, verbose: bool = False) -> int:
+    """Seed unreferenced functions isolated by erased bytes in executable maps."""
+
+    add_function = getattr(bv, "add_function", None)
+    if add_function is None or getattr(bv, "platform", None) is None:
+        return 0
+
+    known_data_spans = _merge_spans((
+        *_flash_ascii_string_cluster_spans(bv),
+        *_flash_numeric_lookup_table_spans(bv),
+        *_flash_address_jump_table_spans(bv),
+        *_flash_cinit_table_spans(bv),
+    ))
+    created = 0
+    for start, end in _executable_backed_islands(bv):
+        length = end - start
+        if (
+            start & 1
+            or length < 4
+            or _has_function_at(bv, start)
+            or _has_data_var_at(bv, start)
+            or _addr_in_spans(start, known_data_spans)
+        ):
+            continue
+        try:
+            data = bytes(bv.read(start, length))
+        except Exception:
+            continue
+        if not _looks_like_msp430_function_island(data):
+            continue
+        try:
+            add_function(start)
+            created += 1
+        except Exception as exc:
+            log_warn(f"Could not add sparse code-island function at {start:#x}: {exc}")
+
+    if verbose and created:
+        print(f"Seeded {created} unreferenced MSP430X sparse code-island function(s).")
+    return created
+
+
 def _seed_address_jump_table_target_functions(bv: BinaryView, verbose: bool = False) -> int:
     """Create functions for backed jump-table targets not classified as data."""
 
@@ -2678,6 +2825,7 @@ def _refresh_msp430x_analysis(
     _define_numeric_lookup_table_data_vars(bv, verbose=verbose)
     _define_address_jump_table_data_vars(bv, verbose=verbose)
     _define_cinit_table_data_vars(bv, verbose=verbose)
+    _seed_sparse_code_island_functions(bv, verbose=verbose)
     _seed_address_jump_table_target_functions(bv, verbose=verbose)
     _seed_address_jump_table_indirect_branches(bv, verbose=verbose)
 
@@ -2801,6 +2949,7 @@ def apply_msp430f5438_memory_map(
     _define_numeric_lookup_table_data_vars(bv, verbose=verbose)
     _define_address_jump_table_data_vars(bv, verbose=verbose)
     _define_cinit_table_data_vars(bv, verbose=verbose)
+    _seed_sparse_code_island_functions(bv, verbose=verbose)
     _seed_address_jump_table_target_functions(bv, verbose=verbose)
     _seed_address_jump_table_indirect_branches(bv, verbose=verbose)
 
@@ -2960,6 +3109,7 @@ class MSP430F5438BinaryView(BinaryView):
         _define_numeric_lookup_table_data_vars(self, auto_defined=True, verbose=False)
         _define_address_jump_table_data_vars(self, auto_defined=True, verbose=False)
         _define_cinit_table_data_vars(self, auto_defined=True, verbose=False)
+        _seed_sparse_code_island_functions(self, verbose=False)
         _seed_address_jump_table_target_functions(self, verbose=False)
         _seed_address_jump_table_indirect_branches(self, verbose=False)
         reset = _read_u16(self, spec.reset_vector)
