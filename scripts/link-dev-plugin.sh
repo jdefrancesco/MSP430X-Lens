@@ -11,7 +11,7 @@ else
     plugin_dir="$HOME/.binaryninja/plugins"
 fi
 
-target="$plugin_dir/mspx430_lens"
+target="$plugin_dir/msp430x_lens"
 if [ -L "$target" ]; then
     linked_path=$(readlink "$target")
     if [ "$linked_path" = "$repo_dir" ]; then

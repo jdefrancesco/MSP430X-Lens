@@ -1,21 +1,26 @@
-# MSPX430 Lens
+# MSP430X Lens
 
-MSPX430-Lens adds MSP430X firmware support to Binary Ninja, with a focus on the
-MSP430F5438/MSP430F5438A memory map. It makes raw MSP430X firmware usable
-without console bootstrap scripts. If you happen to have an ELF of firmware
-that will load as well and possibly provide more symbols and such.  
+MSP430X Lens adds MSP430X firmware support to Binary Ninja, with a focus on the
+MSP430F5438/MSP430F5438A MCUs. It was written with the ability to ingest raw firmware
+images; however having an ELF will make analysis much easier. MSP430X Lens's
+core features include:
 
-It provides:
+- `MSP430X` ISA support; lifting the MSP430/MSP430X CPUX forms for better analysis (duh)..
+- Ability to map raw firmware MSP430F5438/F5438A images. TI-TXT/ELF firmware is supported if available.
+- Vector-table seeding, Flash/RAM/Peripheral sections, and TI header labels.
+- Collapsing and simplifying the decompilation output without all the
+artifacts that Ghidra generally leaves.
+- Pure Python. No external dependencies used making porting and installation easier.
 
-- an `msp430x` architecture with LLIL lifting for MSP430/MSP430X CPUX forms,
-- a mapped raw-firmware BinaryView for MSP430F5438/F5438A images,
-- vector-table seeding, flash/RAM/peripheral sections, and TI header labels,
-- diagnostics for remaining CPUX fallback instructions and analysis refreshes.
+## Agentic Augmented
 
-The architecture handles the MSP430X CPUX extension's 20-bit registers and
-address space without flattening address-word operations into ordinary 16-bit
-MSP430 operations. The bundled raw-firmware view is currently specific to the
-MSP430F5438 and MSP430F5438A device maps.
+The beginning of this project (i.e lifting) was written by hand to ensure the correct
+semantics were being preserved. Since the core of this plugin has been constructed;
+agentic programming is utilized. Agentic code should still be read in full,
+keeping technical debt to a minimum. If you would like to contribute to this plugin
+please read the [CONTRIBUTION](./CONTRIBUTION.md). It contains guidance on how
+agentic code should be utilized if you choose to use it.
+
 
 ## Install
 
@@ -24,15 +29,15 @@ Once the plugin is listed in the Binary Ninja Plugin Manager, install it from
 BinaryView plugins are loaded at startup.
 
 For a manual development install, clone the repository and copy or symlink it
-as a directory named `mspx430_lens` under the Binary Ninja user plugin
+as a directory named `msp430x_lens` under the Binary Ninja user plugin
 directory:
 
-- macOS: `~/Library/Application Support/Binary Ninja/plugins/mspx430_lens`
-- Linux: `~/.binaryninja/plugins/mspx430_lens`
-- Windows: `%APPDATA%\Binary Ninja\plugins\mspx430_lens`
+- macOS: `~/Library/Application Support/Binary Ninja/plugins/msp430x_lens`
+- Linux: `~/.binaryninja/plugins/msp430x_lens`
+- Windows: `%APPDATA%\Binary Ninja\plugins\msp430x_lens`
 
 Restart Binary Ninja after installing. To uninstall a manual installation,
-remove only the `mspx430_lens` directory or symlink you created.
+remove only the `msp430x_lens` directory or symlink you created.
 
 The plugin has no third-party Python dependencies. It requires Binary Ninja
 5.3.9757 or newer.

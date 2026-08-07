@@ -1,6 +1,6 @@
 {
     "pluginmetadataversion": 2,
-    "name": "MSPX430 Lens",
+    "name": "MSP430X Lens",
     "type": ["architecture", "binaryview", "helper"],
     "api": ["python3"],
     "description": "MSP430X architecture and raw firmware loader.",
