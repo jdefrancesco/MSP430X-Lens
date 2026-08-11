@@ -29,15 +29,15 @@ Once the plugin is listed in the Binary Ninja Plugin Manager, install it from
 BinaryView plugins are loaded at startup.
 
 For a manual development install, clone the repository and copy or symlink it
-as a directory named `msp430x_lens` under the Binary Ninja user plugin
+as a directory named `msp430xlens` under the Binary Ninja user plugin
 directory:
 
-- macOS: `~/Library/Application Support/Binary Ninja/plugins/msp430x_lens`
-- Linux: `~/.binaryninja/plugins/msp430x_lens`
-- Windows: `%APPDATA%\Binary Ninja\plugins\msp430x_lens`
+- macOS: `~/Library/Application Support/Binary Ninja/plugins/msp430xlens`
+- Linux: `~/.binaryninja/plugins/msp430xlens`
+- Windows: `%APPDATA%\Binary Ninja\plugins\msp430xlens`
 
 Restart Binary Ninja after installing. To uninstall a manual installation,
-remove only the `msp430x_lens` directory or symlink you created.
+remove only the `msp430xlens` directory or symlink you created.
 
 The plugin has no third-party Python dependencies. It requires Binary Ninja
 5.3.9757 or newer.

@@ -154,6 +154,7 @@ class Decoded:
     ext: Optional[int] = None
     rpt_count: Optional[int] = None
     rpt_reg: Optional[int] = None
+    subc_zero_carry: bool = False
     imm: int = 0
     targets: Tuple[int, ...] = ()
 
@@ -952,7 +953,14 @@ def decode(data: bytes, addr: int) -> Optional[Decoded]:
         ins.src = src
         ins.dst = dst
         ins.length = base_len + 2 * (idx - 1)
-        if ext is not None and records_double_repeat_prefix(src, dst, ext):
+        register_mode_ext = ext is not None and ad == 0 and as_bits == 0
+        # ZC is bit 8 only in a register/register extension word.  In the
+        # non-register form that same bit belongs to the source high nibble.
+        if ins.mnemonic == "subc" and register_mode_ext:
+            ins.subc_zero_carry = ext_zero_carry(ext)
+        # Use the encoded modes as well as normalized operands: R3/As=0 is a
+        # register-mode constant-generator source even though it becomes #0.
+        if ext is not None and (register_mode_ext or records_double_repeat_prefix(src, dst, ext)):
             ins.rpt_count = ext_repeat_count(ext)
             ins.rpt_reg = ext_repeat_reg(ext)
         return ins
@@ -1032,17 +1040,19 @@ def operand_tokens(op: Operand) -> List[InstructionTextToken]:
 def repeat_prefix_tokens(ins: Decoded) -> List[InstructionTextToken]:
     """Render the optional CPUX repeat prefix attached to an instruction."""
 
-    if ins.rpt_count is not None:
+    prefix = "rptz" if ins.subc_zero_carry else "rpt"
+    if ins.rpt_count is not None or (ins.subc_zero_carry and ins.rpt_reg is None):
+        count = ins.rpt_count or 1
         return [
-            tt("inst", "rpt"),
+            tt("inst", prefix),
             tt("text", " "),
             tt("text", "#"),
-            tt("int", f"{ins.rpt_count}", ins.rpt_count),
+            tt("int", f"{count}", count),
             tt("text", "; "),
         ]
     if ins.rpt_reg is not None:
         return [
-            tt("inst", "rpt"),
+            tt("inst", prefix),
             tt("text", " "),
             tt("reg", reg_name(ins.rpt_reg)),
             tt("text", "; "),
@@ -1944,14 +1954,13 @@ class MSP430XArchitecture(Architecture):
         result,
         *,
         rhs_canonical: bool = False,
-        rhs_can_overflow: bool = False,
     ) -> None:
         """Set the MSP430 N, Z, C, and V flags for subtraction or comparison."""
 
         lhs = self._flag_mask_temp(il, size, 18, lhs)
         if not rhs_canonical:
             rhs = self._flag_mask_temp(il, size, 19, rhs)
-        if size == 4 and not rhs_can_overflow:
+        if size == 4:
             diff = il.sub(4, lhs, rhs)
             self._set_flag(il, "z", il.compare_equal(4, lhs, rhs))
             self._set_flag(il, "n", self._bit_flag_expr(il, 4, diff, bits_for_size(4) - 1))
@@ -1966,6 +1975,27 @@ class MSP430XArchitecture(Architecture):
         result = self._flag_mask_temp(il, size, 20, result)
         self._set_nz(il, size, result, masked=True)
         self._set_flag(il, "c", il.compare_unsigned_greater_equal(size, lhs, rhs))
+        overflow_bits = il.and_expr(
+            size,
+            il.and_expr(size, il.xor_expr(size, lhs, rhs), il.xor_expr(size, lhs, result)),
+            il.const(size, 1 << (bits_for_size(size) - 1)),
+        )
+        self._set_flag(il, "v", il.compare_not_equal(size, overflow_bits, il.const(size, 0)))
+
+    def _set_subc_flags(self, il, size: int, lhs, rhs, result, full_result) -> None:
+        """Set SUBC flags from cached inputs and its untruncated addition.
+
+        MSP430 defines SUBC as ``dst + (~src) + C``.  Carry therefore comes
+        from the widened addition while signed overflow uses the original
+        source, not a width-wrapped ``src + !C`` value.
+        """
+
+        self._set_nz(il, size, result, masked=True)
+        self._set_flag(
+            il,
+            "c",
+            il.compare_unsigned_greater_than(4, full_result, il.const(4, mask_for_size(size))),
+        )
         overflow_bits = il.and_expr(
             size,
             il.and_expr(size, il.xor_expr(size, lhs, rhs), il.xor_expr(size, lhs, result)),
@@ -2279,11 +2309,27 @@ class MSP430XArchitecture(Architecture):
             if op not in ("cmp", "cmpa"):
                 self._write_operand(il, ins.dst, size, value, write_addr=dst_write_addr)
         elif op == "subc":
-            borrow = il.zero_extend(size, il.not_expr(0, il.flag("c")))
-            rhs = self._mask_expr(il, size, il.add(size, src, borrow))
-            value = self._mask_expr(il, size, il.sub(size, dst, rhs))
+            carry_value = il.const(1, 0) if ins.subc_zero_carry else il.zero_extend(1, il.flag("c"))
+            carry_in = self._temp_value(il, 1, 51, carry_value)
+            lhs = self._temp_value(il, size, 18, self._flag_mask_expr(il, size, dst))
+            rhs = self._temp_value(il, size, 19, self._flag_mask_expr(il, size, src))
+            complement = il.xor_expr(size, rhs, il.const(size, mask_for_size(size)))
+            lhs_full = lhs if size == 4 else il.zero_extend(4, lhs)
+            complement_full = complement if size == 4 else il.zero_extend(4, complement)
+            full_result = self._temp_value(
+                il,
+                4,
+                52,
+                il.add(4, il.add(4, lhs_full, complement_full), il.zero_extend(4, carry_in)),
+            )
+            result_expr = (
+                il.and_expr(4, full_result, il.const(4, ADDR_MASK))
+                if size == 4
+                else il.low_part(size, full_result)
+            )
+            value = self._temp_value(il, size, 20, result_expr)
             if update_flags:
-                self._set_sub_flags(il, size, dst, rhs, value, rhs_can_overflow=True)
+                self._set_subc_flags(il, size, lhs, rhs, value, full_result)
             self._write_operand(il, ins.dst, size, value, write_addr=dst_write_addr)
         elif op == "bit":
             value = self._mask_expr(il, size, il.and_expr(size, dst, src))
@@ -2377,6 +2423,15 @@ class MSP430XArchitecture(Architecture):
 
     def _can_fold_repeat_reg_carry_chain(self, ins: Decoded) -> bool:
         if ins.mnemonic not in ("addc", "subc") or ins.src is None or ins.dst is None:
+            return False
+        # ZC forces carry-in to zero for every repetition.  The compact SUBC
+        # intrinsic models a normal carry chain, so preserve ZC exactly with
+        # the existing unrolled/dynamic-loop path instead.
+        if ins.mnemonic == "subc" and ins.subc_zero_carry:
+            return False
+        if ins.src.kind == "reg" and ins.src.reg == 2:
+            return False
+        if ins.dst.kind == "reg" and ins.dst.reg in (2, 3):
             return False
         if ins.src.kind == "indirect" and ins.src.autoinc:
             return False
