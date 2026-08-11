@@ -1,6 +1,6 @@
 import unittest
 
-from binaryninja import BinaryView, BinaryViewType
+from binaryninja import BinaryView, BinaryViewType, LowLevelILOperation
 
 import msp430f5438_memory_map as memory_map
 from tests.fixture_firmware import (
@@ -9,6 +9,9 @@ from tests.fixture_firmware import (
     CINIT_TABLE_ADDRESS,
     CINIT_TABLE_END,
     ERASED_GAP_ADDRESS,
+    INDIRECT_CALL_TARGET_ADDRESS,
+    INDIRECT_CALL_WRAPPER,
+    INDIRECT_CALL_WRAPPER_ADDRESS,
     PACKED_ISR_ROUTINES,
     PACKED_ISR_STARTS,
     RESET_HANDLER,
@@ -56,6 +59,29 @@ class RawLoaderIntegrationTests(unittest.TestCase):
                 self.assertIsNotNone(view.get_data_var_at(record))
             for payload in CINIT_PAYLOAD_ADDRESSES:
                 self.assertIsNone(view.get_function_at(payload))
+
+            self.assertEqual(
+                bytes(
+                    view.read(
+                        INDIRECT_CALL_WRAPPER_ADDRESS,
+                        len(INDIRECT_CALL_WRAPPER),
+                    )
+                ),
+                INDIRECT_CALL_WRAPPER,
+            )
+            wrapper = view.get_function_at(INDIRECT_CALL_WRAPPER_ADDRESS)
+            self.assertIsNotNone(wrapper)
+            self.assertIsNotNone(view.get_function_at(INDIRECT_CALL_TARGET_ADDRESS))
+            call_il = wrapper.get_low_level_il_at(INDIRECT_CALL_WRAPPER_ADDRESS + 4)
+            ret_il = wrapper.get_low_level_il_at(INDIRECT_CALL_WRAPPER_ADDRESS + 6)
+            self.assertIsNotNone(call_il)
+            self.assertEqual(
+                call_il.operation,
+                LowLevelILOperation.LLIL_CALL_STACK_ADJUST,
+            )
+            self.assertIsNotNone(ret_il)
+            self.assertEqual(ret_il.operation, LowLevelILOperation.LLIL_RET)
+            self.assertTrue(wrapper.can_return.value)
         finally:
             raw.file.close()
 

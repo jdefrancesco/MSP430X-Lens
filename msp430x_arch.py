@@ -1484,9 +1484,12 @@ class MSP430XArchitecture(Architecture):
             "indirect": BranchType.IndirectBranch,
         }
         for kind, target in decoded_branch_edges(ins, addr):
-            branch_type = branch_types[kind]
+            # LLIL carries the target and call semantics for indirect calls.
+            # Adding a targetless CallDestination can seed address zero as a
+            # phantom callee, while IndirectBranch incorrectly kills fallthrough.
             if kind == "call" and target is None:
-                branch_type = BranchType.IndirectBranch
+                continue
+            branch_type = branch_types[kind]
             if target is None:
                 result.add_branch(branch_type)
             else:

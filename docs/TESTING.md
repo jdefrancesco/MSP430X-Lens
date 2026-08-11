@@ -56,9 +56,13 @@ Verify the loader and registration:
    are all recovered from one backed island.
 8. Confirm the C initializer table at `0x6112`, immediately after those
    handlers, is data rather than another function.
-9. Confirm the long `0xff` ranges between code islands remain
+9. Confirm the function at `0x6d00` contains `call r11` at `0x6d04` and the
+   following `ret` at `0x6d06`, and is not marked `noreturn`.
+10. Confirm the indirect call resolves through the pointer at `0xe000` to the
+    returning function at `0x7de0`.
+11. Confirm the long `0xff` ranges between code islands remain
    non-executable data.
-10. Spot-check reset/vector and MSP430 header labels.
+12. Spot-check reset/vector and MSP430 header labels.
 
 If `Open With Options` predicts ARM/Thumb, close the view and reopen it with
 the exact MSP430F5438 view type. The generic firmware loader is not the mapped

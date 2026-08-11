@@ -12,10 +12,14 @@ RESET_VECTOR = 0xFFFE
 RESET_HANDLER = 0x5C00
 SPARSE_FUNCTION_ADDRESS = 0x6000
 PACKED_ISR_ADDRESS = 0x6100
+INDIRECT_CALL_WRAPPER_ADDRESS = 0x6D00
+INDIRECT_CALL_TARGET_ADDRESS = 0x7DE0
+INDIRECT_CALL_POINTER_ADDRESS = 0xE000
 ERASED_GAP_ADDRESS = 0x6050
 
-# nop; ret
-RESET_FUNCTION = bytes.fromhex("03 43 30 41")
+# call #0x7de0; call #0x6d00; ret. Direct references make both functions
+# deterministic analysis roots for the integration fixture.
+RESET_FUNCTION = bytes.fromhex("b0 12 e0 7d b0 12 00 6d 30 41")
 
 # push r4; mov r14,r4; mov r12,0(r13); add #2,r13; sub #1,r4;
 # jne $-8; pop r4; ret -- representative of the missed code in the screenshot.
@@ -55,6 +59,11 @@ CINIT_PAYLOAD_ADDRESSES = tuple(
     CINIT_TABLE_ADDRESS + offset for offset in (0x06, 0x14, 0x20, 0x30)
 )
 
+# mov &0xe000, r11; call r11; ret. The pointer names a known returning target,
+# so analysis must retain the fallthrough after the register-indirect call.
+INDIRECT_CALL_WRAPPER = bytes.fromhex("1b 42 00 e0 8b 12 30 41")
+INDIRECT_CALL_TARGET = bytes.fromhex("03 43 30 41")
+
 
 def build_sparse_raw_firmware() -> bytes:
     """Return a main-flash image with sparse and packed code/data islands."""
@@ -69,6 +78,12 @@ def build_sparse_raw_firmware() -> bytes:
     place(SPARSE_FUNCTION_ADDRESS, SPARSE_FUNCTION)
     place(PACKED_ISR_ADDRESS, b"".join(PACKED_ISR_ROUTINES))
     place(CINIT_TABLE_ADDRESS, CINIT_TABLE)
+    place(INDIRECT_CALL_WRAPPER_ADDRESS, INDIRECT_CALL_WRAPPER)
+    place(INDIRECT_CALL_TARGET_ADDRESS, INDIRECT_CALL_TARGET)
+    place(
+        INDIRECT_CALL_POINTER_ADDRESS,
+        INDIRECT_CALL_TARGET_ADDRESS.to_bytes(2, "little"),
+    )
     place(RESET_VECTOR, RESET_HANDLER.to_bytes(2, "little"))
     return bytes(image)
 
@@ -86,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
     packed_starts = ", ".join(f"{addr:#x}" for addr in PACKED_ISR_STARTS)
     print(f"Expected packed ISR functions: {packed_starts}")
     print(f"Expected C initializer data (not code): {CINIT_TABLE_ADDRESS:#x}")
+    print(f"Expected returning indirect-call wrapper: {INDIRECT_CALL_WRAPPER_ADDRESS:#x}")
     return 0
 
 
