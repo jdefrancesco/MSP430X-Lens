@@ -8,6 +8,7 @@ core features include:
 - `MSP430X` ISA support; lifting the MSP430/MSP430X CPUX forms for better analysis (duh)..
 - Ability to map raw firmware MSP430F5438/F5438A images. TI-TXT/ELF firmware is supported if available.
 - Vector-table seeding, Flash/RAM/Peripheral sections, and TI header labels.
+- Typed factory TLV calibration/device records with stored CRC16 validation.
 - Collapsing and simplifying the decompilation output without all the
 artifacts that Ghidra generally leaves.
 - Pure Python. No external dependencies used making porting and installation easier.
@@ -77,6 +78,7 @@ Useful commands include:
 - `Apply memory map (full image @ 0)`
 - `Diagnose active view`
 - `Report CPUX fallback instructions`
+- `Report TLV device descriptors and CRC16`
 - `Re-run MSP430X analysis`
 - `Apply MSP430 header labels`
 
@@ -135,6 +137,16 @@ start inside those strings or in short zero padding next to them, which prevents
 string tables from decompiling into noisy carry/flag-heavy pseudocode or tiny
 `bra @pc` functions.
 
+Binary Ninja can also hide a valid string load when an untyped callee is
+auto-inferred from its R4-R10 save/restore prologue: the call prototype omits
+R12, so HLIL removes the proven R12 assignment as dead. After function analysis,
+the mapped loader recovers direct CALL/CALLA sites whose R12 value points to a
+fully backed, printable C string. It adds the string as the callee's first
+automatic parameter (and recognizes format strings) while retaining uncertain
+auto-inferred inputs. User-authored types and more specific prototypes are never
+replaced. Run `Re-run MSP430X analysis` to apply this recovery to an existing
+mapped, ELF, or BNDB view.
+
 To keep random firmware bytes out of Binary Ninja's Strings sidebar, the mapped
 loader raises the inherited `analysis.limits.minStringLength` setting from four
 to eight before initial analysis. Explicit User, Project, and Resource values
@@ -157,6 +169,26 @@ TI-style `sfrb`/`sfrw` register definitions, module base labels, vector labels,
 TLV labels, and simple aliases such as board/HAL names that point at a known
 register label.
 
+When bytes at `0x1a00-0x1aff` are present, the mapped-raw loader reads the
+factory device descriptors before its first analysis pass. For an ELF or other
+custom view, use `Re-run MSP430X analysis` to apply the same annotations until
+the planned ELF pre-analysis hook is available. The info block, die record,
+ADC12 calibration, reference calibration, and known record layouts receive
+packed types; peripheral discovery and unknown records remain bounded byte
+arrays. The report command lists every discovered peripheral, including the
+CRC16 interfaces advertised by the device.
+
+The stored word at `0x1a02` is checked as CRC-16/CCITT-FALSE over
+`0x1a04-0x1aff`. A mismatch is reported and left visible but does not hide
+structurally safe calibration fields. Main-flash-only dumps normally do not
+contain this range, so `tlv=absent` is expected and the loader deliberately does
+not interpret zero-filled, unbacked memory as factory data. A CRC-valid backed
+device ID also selects F5438 versus F5438A automatically for the mapped raw
+view.
+
+The checksum and descriptor layout follow TI's
+[MSP430x5xx/6xx Family User's Guide](https://www.ti.com/lit/ug/slau208q/slau208q.pdf).
+
 ## Test
 
 Run all Binary Ninja-backed unit and loader-integration tests:
@@ -165,7 +197,8 @@ Run all Binary Ninja-backed unit and loader-integration tests:
 make test
 ```
 
-Generate a deterministic raw image for visual testing with `make fixture`.
+Generate deterministic main-flash and full-address-space images for visual
+testing with `make fixture`.
 More details, including the guarded `make dev-link` setup, are in
 [docs/TESTING.md](docs/TESTING.md).
 

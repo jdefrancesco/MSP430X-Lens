@@ -30,6 +30,8 @@ explicit profiles instead of adding more global assumptions.
 
 - `msp430x_arch.py`: instruction decoding, disassembly tokens, branch metadata,
   calling convention behavior, and LLIL lifting.
+- `msp430_tlv.py`: pure factory device-descriptor parsing, CRC16 validation,
+  and peripheral-discovery decoding.
 - `msp430f5438_memory_map.py`: device profiles, mapped raw BinaryView, vector
   seeding, header symbols, code/data heuristics, diagnostics, and UI commands.
 - `inc/`: bundled TI-derived device and peripheral headers. Preserve their

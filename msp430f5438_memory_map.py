@@ -15,11 +15,14 @@ from binaryninja import (
     BinaryView,
     BinaryViewType,
     Endianness,
+    FunctionParameter,
     PluginCommand,
     SectionSemantics,
     SegmentFlag,
     Settings,
     SettingsScope,
+    StructureBuilder,
+    StructureMember,
     Symbol,
     SymbolType,
     Type,
@@ -27,6 +30,38 @@ from binaryninja import (
     log_info,
     log_warn,
 )
+from binaryninja.enums import RegisterValueType, VariableSourceType
+
+try:
+    from .msp430_tlv import (
+        TLV_REGION_END,
+        TLV_REGION_SIZE,
+        TLV_REGION_START,
+        TLV_TAG_ADC12_CAL,
+        TLV_TAG_ADC12_CAL_F5438,
+        TLV_TAG_DIE_RECORD,
+        TLV_TAG_PERIPHERAL,
+        TLV_TAG_REF_CAL,
+        TlvDescriptorBlock,
+        TlvRecord,
+        decode_peripheral_descriptor,
+        parse_tlv_descriptor_block,
+    )
+except ImportError:
+    from msp430_tlv import (
+        TLV_REGION_END,
+        TLV_REGION_SIZE,
+        TLV_REGION_START,
+        TLV_TAG_ADC12_CAL,
+        TLV_TAG_ADC12_CAL_F5438,
+        TLV_TAG_DIE_RECORD,
+        TLV_TAG_PERIPHERAL,
+        TLV_TAG_REF_CAL,
+        TlvDescriptorBlock,
+        TlvRecord,
+        decode_peripheral_descriptor,
+        parse_tlv_descriptor_block,
+    )
 
 # TODO(multi-device): These globals are the default MSP430F5438/F5438A device
 # profile. ``DeviceSpec`` already groups variant-specific data, but some loader
@@ -42,8 +77,11 @@ BSL_START = 0x001000
 BSL_END = 0x0017FF
 INFO_START = 0x001800
 INFO_END = 0x0019FF
-TLV_START = 0x001A00
-TLV_END = 0x001AFF
+# The TI headers call the record-stream address (0x1a08) TLV_START.  Preserve
+# these older module aliases for callers while keeping the region and stream
+# concepts distinct in new code.
+TLV_START = TLV_REGION_START
+TLV_END = TLV_REGION_END
 FACTORY_BOOT_START = 0x001B00
 FACTORY_BOOT_END = 0x001BFF
 RAM_START = 0x001C00
@@ -59,6 +97,7 @@ FLASH_SIZE = FLASH_END - FLASH_START + 1
 RAM_SIZE = RAM_END - RAM_START + 1
 STACK_TOP = RAM_END
 _REGISTERED_PLATFORM_RECOGNIZER = False
+DEVICE_VARIANT_METADATA_KEY = "msp430x_lens.device_variant"
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +114,29 @@ class Region:
     @property
     def length(self) -> int:
         return self.end - self.start + 1
+
+
+@dataclass(frozen=True, slots=True)
+class TlvSpec:
+    """Variant-specific factory device-descriptor expectations."""
+
+    region_start: int
+    region_end: int
+    expected_device_id: bytes
+
+    @property
+    def region_size(self) -> int:
+        return self.region_end - self.region_start + 1
+
+
+@dataclass(frozen=True, slots=True)
+class _TlvReadResult:
+    """Backing-aware result for one BinaryView TLV inspection."""
+
+    status: str
+    block: Optional[TlvDescriptorBlock]
+    backed_bytes: int
+    detail: str = ""
 
 
 AddressSpan = tuple[int, int]
@@ -112,6 +174,7 @@ class DeviceSpec:
     regions: tuple[Region, ...]
     symbols: tuple[SymbolDefinition, ...]
     vector_names: tuple[VectorDefinition, ...]
+    tlv: Optional[TlvSpec] = None
 
     @property
     def device_end(self) -> int:
@@ -155,6 +218,7 @@ ERASED_FUNCTION_MIN_BYTES = 8
 SPARSE_CODE_ISLAND_RETURN_SCAN_BYTES = 0x1000
 EXECUTABLE_SEGMENT_SCAN_MAX_BYTES = 0x200000
 ASCII_STRING_MIN_LEN = 8
+STRING_CALL_MAX_BYTES = 0x400
 AUTO_STRING_MIN_LENGTH_SETTING = "analysis.limits.minStringLength"
 ASCII_STRING_PADDING_MAX_LEN = 4
 ASCII_STRING_CLUSTER_MAX_GAP = 0x80
@@ -382,6 +446,19 @@ VECTOR_NAMES: tuple[VectorDefinition, ...] = (
 )
 
 
+MSP430F5438_TLV_SPEC = TlvSpec(
+    region_start=TLV_REGION_START,
+    region_end=TLV_REGION_END,
+    expected_device_id=b"\x54\x38",
+)
+
+MSP430F5438A_TLV_SPEC = TlvSpec(
+    region_start=TLV_REGION_START,
+    region_end=TLV_REGION_END,
+    expected_device_id=b"\x05\x80",
+)
+
+
 MSP430F5438_SPEC = DeviceSpec(
     name="MSP430F5438",
     aliases=("F5438",),
@@ -395,6 +472,7 @@ MSP430F5438_SPEC = DeviceSpec(
     regions=tuple(sorted(MAP_REGIONS + LEGACY_F5438_ONLY_REGIONS, key=lambda r: r.start)),
     symbols=SYMBOLS,
     vector_names=VECTOR_NAMES,
+    tlv=MSP430F5438_TLV_SPEC,
 )
 
 MSP430F5438A_SPEC = DeviceSpec(
@@ -410,6 +488,7 @@ MSP430F5438A_SPEC = DeviceSpec(
     regions=tuple(sorted(MAP_REGIONS, key=lambda r: r.start)),
     symbols=SYMBOLS,
     vector_names=VECTOR_NAMES,
+    tlv=MSP430F5438A_TLV_SPEC,
 )
 
 DEVICE_SPECS: tuple[DeviceSpec, ...] = (MSP430F5438_SPEC, MSP430F5438A_SPEC)
@@ -421,6 +500,41 @@ DEVICE_SPEC_ALIASES = {
 }
 DEFAULT_DEVICE_SPEC = DEVICE_SPEC_BY_NAME[DEVICE_VARIANT]
 ALL_KNOWN_MAP_REGIONS = tuple(sorted(MAP_REGIONS + LEGACY_F5438_ONLY_REGIONS, key=lambda r: r.start))
+
+
+def _set_view_device_spec(bv: BinaryView, spec: DeviceSpec) -> None:
+    try:
+        bv.spec = spec
+    except Exception:
+        pass
+    try:
+        bv.store_metadata(DEVICE_VARIANT_METADATA_KEY, spec.name, isAuto=True)
+    except Exception:
+        pass
+
+
+def _device_spec_for_view(bv: BinaryView) -> DeviceSpec:
+    spec = getattr(bv, "spec", None)
+    if isinstance(spec, DeviceSpec):
+        return spec
+    try:
+        variant = bv.query_metadata(DEVICE_VARIANT_METADATA_KEY)
+    except Exception:
+        variant = None
+    if isinstance(variant, str):
+        spec_name = DEVICE_SPEC_ALIASES.get(variant.upper())
+        if spec_name is not None:
+            return DEVICE_SPEC_BY_NAME[spec_name]
+    detector = globals().get("_detect_device_spec_from_mapped_tlv")
+    if detector is not None:
+        try:
+            detected = detector(bv)
+        except Exception:
+            detected = None
+        if isinstance(detected, DeviceSpec):
+            _set_view_device_spec(bv, detected)
+            return detected
+    return DEFAULT_DEVICE_SPEC
 
 
 def _raw_length(bv: BinaryView) -> int:
@@ -618,6 +732,30 @@ def _detect_image_base(bv: BinaryView, raw_len: int) -> int:
     if best_score > 0:
         return best_base
     return fallback
+
+
+def _detect_device_spec_from_tlv(
+    bv: BinaryView,
+    image_base: int,
+) -> Optional[DeviceSpec]:
+    """Identify a supported variant from backed factory device-ID bytes."""
+
+    data_offset = TLV_REGION_START - image_base
+    if data_offset < 0:
+        return None
+    data = _read_file_bytes(bv, data_offset, TLV_REGION_SIZE)
+    if len(data) != TLV_REGION_SIZE:
+        return None
+    try:
+        block = parse_tlv_descriptor_block(data, base=TLV_REGION_START)
+    except ValueError:
+        return None
+    if block.erased or block.issues or not block.crc_valid:
+        return None
+    for spec in DEVICE_SPECS:
+        if spec.tlv is not None and block.device_id == spec.tlv.expected_device_id:
+            return spec
+    return None
 
 
 def _has_probable_msp430_vector_table(bv: BinaryView, raw_len: int) -> bool:
@@ -1324,6 +1462,105 @@ def _read_u16(bv: BinaryView, addr: int) -> Optional[int]:
     return data[0] | (data[1] << 8)
 
 
+def _is_file_backed_byte(bv: BinaryView, addr: int) -> bool:
+    """Return whether ``addr`` comes from the input file, not segment fill."""
+
+    checker = getattr(bv, "is_offset_backed_by_file", None)
+    if checker is not None:
+        try:
+            return bool(checker(addr))
+        except Exception:
+            return False
+
+    getter = getattr(bv, "get_segment_at", None)
+    if getter is None:
+        return False
+    try:
+        segment = getter(addr)
+        if segment is None:
+            return False
+        data_length = int(getattr(segment, "data_length", 0))
+        return segment.start <= addr < segment.start + data_length
+    except Exception:
+        return False
+
+
+def _detect_device_spec_from_mapped_tlv(bv: BinaryView) -> Optional[DeviceSpec]:
+    """Identify a supported variant from a mapped, CRC-valid TLV block."""
+
+    if not all(
+        _is_file_backed_byte(bv, addr)
+        for addr in range(TLV_REGION_START, TLV_REGION_END + 1)
+    ):
+        return None
+    try:
+        data = bytes(bv.read(TLV_REGION_START, TLV_REGION_SIZE))
+        block = parse_tlv_descriptor_block(data, base=TLV_REGION_START)
+    except Exception:
+        return None
+    if block.erased or block.issues or not block.crc_valid:
+        return None
+    for spec in DEVICE_SPECS:
+        if spec.tlv is not None and block.device_id == spec.tlv.expected_device_id:
+            return spec
+    return None
+
+
+def _read_tlv_descriptor(
+    bv: BinaryView,
+    spec: Optional[DeviceSpec] = None,
+) -> _TlvReadResult:
+    """Read and parse a fully file-backed factory descriptor block."""
+
+    if spec is None:
+        spec = _device_spec_for_view(bv)
+    layout = spec.tlv
+    if layout is None:
+        return _TlvReadResult("unsupported", None, 0, "device profile has no TLV layout")
+
+    backed = tuple(
+        _is_file_backed_byte(bv, addr)
+        for addr in range(layout.region_start, layout.region_end + 1)
+    )
+    backed_count = sum(backed)
+    if backed_count == 0:
+        return _TlvReadResult("absent", None, 0, "descriptor region is not file-backed")
+    if backed_count != layout.region_size:
+        return _TlvReadResult(
+            "partial",
+            None,
+            backed_count,
+            f"only {backed_count:#x}/{layout.region_size:#x} descriptor bytes are file-backed",
+        )
+
+    try:
+        data = bytes(bv.read(layout.region_start, layout.region_size))
+    except Exception as exc:
+        return _TlvReadResult("unreadable", None, backed_count, str(exc))
+    if len(data) != layout.region_size:
+        return _TlvReadResult(
+            "unreadable",
+            None,
+            backed_count,
+            f"read returned {len(data):#x}/{layout.region_size:#x} bytes",
+        )
+
+    try:
+        block = parse_tlv_descriptor_block(data, base=layout.region_start)
+    except ValueError as exc:
+        return _TlvReadResult("malformed", None, backed_count, str(exc))
+
+    if block.erased:
+        status = "erased"
+    elif block.issues:
+        status = "malformed"
+    elif block.crc_valid:
+        status = "valid"
+    else:
+        status = "crc-mismatch"
+    return _TlvReadResult(status, block, backed_count)
+
+
 def _is_probable_code_pointer(addr: int) -> bool:
     if addr in (0x0000, 0xFFFF):
         return False
@@ -1334,6 +1571,18 @@ def _is_probable_code_pointer(addr: int) -> bool:
 
 def _uint16_type():
     return Type.int(2, False)
+
+
+def _uint8_type():
+    return Type.int(1, False)
+
+
+def _int16_type():
+    return Type.int(2, True)
+
+
+def _uint32_type():
+    return Type.int(4, False)
 
 
 def _char_array_type(length: int):
@@ -2340,6 +2589,323 @@ def _msp430x_decode_api():
     return None, None
 
 
+_FORMAT_ARGUMENT_RE = re.compile(
+    r"%(?!%)(?:\d+\$)?[-+ #0']*(?:\*|\d+)?"
+    r"(?:\.(?:\*|\d+))?(?:hh|h|ll|l|j|z|t|L)?[diuoxXfFeEgGaAcspn]"
+)
+_MSP430_CALLEE_SAVED_REGS = frozenset(
+    {"r4", "r5", "r6", "r7", "r8", "r9", "r10"}
+)
+
+
+def _has_format_argument(text: str) -> bool:
+    """Recognize a printf-style conversion while treating ``%%`` as literal."""
+
+    cursor = 0
+    while cursor < len(text):
+        percent = text.find("%", cursor)
+        if percent < 0:
+            return False
+        if percent + 1 < len(text) and text[percent + 1] == "%":
+            cursor = percent + 2
+            continue
+        if _FORMAT_ARGUMENT_RE.match(text, percent) is not None:
+            return True
+        cursor = percent + 1
+    return False
+
+
+def _read_backed_ascii_c_string(
+    bv: BinaryView,
+    addr: int,
+    *,
+    min_len: int = ASCII_STRING_MIN_LEN,
+    max_len: int = STRING_CALL_MAX_BYTES,
+) -> Optional[str]:
+    """Read a bounded firmware string without accepting segment-fill bytes."""
+
+    if addr < 0 or min_len <= 0 or max_len < min_len:
+        return None
+    try:
+        data = bytes(bv.read(addr, max_len + 1))
+    except Exception:
+        return None
+    terminator = data.find(b"\x00")
+    if terminator < min_len or terminator > max_len:
+        return None
+    payload = data[:terminator]
+    if not payload or not all(_is_printable_string_byte(byte) for byte in payload):
+        return None
+    if not any(
+        (0x41 <= byte <= 0x5A) or (0x61 <= byte <= 0x7A)
+        for byte in payload
+    ):
+        return None
+    if not all(
+        _is_file_backed_byte(bv, byte_addr)
+        for byte_addr in range(addr, addr + terminator + 1)
+    ):
+        return None
+    try:
+        return payload.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+
+def _direct_msp430_call_target(bv: BinaryView, addr: int, decoder) -> Optional[int]:
+    """Return a directly encoded CALL/CALLA destination at ``addr``."""
+
+    try:
+        data = bytes(bv.read(addr, 8))
+        ins = decoder(data, addr)
+    except Exception:
+        return None
+    src = getattr(ins, "src", None)
+    if (
+        ins is None
+        or getattr(ins, "fmt", None) != "single"
+        or getattr(ins, "mnemonic", None) not in ("call", "calla")
+        or getattr(src, "kind", None) != "imm"
+    ):
+        return None
+    return int(getattr(src, "value", 0)) & 0xFFFFF
+
+
+def _function_at_call_target(bv: BinaryView, caller, addr: int):
+    """Resolve a call target on the caller's platform when duplicate functions exist."""
+
+    platform = getattr(caller, "platform", None)
+    getter = getattr(bv, "get_function_at", None)
+    if getter is not None and platform is not None:
+        try:
+            func = getter(addr, platform)
+            if func is not None:
+                return func
+        except Exception:
+            pass
+
+    candidates_getter = getattr(bv, "get_functions_at", None)
+    if candidates_getter is not None:
+        try:
+            candidates = list(candidates_getter(addr))
+        except Exception:
+            candidates = []
+        caller_arch = str(getattr(caller, "arch", ""))
+        for func in candidates:
+            if str(getattr(func, "platform", "")) == str(platform):
+                return func
+        for func in candidates:
+            if str(getattr(func, "arch", "")) == caller_arch:
+                return func
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
+
+
+def _register_parameter_names(func) -> set[str]:
+    """Return native registers already represented by a function prototype."""
+
+    arch = getattr(func, "arch", None)
+    if arch is None:
+        return set()
+    names = set()
+    try:
+        variables = getattr(func, "parameter_vars", ())
+        variables = getattr(variables, "vars", variables)
+        for variable in variables:
+            if getattr(variable, "source_type", None) != VariableSourceType.RegisterVariableSourceType:
+                continue
+            names.add(str(arch.get_reg_name(variable.storage)))
+    except Exception:
+        return set()
+    return names
+
+
+def _preservable_auto_parameters(func) -> Optional[tuple]:
+    """Keep only the narrow auto-prototype shape that causes lost string inputs.
+
+    Binary Ninja can infer PUSH/POP preservation of R4-R10 as formal inputs for
+    this 20-bit architecture.  We retain those uncertain inputs rather than
+    deleting them, but refuse to rewrite a prototype containing stack,
+    implicit, caller-saved, or otherwise meaningful parameters.
+    """
+
+    if bool(getattr(func, "has_user_type", False)):
+        return None
+    try:
+        parameters = tuple(func.type.parameters)
+        arch = func.arch
+    except Exception:
+        return None
+    if not parameters:
+        return None
+    for parameter in parameters:
+        location = getattr(parameter, "location", None)
+        if (
+            location is None
+            or getattr(location, "source_type", None)
+            != VariableSourceType.RegisterVariableSourceType
+        ):
+            return None
+        try:
+            register_name = str(arch.get_reg_name(location.storage))
+        except Exception:
+            return None
+        if register_name not in _MSP430_CALLEE_SAVED_REGS:
+            return None
+    return parameters
+
+
+def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False) -> int:
+    """Restore proven R12 string inputs hidden by an inferred callee prototype.
+
+    This runs only after function analysis.  It requires a direct CALL/CALLA,
+    a constant R12 value at that call, a fully file-backed printable C string,
+    and an untyped target whose inferred inputs consist exclusively of MSP430
+    callee-saved registers.  User types, zero-argument functions, and more
+    specific prototypes are never replaced.
+    """
+
+    decoder, _branch_edges = _msp430x_decode_api()
+    if decoder is None:
+        return 0
+
+    candidates = {}
+    for caller in list(getattr(bv, "functions", [])):
+        if str(getattr(caller, "arch", "")) != "msp430x":
+            continue
+        try:
+            call_sites = list(caller.call_sites)
+        except Exception:
+            continue
+        for call_site in call_sites:
+            call_addr = getattr(call_site, "address", None)
+            if call_addr is None:
+                continue
+            target_addr = _direct_msp430_call_target(bv, call_addr, decoder)
+            if target_addr is None:
+                continue
+            try:
+                r12_value = caller.get_reg_value_at(call_addr, "r12", caller.arch)
+            except Exception:
+                continue
+            if getattr(r12_value, "type", None) not in (
+                RegisterValueType.ConstantValue,
+                RegisterValueType.ConstantPointerValue,
+            ):
+                continue
+            string_addr = int(getattr(r12_value, "value", 0)) & 0xFFFFF
+            text = _read_backed_ascii_c_string(bv, string_addr)
+            if text is None:
+                continue
+            callee = _function_at_call_target(bv, caller, target_addr)
+            if callee is None or str(getattr(callee, "arch", "")) != "msp430x":
+                continue
+            key = (
+                str(getattr(callee, "platform", "")),
+                int(getattr(callee, "start", target_addr)),
+            )
+            candidate = candidates.setdefault(
+                key,
+                {"callee": callee, "callers": {}, "format": False},
+            )
+            caller_key = (
+                str(getattr(caller, "platform", "")),
+                int(getattr(caller, "start", 0)),
+            )
+            candidate["callers"][caller_key] = caller
+            candidate["format"] = candidate["format"] or _has_format_argument(text)
+
+    recovered = 0
+    for candidate in candidates.values():
+        callee = candidate["callee"]
+        if "r12" in _register_parameter_names(callee):
+            continue
+        existing_parameters = _preservable_auto_parameters(callee)
+        if existing_parameters is None:
+            continue
+
+        calling_convention = getattr(callee, "calling_convention", None)
+        if calling_convention is None:
+            calling_convention = getattr(
+                getattr(callee, "platform", None),
+                "default_calling_convention",
+                None,
+            )
+        try:
+            argument_registers = tuple(calling_convention.int_arg_regs)
+        except Exception:
+            argument_registers = ()
+        if not argument_registers or str(argument_registers[0]) != "r12":
+            continue
+
+        is_format = bool(candidate["format"])
+        try:
+            current_type = callee.type
+            pointer_type = Type.pointer(callee.arch, Type.char())
+            adjusted_type = Type.function(
+                callee.return_type,
+                [
+                    FunctionParameter(pointer_type, "format" if is_format else "text"),
+                    *existing_parameters,
+                ],
+                calling_convention=calling_convention,
+                variable_arguments=(
+                    is_format
+                    or bool(getattr(current_type.has_variable_arguments, "value", False))
+                ),
+                stack_adjust=getattr(current_type, "stack_adjustment", None),
+            ).mutable_copy()
+            adjusted_type.can_return = current_type.can_return
+            adjusted_type.pure = current_type.pure
+            callee.set_auto_type(adjusted_type)
+        except Exception as exc:
+            if verbose:
+                print(
+                    f"Could not recover R12 string parameter for function "
+                    f"{getattr(callee, 'start', 0):#x}: {exc}"
+                )
+            log_warn(
+                f"Could not recover R12 string parameter for function "
+                f"{getattr(callee, 'start', 0):#x}: {exc}"
+            )
+            continue
+
+        for caller in candidate["callers"].values():
+            try:
+                caller.reanalyze()
+            except Exception:
+                pass
+        recovered += 1
+
+    if verbose and recovered:
+        print(
+            f"Recovered R12 string parameter(s) for {recovered} direct call target(s)."
+        )
+    return recovered
+
+
+def _schedule_string_call_parameter_recovery(bv: BinaryView) -> None:
+    """Run string-call recovery once the mapped view's first analysis completes."""
+
+    scheduler = getattr(bv, "add_analysis_completion_event", None)
+    if scheduler is None:
+        return
+
+    def recover_after_initial_analysis() -> None:
+        try:
+            recovered = _recover_direct_string_call_parameters(bv, verbose=False)
+            if recovered:
+                bv.update_analysis()
+        except Exception as exc:
+            log_warn(f"Could not recover R12 string call parameters: {exc}")
+
+    try:
+        scheduler(recover_after_initial_analysis)
+    except Exception as exc:
+        log_warn(f"Could not schedule R12 string call recovery: {exc}")
+
+
 def _decoded_return_kind(ins) -> Optional[str]:
     """Return the architectural return kind for a decoded instruction."""
 
@@ -2811,6 +3377,366 @@ def _has_data_var_at(bv: BinaryView, addr: int) -> bool:
         return False
 
 
+_TLV_AUTO_TYPE_SOURCE = "msp430x-lens.tlv"
+
+
+def _tlv_structure_definitions():
+    u8 = _uint8_type()
+    u16 = _uint16_type()
+    i16 = _int16_type()
+    u32 = _uint32_type()
+    return {
+        "msp430_tlv_info_block": (
+            8,
+            (
+                (u8, "info_length", 0),
+                (u8, "crc_length", 1),
+                (u16, "crc16", 2),
+                (u16, "device_id", 4),
+                (u8, "hardware_revision", 6),
+                (u8, "firmware_revision", 7),
+            ),
+        ),
+        "msp430_tlv_die_record": (
+            12,
+            (
+                (u8, "tag", 0),
+                (u8, "length", 1),
+                (u32, "lot_wafer_id", 2),
+                (u16, "die_x", 6),
+                (u16, "die_y", 8),
+                (u16, "test_results", 10),
+            ),
+        ),
+        "msp430_tlv_adc12_calibration_f5438": (
+            18,
+            (
+                (u8, "tag", 0),
+                (u8, "length", 1),
+                (u16, "gain_factor", 2),
+                (i16, "offset", 4),
+                (u16, "ref15_factor", 6),
+                (u16, "ref15_30c", 8),
+                (u16, "ref15_85c", 10),
+                (u16, "ref25_factor", 12),
+                (u16, "ref25_30c", 14),
+                (u16, "ref25_85c", 16),
+            ),
+        ),
+        "msp430_tlv_adc12_calibration_f5438a": (
+            18,
+            (
+                (u8, "tag", 0),
+                (u8, "length", 1),
+                (u16, "gain_factor", 2),
+                (i16, "offset", 4),
+                (u16, "ref15_30c", 6),
+                (u16, "ref15_85c", 8),
+                (u16, "ref20_30c", 10),
+                (u16, "ref20_85c", 12),
+                (u16, "ref25_30c", 14),
+                (u16, "ref25_85c", 16),
+            ),
+        ),
+        "msp430_tlv_ref_calibration": (
+            8,
+            (
+                (u8, "tag", 0),
+                (u8, "length", 1),
+                (u16, "ref15", 2),
+                (u16, "ref20", 4),
+                (u16, "ref25", 6),
+            ),
+        ),
+    }
+
+
+def _register_tlv_types(bv: BinaryView) -> dict[str, object]:
+    """Register stable packed TLV record types and return named references."""
+
+    result = {}
+    for name, (width, members) in _tlv_structure_definitions().items():
+        type_id = Type.generate_auto_type_id(_TLV_AUTO_TYPE_SOURCE, name)
+        try:
+            registered_name = bv.get_type_name_by_id(type_id)
+        except Exception:
+            registered_name = None
+        try:
+            structure = StructureBuilder.create(
+                members=[
+                    StructureMember(member_type, member_name, offset)
+                    for member_type, member_name, offset in members
+                ],
+                packed=True,
+                width=width,
+            )
+            registered_name = bv.define_type(type_id, name, structure)
+        except Exception as exc:
+            if registered_name is None:
+                log_warn(f"Could not register TLV type {name}: {exc}")
+                continue
+        try:
+            result[name] = Type.named_type_from_registered_type(bv, registered_name)
+        except Exception as exc:
+            log_warn(f"Could not reference TLV type {registered_name}: {exc}")
+    return result
+
+
+def _data_var_overlaps(bv: BinaryView, start: int, width: int) -> bool:
+    if width <= 0:
+        return True
+    try:
+        if bv.get_data_var_at(start) is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        following = bv.get_next_data_var_after(start)
+        if following is not None and following.address < start + width:
+            return True
+    except Exception:
+        try:
+            for addr, variable in getattr(bv, "data_vars", {}).items():
+                variable_width = int(getattr(getattr(variable, "type", None), "width", 1))
+                if start < addr + max(1, variable_width) and addr < start + width:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _define_tlv_data_var(
+    bv: BinaryView,
+    addr: int,
+    var_type,
+    name: str,
+    *,
+    auto_defined: bool,
+) -> bool:
+    width = int(getattr(var_type, "width", 0))
+    if _data_var_overlaps(bv, addr, width):
+        return False
+    try:
+        if auto_defined and hasattr(bv, "define_data_var"):
+            bv.define_data_var(addr, var_type, name)
+        elif hasattr(bv, "define_user_data_var"):
+            bv.define_user_data_var(addr, var_type, name)
+        else:
+            _define_symbol(
+                bv,
+                Symbol(SymbolType.DataSymbol, addr, name),
+                auto_defined=auto_defined,
+            )
+        return True
+    except Exception as exc:
+        log_warn(f"Could not define TLV data {name} at {addr:#06x}: {exc}")
+        return False
+
+
+def _tlv_device_name(device_id: bytes) -> str:
+    names = {
+        b"\x54\x38": "MSP430F5438",
+        b"\x05\x80": "MSP430F5438A",
+    }
+    return names.get(bytes(device_id), "unknown device")
+
+
+def _tlv_record_comment(record: TlvRecord) -> str:
+    prefix = f"TLV {record.name}: payload length={record.length:#x}"
+    value = record.value
+    if record.tag == TLV_TAG_DIE_RECORD and record.length == 0x0A:
+        wafer_id = int.from_bytes(value[0:4], "little")
+        die_x = int.from_bytes(value[4:6], "little")
+        die_y = int.from_bytes(value[6:8], "little")
+        test_results = int.from_bytes(value[8:10], "little")
+        return (
+            f"{prefix}; wafer/lot={wafer_id:#010x}, die=({die_x}, {die_y}), "
+            f"test_results={test_results:#06x}"
+        )
+    if record.tag == TLV_TAG_ADC12_CAL_F5438 and record.length == 0x10:
+        values = tuple(int.from_bytes(value[i:i + 2], "little") for i in range(0, 16, 2))
+        offset = int.from_bytes(value[2:4], "little", signed=True)
+        return (
+            f"{prefix}; gain={values[0]:#06x}, offset={offset}, "
+            f"ref1.5_factor={values[2]:#06x}, ref1.5_temp={[hex(item) for item in values[3:5]]}, "
+            f"ref2.5_factor={values[5]:#06x}, ref2.5_temp={[hex(item) for item in values[6:8]]}"
+        )
+    if record.tag == TLV_TAG_ADC12_CAL and record.length == 0x10:
+        values = tuple(int.from_bytes(value[i:i + 2], "little") for i in range(0, 16, 2))
+        offset = int.from_bytes(value[2:4], "little", signed=True)
+        return (
+            f"{prefix}; gain={values[0]:#06x}, offset={offset}, "
+            f"temperature_cal={[hex(item) for item in values[2:]]}"
+        )
+    if record.tag == TLV_TAG_REF_CAL and record.length == 0x06:
+        refs = tuple(int.from_bytes(value[i:i + 2], "little") for i in range(0, 6, 2))
+        return f"{prefix}; ref1.5={refs[0]:#06x}, ref2.0={refs[1]:#06x}, ref2.5={refs[2]:#06x}"
+    if record.tag == TLV_TAG_PERIPHERAL:
+        descriptor = decode_peripheral_descriptor(record)
+        if descriptor is None:
+            return f"{prefix}; peripheral payload is malformed"
+        crc_modules = [
+            f"{entry.name}@{entry.address:#05x}"
+            for entry in descriptor.entries
+            if entry.peripheral_id in (0x3C, 0x3D)
+        ]
+        crc_text = ", ".join(crc_modules) if crc_modules else "no CRC16 entry"
+        return f"{prefix}; peripherals={len(descriptor.entries)}, {crc_text}"
+    return prefix
+
+
+def _tlv_record_type_and_name(record: TlvRecord, tlv_types: dict[str, object]):
+    raw_type = _uint8_array_type(record.end - record.address)
+    if record.tag == TLV_TAG_DIE_RECORD and record.length == 0x0A:
+        return tlv_types.get("msp430_tlv_die_record", raw_type), "tlv_die_record"
+    if record.tag == TLV_TAG_ADC12_CAL_F5438 and record.length == 0x10:
+        return (
+            tlv_types.get("msp430_tlv_adc12_calibration_f5438", raw_type),
+            "tlv_adc12_calibration",
+        )
+    if record.tag == TLV_TAG_ADC12_CAL and record.length == 0x10:
+        return (
+            tlv_types.get("msp430_tlv_adc12_calibration_f5438a", raw_type),
+            "tlv_adc12_calibration",
+        )
+    if record.tag == TLV_TAG_REF_CAL and record.length == 0x06:
+        return tlv_types.get("msp430_tlv_ref_calibration", raw_type), "tlv_ref_calibration"
+    if record.tag == TLV_TAG_PERIPHERAL:
+        name = "tlv_peripheral_descriptor"
+    else:
+        name = f"tlv_record_{record.address:05x}"
+    return raw_type, name
+
+
+def _annotate_tlv_descriptor(
+    bv: BinaryView,
+    descriptor: Optional[object] = None,
+    *,
+    spec: Optional[DeviceSpec] = None,
+    auto_defined: bool = False,
+    verbose: bool = False,
+) -> int:
+    """Apply bounded, idempotent types/comments for a backed TLV block."""
+
+    if spec is None:
+        spec = _device_spec_for_view(bv)
+    if isinstance(descriptor, TlvDescriptorBlock):
+        if descriptor.erased:
+            status = "erased"
+        elif descriptor.issues:
+            status = "malformed"
+        elif descriptor.crc_valid:
+            status = "valid"
+        else:
+            status = "crc-mismatch"
+        result = _TlvReadResult(status, descriptor, TLV_REGION_SIZE)
+    elif isinstance(descriptor, _TlvReadResult):
+        result = descriptor
+    else:
+        result = _read_tlv_descriptor(bv, spec)
+    block = result.block
+    if block is None or block.erased or block.issues:
+        if verbose and result.status not in ("absent", "erased"):
+            print(f"TLV descriptors: {result.status} ({result.detail})")
+            if block is not None:
+                for issue in block.issues:
+                    print(f"  issue: {issue}")
+        return 0
+
+    changed = 0
+    tlv_types = _register_tlv_types(bv)
+    info_type = tlv_types.get("msp430_tlv_info_block", _uint8_array_type(8))
+    if _define_tlv_data_var(
+        bv,
+        block.base,
+        info_type,
+        "tlv_info_block",
+        auto_defined=auto_defined,
+    ):
+        changed += 1
+
+    device_name = _tlv_device_name(block.device_id)
+    expected = spec.tlv.expected_device_id if spec.tlv is not None else None
+    profile_note = ""
+    if expected is not None and block.device_id != expected:
+        profile_note = f"; selected profile expects device ID {expected.hex(' ')}"
+    info_comment = (
+        f"MSP430 device descriptors: {device_name}, device_id={block.device_id.hex(' ')}, "
+        f"hardware_revision={block.hardware_revision:#04x}, "
+        f"firmware_revision={block.firmware_revision:#04x}{profile_note}"
+    )
+    if _set_comment_if_empty(bv, block.base, info_comment, auto_defined=auto_defined):
+        changed += 1
+
+    crc_state = "valid" if block.crc_valid else "MISMATCH"
+    crc_comment = (
+        f"TLV CRC16/CCITT-FALSE {crc_state}: stored={block.stored_crc:#06x}, "
+        f"computed={block.computed_crc:#06x} over "
+        f"[{block.base + 4:#06x}, {block.end:#06x})"
+    )
+    if _set_comment_if_empty(bv, block.base + 2, crc_comment, auto_defined=auto_defined):
+        changed += 1
+    for name, addr in (
+        ("tlv_crc16", block.base + 2),
+        ("tlv_device_id", block.base + 4),
+    ):
+        if _symbol_exists(bv, name, addr):
+            continue
+        try:
+            _define_symbol(
+                bv,
+                Symbol(SymbolType.DataSymbol, addr, name),
+                auto_defined=auto_defined,
+            )
+            changed += 1
+        except Exception as exc:
+            log_warn(f"Could not define TLV symbol {name} at {addr:#06x}: {exc}")
+
+    for record in block.records:
+        record_type, name = _tlv_record_type_and_name(record, tlv_types)
+        if record_type is not None and _define_tlv_data_var(
+            bv,
+            record.address,
+            record_type,
+            name,
+            auto_defined=auto_defined,
+        ):
+            changed += 1
+        if _set_comment_if_empty(
+            bv,
+            record.address,
+            _tlv_record_comment(record),
+            auto_defined=auto_defined,
+        ):
+            changed += 1
+
+    if block.terminator_address is not None:
+        if _define_tlv_data_var(
+            bv,
+            block.terminator_address,
+            _uint8_type(),
+            "tlv_tag_end",
+            auto_defined=auto_defined,
+        ):
+            changed += 1
+        if _set_comment_if_empty(
+            bv,
+            block.terminator_address,
+            "TLV end tag",
+            auto_defined=auto_defined,
+        ):
+            changed += 1
+
+    if verbose:
+        print(
+            f"TLV descriptors: {result.status}, device={device_name}, "
+            f"records={len(block.records)}, crc16={crc_state.lower()}"
+        )
+        for issue in block.issues:
+            print(f"  issue: {issue}")
+    return changed
+
+
 def _define_ascii_string_data_vars(
     bv: BinaryView,
     *,
@@ -3138,10 +4064,50 @@ def report_cpux_fallbacks(bv: BinaryView) -> None:
         print(f"  {addr:#08x} {func_name}: {raw.hex()} {text}")
 
 
+def report_msp430_tlv(bv: BinaryView) -> None:
+    """Print backed factory descriptors and their stored CRC16 status."""
+
+    spec = _device_spec_for_view(bv)
+    result = _read_tlv_descriptor(bv, spec)
+    if result.block is None:
+        suffix = f": {result.detail}" if result.detail else ""
+        print(f"TLV device descriptors: {result.status}{suffix}")
+        return
+
+    block = result.block
+    device_name = _tlv_device_name(block.device_id)
+    crc_state = "valid" if block.crc_valid else "MISMATCH"
+    print(
+        f"TLV device descriptors: {result.status}; device={device_name}; "
+        f"device_id={block.device_id.hex(' ')}; hw_rev={block.hardware_revision:#04x}; "
+        f"fw_rev={block.firmware_revision:#04x}"
+    )
+    print(
+        f"CRC16/CCITT-FALSE: {crc_state}; stored={block.stored_crc:#06x}; "
+        f"computed={block.computed_crc:#06x}; range=[{block.base + 4:#06x}, {block.end:#06x})"
+    )
+    for record in block.records:
+        print(f"  {record.address:#06x}: {_tlv_record_comment(record)}")
+        peripheral = decode_peripheral_descriptor(record)
+        if peripheral is None:
+            continue
+        memory = ", ".join(f"{word:#06x}" for word in peripheral.memory_words)
+        print(f"    memory descriptors: {memory}")
+        for entry in peripheral.entries:
+            print(
+                f"    {entry.address:#06x}: {entry.name} "
+                f"(peripheral ID {entry.peripheral_id:#04x})"
+            )
+    if block.terminator_address is not None:
+        print(f"  {block.terminator_address:#06x}: TLV end tag")
+    for issue in block.issues:
+        print(f"  issue: {issue}")
+
+
 def diagnose_msp430f5438_view(bv: BinaryView) -> None:
     """Print concise mapping and decoder diagnostics for the active view."""
 
-    spec = DEFAULT_DEVICE_SPEC
+    spec = _device_spec_for_view(bv)
     raw_len = _raw_length(bv)
     reset = _read_u16(bv, spec.reset_vector)
     view_type = _view_type_name(bv)
@@ -3160,6 +4126,16 @@ def diagnose_msp430f5438_view(bv: BinaryView) -> None:
     print(f"cpux_fallback_functions={len(cpux_fallbacks)}")
     for addr, func_name, text, raw in cpux_fallbacks[:8]:
         print(f"  {addr:#08x} {func_name}: {raw.hex()} {text}")
+    tlv_result = _read_tlv_descriptor(bv, spec)
+    if tlv_result.block is None:
+        print(f"tlv={tlv_result.status}")
+    else:
+        tlv_block = tlv_result.block
+        crc_state = "valid" if tlv_block.crc_valid else "mismatch"
+        print(
+            f"tlv={tlv_result.status} device={_tlv_device_name(tlv_block.device_id)} "
+            f"records={len(tlv_block.records)} crc16={crc_state}"
+        )
     print(f"reset_vector={reset if reset is None else hex(reset)}")
     if reset is None:
         print("Reset vector is unreadable. Re-run with the correct image_base for this dump.")
@@ -3196,7 +4172,7 @@ def _regions_for_variant(variant: str) -> tuple[Region, ...]:
 def _refresh_msp430x_analysis(
     bv: BinaryView,
     *,
-    variant: str = DEVICE_VARIANT,
+    variant: Optional[str] = None,
     arch_name: Optional[str] = "msp430x",
     add_reset_entry: bool = True,
     enable_linear_sweep: bool = False,
@@ -3205,7 +4181,8 @@ def _refresh_msp430x_analysis(
 ) -> int:
     """Reapply analysis annotations without rebuilding the memory segments."""
 
-    spec = _spec_for_variant(variant)
+    spec = _device_spec_for_view(bv) if variant is None else _spec_for_variant(variant)
+    _set_view_device_spec(bv, spec)
     arch = _configure_architecture(bv, arch_name, verbose, set_platform=True)
     _enable_analysis_options(bv, enable_linear_sweep)
     if cleanup_peripheral_functions:
@@ -3221,6 +4198,7 @@ def _refresh_msp430x_analysis(
         )
     _define_symbols(bv, spec.symbols)
     apply_msp430_header_labels(bv, verbose=verbose)
+    _annotate_tlv_descriptor(bv, spec=spec, verbose=verbose)
     _remove_boundary_symbols_at_function_starts(bv, verbose, spec.symbols)
     _cleanup_erased_flash_functions(bv, verbose)
     _cleanup_ascii_string_functions(bv, verbose)
@@ -3238,6 +4216,9 @@ def _refresh_msp430x_analysis(
     _seed_address_jump_table_indirect_branches(bv, verbose=verbose)
 
     _update_analysis(bv)
+    recovered_string_calls = _recover_direct_string_call_parameters(bv, verbose=verbose)
+    if recovered_string_calls:
+        _update_analysis(bv)
 
     if verbose and arch is None:
         print(
@@ -3252,7 +4233,8 @@ def _refresh_msp430x_analysis(
 
     log_info(
         "Refreshed MSP430X analysis "
-        f"variant={variant}, vector_functions={vector_functions}"
+        f"variant={spec.name}, vector_functions={vector_functions}, "
+        f"string_call_targets={recovered_string_calls}"
     )
     return vector_functions
 
@@ -3289,6 +4271,7 @@ def apply_msp430f5438_memory_map(
         return
 
     spec = _spec_for_variant(variant)
+    _set_view_device_spec(bv, spec)
     raw_len = _raw_length(bv)
     effective_image_base = _detect_image_base(bv, raw_len)
     if image_base is not None:
@@ -3345,6 +4328,7 @@ def apply_msp430f5438_memory_map(
         )
     _define_symbols(bv, spec.symbols)
     apply_msp430_header_labels(bv, verbose=verbose)
+    _annotate_tlv_descriptor(bv, spec=spec, verbose=verbose)
     _remove_boundary_symbols_at_function_starts(bv, verbose, spec.symbols)
     _cleanup_erased_flash_functions(bv, verbose)
     _cleanup_ascii_string_functions(bv, verbose)
@@ -3362,6 +4346,9 @@ def apply_msp430f5438_memory_map(
     _seed_address_jump_table_indirect_branches(bv, verbose=verbose)
 
     _update_analysis(bv)
+    recovered_string_calls = _recover_direct_string_call_parameters(bv, verbose=verbose)
+    if recovered_string_calls:
+        _update_analysis(bv)
 
     if verbose and arch is None:
         print(
@@ -3378,7 +4365,7 @@ def apply_msp430f5438_memory_map(
         f"Applied {spec.name} memory map "
         f"variant={variant}, raw_len={raw_len:#x}, image_base={effective_image_base:#x}, "
         f"flash={spec.flash_start:#x}-{spec.flash_end:#x}, ram={spec.ram_start:#x}-{spec.ram_end:#x}, "
-        f"vector_functions={vector_functions}"
+        f"vector_functions={vector_functions}, string_call_targets={recovered_string_calls}"
     )
 
 
@@ -3469,9 +4456,13 @@ class MSP430F5438BinaryView(BinaryView):
     def init(self):
         """Create device segments, seed symbols/vectors, and select the entry point."""
 
-        spec = self.spec
         raw_len = _raw_length(self.raw)
         image_base = _detect_image_base(self.raw, raw_len)
+        detected_spec = _detect_device_spec_from_tlv(self.raw, image_base)
+        if detected_spec is not None:
+            self.spec = detected_spec
+        spec = self.spec
+        _set_view_device_spec(self, spec)
         regions = spec.regions
         if getattr(self, "parse_only", False):
             reset = _read_raw_u16(self.raw, spec.reset_vector - image_base)
@@ -3507,6 +4498,12 @@ class MSP430F5438BinaryView(BinaryView):
             apply_msp430_header_labels(self, auto_defined=True, verbose=False)
         except Exception as exc:
             log_warn(f"Could not apply MSP430 header labels during load: {exc}")
+        _annotate_tlv_descriptor(
+            self,
+            spec=spec,
+            auto_defined=True,
+            verbose=False,
+        )
         _remove_boundary_symbols_at_function_starts(self, symbols=spec.symbols)
         _cleanup_erased_flash_functions(self, False)
         _cleanup_ascii_string_functions(self, False)
@@ -3522,6 +4519,7 @@ class MSP430F5438BinaryView(BinaryView):
         _seed_sparse_code_island_functions(self, verbose=False)
         _seed_address_jump_table_target_functions(self, verbose=False)
         _seed_address_jump_table_indirect_branches(self, verbose=False)
+        _schedule_string_call_parameter_recovery(self)
         reset = _read_u16(self, spec.reset_vector)
         if reset is not None and _is_probable_code_pointer(reset):
             self._entry_point = reset
@@ -3642,6 +4640,11 @@ try:
         "MSP430F5438\\Report CPUX fallback instructions",
         "Print any undecoded CPUX fallback instructions that remain inside analyzed functions.",
         report_cpux_fallbacks,
+    )
+    PluginCommand.register(
+        "MSP430F5438\\Report TLV device descriptors and CRC16",
+        "Print factory device descriptors, calibration records, peripheral IDs, and stored TLV CRC16 validity.",
+        report_msp430_tlv,
     )
     PluginCommand.register(
         "MSP430F5438\\Re-run MSP430X analysis",

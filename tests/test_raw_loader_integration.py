@@ -29,6 +29,10 @@ from tests.fixture_firmware import (
     SHORT_JUNK_STRING_ADDRESS,
     SPARSE_FUNCTION,
     SPARSE_FUNCTION_ADDRESS,
+    STRING_CALL_ARGUMENT,
+    STRING_CALL_ARGUMENT_ADDRESS,
+    STRING_CALLER_ADDRESS,
+    STRING_CALL_TARGET_ADDRESS,
     build_sparse_raw_firmware,
 )
 
@@ -58,10 +62,17 @@ class RawLoaderIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(string_minimum, expected_minimum)
             view.update_analysis_and_wait()
+            # The loader's one-shot completion hook can queue a focused second
+            # pass after recovering string-bearing call prototypes.
+            view.update_analysis_and_wait()
 
             self.assertEqual(view.view_type, "MSP430F5438")
             self.assertEqual(str(view.arch), "msp430x")
             self.assertEqual(view.entry_point, RESET_HANDLER)
+            tlv_result = memory_map._read_tlv_descriptor(view)
+            self.assertEqual(tlv_result.status, "absent")
+            self.assertIsNone(tlv_result.block)
+            self.assertIsNone(view.get_data_var_at(memory_map.TLV_REGION_START))
             self.assertEqual(
                 bytes(view.read(SPARSE_FUNCTION_ADDRESS, len(SPARSE_FUNCTION))),
                 SPARSE_FUNCTION,
@@ -128,6 +139,34 @@ class RawLoaderIntegrationTests(unittest.TestCase):
             self.assertIsNotNone(ret_il)
             self.assertEqual(ret_il.operation, LowLevelILOperation.LLIL_RET)
             self.assertTrue(wrapper.can_return.value)
+
+            self.assertEqual(
+                bytes(
+                    view.read(
+                        STRING_CALL_ARGUMENT_ADDRESS,
+                        len(STRING_CALL_ARGUMENT),
+                    )
+                ),
+                STRING_CALL_ARGUMENT,
+            )
+            string_caller = view.get_function_at(STRING_CALLER_ADDRESS)
+            string_target = view.get_function_at(STRING_CALL_TARGET_ADDRESS)
+            self.assertIsNotNone(string_caller)
+            self.assertIsNotNone(string_target)
+            hlil_text = "\n".join(
+                str(instruction)
+                for block in string_caller.hlil
+                for instruction in block
+            )
+            self.assertIn(STRING_CALL_ARGUMENT[:-1].decode("ascii"), hlil_text)
+            self.assertIn(
+                "r12",
+                memory_map._register_parameter_names(string_target),
+            )
+            self.assertEqual(
+                memory_map._recover_direct_string_call_parameters(view),
+                0,
+            )
         finally:
             raw.file.close()
 
