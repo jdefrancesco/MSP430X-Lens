@@ -19,6 +19,7 @@ from binaryninja import (
     SectionSemantics,
     SegmentFlag,
     Settings,
+    SettingsScope,
     Symbol,
     SymbolType,
     Type,
@@ -153,7 +154,8 @@ ERASED_FLASH_MIN_RUN = 32
 ERASED_FUNCTION_MIN_BYTES = 8
 SPARSE_CODE_ISLAND_RETURN_SCAN_BYTES = 0x1000
 EXECUTABLE_SEGMENT_SCAN_MAX_BYTES = 0x200000
-ASCII_STRING_MIN_LEN = 5
+ASCII_STRING_MIN_LEN = 8
+AUTO_STRING_MIN_LENGTH_SETTING = "analysis.limits.minStringLength"
 ASCII_STRING_PADDING_MAX_LEN = 4
 ASCII_STRING_CLUSTER_MAX_GAP = 0x80
 BYTE_LOOKUP_TABLE_MIN_LEN = 16
@@ -1275,6 +1277,41 @@ def _set_load_setting_value(load_settings: Settings, key: str, value) -> None:
             load_settings.set_integer(key, value)
     except Exception as exc:
         log_warn(f"Could not set load setting {key}: {exc}")
+
+
+def _configure_auto_string_minimum(bv: BinaryView) -> int:
+    """Raise BN's inherited string minimum before the first analysis pass."""
+
+    settings = Settings()
+    try:
+        current, scope = settings.get_integer_with_scope(
+            AUTO_STRING_MIN_LENGTH_SETTING,
+            bv,
+        )
+    except Exception as exc:
+        log_warn(f"Could not read Binary Ninja's automatic-string minimum: {exc}")
+        return 0
+
+    # Only replace the inherited schema default. Preserve every explicit User,
+    # Project, or Resource value, including load-option overrides.
+    if scope != SettingsScope.SettingsDefaultScope or current >= ASCII_STRING_MIN_LEN:
+        return current
+
+    try:
+        changed = settings.set_integer(
+            AUTO_STRING_MIN_LENGTH_SETTING,
+            ASCII_STRING_MIN_LEN,
+            bv,
+            SettingsScope.SettingsResourceScope,
+        )
+    except Exception as exc:
+        log_warn(f"Could not set Binary Ninja's automatic-string minimum: {exc}")
+        return current
+
+    if not changed:
+        log_warn("Binary Ninja rejected the MSP430 firmware automatic-string minimum.")
+        return current
+    return ASCII_STRING_MIN_LEN
 
 
 def _read_u16(bv: BinaryView, addr: int) -> Optional[int]:
@@ -3441,6 +3478,8 @@ class MSP430F5438BinaryView(BinaryView):
             if reset is not None and _is_probable_code_pointer(reset):
                 self._entry_point = reset
             return True
+
+        _configure_auto_string_minimum(self)
 
         self.begin_bulk_add_segments()
         try:

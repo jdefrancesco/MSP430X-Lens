@@ -1,6 +1,12 @@
 import unittest
 
-from binaryninja import BinaryView, BinaryViewType, LowLevelILOperation
+from binaryninja import (
+    BinaryView,
+    BinaryViewType,
+    LowLevelILOperation,
+    Settings,
+    SettingsScope,
+)
 
 import msp430f5438_memory_map as memory_map
 from tests.fixture_firmware import (
@@ -9,12 +15,18 @@ from tests.fixture_firmware import (
     CINIT_TABLE_ADDRESS,
     CINIT_TABLE_END,
     ERASED_GAP_ADDRESS,
+    EXACT_MIN_STRING,
+    EXACT_MIN_STRING_ADDRESS,
     INDIRECT_CALL_TARGET_ADDRESS,
     INDIRECT_CALL_WRAPPER,
     INDIRECT_CALL_WRAPPER_ADDRESS,
+    LONG_STRING,
+    LONG_STRING_ADDRESS,
     PACKED_ISR_ROUTINES,
     PACKED_ISR_STARTS,
     RESET_HANDLER,
+    SHORT_JUNK_STRING,
+    SHORT_JUNK_STRING_ADDRESS,
     SPARSE_FUNCTION,
     SPARSE_FUNCTION_ADDRESS,
     build_sparse_raw_firmware,
@@ -28,8 +40,23 @@ class RawLoaderIntegrationTests(unittest.TestCase):
             view_type = BinaryViewType[memory_map.MSP430F5438BinaryView.name]
             self.assertTrue(view_type.is_valid_for_data(raw))
 
+            inherited_minimum, inherited_scope = Settings().get_integer_with_scope(
+                memory_map.AUTO_STRING_MIN_LENGTH_SETTING,
+            )
+            expected_minimum = inherited_minimum
+            if (
+                inherited_scope == SettingsScope.SettingsDefaultScope
+                and inherited_minimum < memory_map.ASCII_STRING_MIN_LEN
+            ):
+                expected_minimum = memory_map.ASCII_STRING_MIN_LEN
+
             view = view_type.create(raw)
             self.assertIsNotNone(view)
+            string_minimum = Settings().get_integer(
+                memory_map.AUTO_STRING_MIN_LENGTH_SETTING,
+                view,
+            )
+            self.assertEqual(string_minimum, expected_minimum)
             view.update_analysis_and_wait()
 
             self.assertEqual(view.view_type, "MSP430F5438")
@@ -39,6 +66,25 @@ class RawLoaderIntegrationTests(unittest.TestCase):
                 bytes(view.read(SPARSE_FUNCTION_ADDRESS, len(SPARSE_FUNCTION))),
                 SPARSE_FUNCTION,
             )
+            self.assertEqual(
+                bytes(view.read(SHORT_JUNK_STRING_ADDRESS, len(SHORT_JUNK_STRING))),
+                SHORT_JUNK_STRING,
+            )
+            self.assertEqual(
+                bytes(view.read(EXACT_MIN_STRING_ADDRESS, len(EXACT_MIN_STRING))),
+                EXACT_MIN_STRING,
+            )
+            self.assertEqual(
+                bytes(view.read(LONG_STRING_ADDRESS, len(LONG_STRING))),
+                LONG_STRING,
+            )
+            if string_minimum == memory_map.ASCII_STRING_MIN_LEN:
+                self.assertIsNone(view.get_string_at(SHORT_JUNK_STRING_ADDRESS))
+                self.assertIsNotNone(view.get_string_at(EXACT_MIN_STRING_ADDRESS))
+                self.assertIsNotNone(view.get_string_at(LONG_STRING_ADDRESS))
+            self.assertIsNone(view.get_data_var_at(SHORT_JUNK_STRING_ADDRESS))
+            self.assertIsNotNone(view.get_data_var_at(EXACT_MIN_STRING_ADDRESS))
+            self.assertIsNotNone(view.get_data_var_at(LONG_STRING_ADDRESS))
             self.assertTrue(view.get_segment_at(SPARSE_FUNCTION_ADDRESS).executable)
             self.assertFalse(view.get_segment_at(ERASED_GAP_ADDRESS).executable)
             self.assertIsNotNone(view.get_function_at(RESET_HANDLER))

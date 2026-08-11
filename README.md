@@ -135,6 +135,15 @@ start inside those strings or in short zero padding next to them, which prevents
 string tables from decompiling into noisy carry/flag-heavy pseudocode or tiny
 `bra @pc` functions.
 
+To keep random firmware bytes out of Binary Ninja's Strings sidebar, the mapped
+loader raises the inherited `analysis.limits.minStringLength` setting from four
+to eight before initial analysis. Explicit User, Project, and Resource values
+are preserved. For ELF files, set that option to eight before opening the file;
+the mapped-raw loader cannot apply its per-view default to an ELF yet. Binary
+Ninja does not rediscover strings during ordinary reanalysis, so reopen the
+original firmware after changing this setting or updating the plugin; an
+existing BNDB keeps its previously discovered strings.
+
 After importing external symbols or types, such as names recovered from a
 Ghidra project, use `Tools -> MSP430F5438 -> Re-run MSP430X analysis`. This
 refreshes vector entry points, removes boundary data symbols that collide with

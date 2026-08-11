@@ -16,6 +16,16 @@ INDIRECT_CALL_WRAPPER_ADDRESS = 0x6D00
 INDIRECT_CALL_TARGET_ADDRESS = 0x7DE0
 INDIRECT_CALL_POINTER_ADDRESS = 0xE000
 ERASED_GAP_ADDRESS = 0x6050
+SHORT_JUNK_STRING_ADDRESS = 0x6800
+EXACT_MIN_STRING_ADDRESS = 0x6820
+LONG_STRING_ADDRESS = 0x6840
+
+# The short printable run resembles the accidental strings Binary Ninja finds
+# in instruction bytes at its default four-byte threshold. The other two cover
+# the firmware-specific minimum and an unambiguously useful diagnostic string.
+SHORT_JUNK_STRING = b"BDI6@\x00"
+EXACT_MIN_STRING = b"MSP430X!\x00"
+LONG_STRING = b"cmd_enter_bootloader: request/response descriptor 11\x00"
 
 # call #0x7de0; call #0x6d00; ret. Direct references make both functions
 # deterministic analysis roots for the integration fixture.
@@ -78,6 +88,9 @@ def build_sparse_raw_firmware() -> bytes:
     place(SPARSE_FUNCTION_ADDRESS, SPARSE_FUNCTION)
     place(PACKED_ISR_ADDRESS, b"".join(PACKED_ISR_ROUTINES))
     place(CINIT_TABLE_ADDRESS, CINIT_TABLE)
+    place(SHORT_JUNK_STRING_ADDRESS, SHORT_JUNK_STRING)
+    place(EXACT_MIN_STRING_ADDRESS, EXACT_MIN_STRING)
+    place(LONG_STRING_ADDRESS, LONG_STRING)
     place(INDIRECT_CALL_WRAPPER_ADDRESS, INDIRECT_CALL_WRAPPER)
     place(INDIRECT_CALL_TARGET_ADDRESS, INDIRECT_CALL_TARGET)
     place(

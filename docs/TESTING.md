@@ -60,13 +60,24 @@ Verify the loader and registration:
    following `ret` at `0x6d06`, and is not marked `noreturn`.
 10. Confirm the indirect call resolves through the pointer at `0xe000` to the
     returning function at `0x7de0`.
-11. Confirm the long `0xff` ranges between code islands remain
+11. In the Strings sidebar, confirm the five-character junk run at `0x6800` is
+    absent while `MSP430X!` at `0x6820` and the bootloader diagnostic at
+    `0x6840` are present.
+12. Confirm the long `0xff` ranges between code islands remain
    non-executable data.
-12. Spot-check reset/vector and MSP430 header labels.
+13. Spot-check reset/vector and MSP430 header labels.
 
 If `Open With Options` predicts ARM/Thumb, close the view and reopen it with
 the exact MSP430F5438 view type. The generic firmware loader is not the mapped
 MSP430F5438 loader.
+
+Automatic strings are discovered only during Binary Ninja's first analysis
+pass. If short junk strings remain after a plugin update, close the old view and
+reopen the original firmware; `Re-run MSP430X analysis` cannot remove entries
+already recorded by the core string scanner. The mapped-raw loader applies the
+eight-character minimum automatically. Before opening an ELF, set Binary
+Ninja's `analysis.limits.minStringLength` option to eight manually; the planned
+ELF pre-analysis hook will make that per-view setup automatic.
 
 For an already-open mapped or ELF file, run
 `Tools -> MSP430F5438 -> Re-run MSP430X analysis` and check the log for:
