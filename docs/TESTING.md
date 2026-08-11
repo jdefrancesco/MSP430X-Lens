@@ -53,28 +53,30 @@ Verify the loader and registration:
 2. Confirm the architecture/platform is `msp430x`.
 3. Confirm the `Tools -> MSP430F5438` commands are present.
 4. Run `Tools -> MSP430F5438 -> Diagnose active view`.
-5. Confirm `0x5c00` is the reset-handler function.
-6. Confirm `0x6000` is recovered as a function even though nothing references
+5. Let initial analysis finish, then run
+   `Tools -> MSP430F5438 -> Re-run MSP430X analysis` once.
+6. Confirm `0x5c00` is the reset-handler function.
+7. Confirm `0x6000` is recovered as a function even though nothing references
    it.
-7. Confirm the adjacent interrupt handlers at `0x6100`, `0x6108`, and `0x610c`
+8. Confirm the adjacent interrupt handlers at `0x6100`, `0x6108`, and `0x610c`
    are all recovered from one backed island.
-8. Confirm the C initializer table at `0x6112`, immediately after those
+9. Confirm the C initializer table at `0x6112`, immediately after those
    handlers, is data rather than another function.
-9. Confirm the function at `0x6d00` contains `call r11` at `0x6d04` and the
+10. Confirm the function at `0x6d00` contains `call r11` at `0x6d04` and the
    following `ret` at `0x6d06`, and is not marked `noreturn`.
-10. Confirm the indirect call resolves through the pointer at `0xe000` to the
+11. Confirm the indirect call resolves through the pointer at `0xe000` to the
     returning function at `0x7de0`.
-11. In the Strings sidebar, confirm the five-character junk run at `0x6800` is
+12. In the Strings sidebar, confirm the five-character junk run at `0x6800` is
     absent while `MSP430X!` at `0x6820` and the bootloader diagnostic at
     `0x6840` are present.
-12. Open Pseudo C at `0x6e00` and confirm the call at `0x6e0a` includes
+13. Open Pseudo C at `0x6e00` and confirm the call at `0x6e0a` includes
     `"module=startup state=%u result=%u"`. In Disassembly, confirm the string
     address is loaded into R12 immediately before that call. The target at
     `0x6e40` should have a first `char *format` parameter rather than losing the
     R12 value during HLIL simplification.
-13. Confirm the long `0xff` ranges between code islands remain
+14. Confirm the long `0xff` ranges between code islands remain
     non-executable data.
-14. Spot-check reset/vector and MSP430 header labels.
+15. Spot-check reset/vector and MSP430 header labels.
 
 For the synthetic `build/base-zero-low64k-tlv.bin`, also verify:
 

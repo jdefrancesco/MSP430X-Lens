@@ -30,7 +30,8 @@ from binaryninja import (
     log_info,
     log_warn,
 )
-from binaryninja.enums import RegisterValueType, VariableSourceType
+from binaryninja import _binaryninjacore as _bn_core
+from binaryninja.enums import FunctionUpdateType, RegisterValueType, VariableSourceType
 
 try:
     from .msp430_tlv import (
@@ -2756,14 +2757,50 @@ def _preservable_auto_parameters(func) -> Optional[tuple]:
     return parameters
 
 
+def _set_auto_call_type_adjustment(caller, addr: int, adjusted_type) -> None:
+    """Apply an automatic, call-site-local type without creating a user type."""
+
+    setter = getattr(caller, "set_auto_call_type_adjustment", None)
+    if setter is not None:
+        try:
+            setter(addr, adjusted_type, arch=caller.arch)
+        except TypeError:
+            setter(addr, adjusted_type)
+        return
+
+    setter = getattr(_bn_core, "BNSetAutoCallTypeAdjustment", None)
+    if setter is None:
+        raise RuntimeError("Binary Ninja has no automatic call type adjustment API")
+    immutable_type = adjusted_type.immutable_copy()
+    type_confidence = _bn_core.BNTypeWithConfidence()
+    type_confidence.type = immutable_type.handle
+    type_confidence.confidence = immutable_type.confidence
+    setter(caller.handle, caller.arch.handle, addr, type_confidence)
+
+
+def _mark_incremental_function_updates(functions: Iterable) -> None:
+    """Invalidate only affected callers without forcing full user reanalysis."""
+
+    for caller in functions:
+        marker = getattr(caller, "mark_updates_required", None)
+        if marker is None:
+            continue
+        try:
+            marker(FunctionUpdateType.IncrementalAutoFunctionUpdate)
+        except Exception:
+            pass
+
+
 def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False) -> int:
-    """Restore proven R12 string inputs hidden by an inferred callee prototype.
+    """Restore proven R12 strings with automatic call-site type adjustments.
 
     This runs only after function analysis.  It requires a direct CALL/CALLA,
     a constant R12 value at that call, a fully file-backed printable C string,
     and an untyped target whose inferred inputs consist exclusively of MSP430
-    callee-saved registers.  User types, zero-argument functions, and more
-    specific prototypes are never replaced.
+    callee-saved registers.  Existing call adjustments, user types,
+    zero-argument functions, and more specific prototypes are never replaced.
+    Keeping the adjustment on the proven call site prevents Binary Ninja's
+    interprocedural inference from repeatedly replacing a callee-wide auto type.
     """
 
     decoder, _branch_edges = _msp430x_decode_api()
@@ -2802,27 +2839,45 @@ def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False
             if callee is None or str(getattr(callee, "arch", "")) != "msp430x":
                 continue
             key = (
-                str(getattr(callee, "platform", "")),
-                int(getattr(callee, "start", target_addr)),
-            )
-            candidate = candidates.setdefault(
-                key,
-                {"callee": callee, "callers": {}, "format": False},
-            )
-            caller_key = (
                 str(getattr(caller, "platform", "")),
                 int(getattr(caller, "start", 0)),
+                int(call_addr),
             )
-            candidate["callers"][caller_key] = caller
-            candidate["format"] = candidate["format"] or _has_format_argument(text)
+            candidates.setdefault(
+                key,
+                {
+                    "caller": caller,
+                    "callee": callee,
+                    "call_addr": int(call_addr),
+                    "format": _has_format_argument(text),
+                },
+            )
 
     recovered = 0
+    affected_callers = {}
     for candidate in candidates.values():
+        caller = candidate["caller"]
         callee = candidate["callee"]
+        call_addr = candidate["call_addr"]
         if "r12" in _register_parameter_names(callee):
             continue
         existing_parameters = _preservable_auto_parameters(callee)
         if existing_parameters is None:
+            continue
+
+        getter = getattr(caller, "get_call_type_adjustment", None)
+        if getter is None:
+            continue
+        try:
+            existing_adjustment = getter(call_addr, caller.arch)
+        except TypeError:
+            try:
+                existing_adjustment = getter(call_addr)
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if existing_adjustment is not None:
             continue
 
         calling_convention = getattr(callee, "calling_convention", None)
@@ -2858,52 +2913,32 @@ def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False
             ).mutable_copy()
             adjusted_type.can_return = current_type.can_return
             adjusted_type.pure = current_type.pure
-            callee.set_auto_type(adjusted_type)
+            _set_auto_call_type_adjustment(caller, call_addr, adjusted_type)
         except Exception as exc:
             if verbose:
                 print(
-                    f"Could not recover R12 string parameter for function "
-                    f"{getattr(callee, 'start', 0):#x}: {exc}"
+                    f"Could not recover R12 string parameter at call "
+                    f"{call_addr:#x}: {exc}"
                 )
             log_warn(
-                f"Could not recover R12 string parameter for function "
-                f"{getattr(callee, 'start', 0):#x}: {exc}"
+                f"Could not recover R12 string parameter at call "
+                f"{call_addr:#x}: {exc}"
             )
             continue
 
-        for caller in candidate["callers"].values():
-            try:
-                caller.reanalyze()
-            except Exception:
-                pass
+        caller_key = (
+            str(getattr(caller, "platform", "")),
+            int(getattr(caller, "start", 0)),
+        )
+        affected_callers[caller_key] = caller
         recovered += 1
 
+    _mark_incremental_function_updates(affected_callers.values())
     if verbose and recovered:
         print(
-            f"Recovered R12 string parameter(s) for {recovered} direct call target(s)."
+            f"Recovered R12 string parameter(s) at {recovered} direct call site(s)."
         )
     return recovered
-
-
-def _schedule_string_call_parameter_recovery(bv: BinaryView) -> None:
-    """Run string-call recovery once the mapped view's first analysis completes."""
-
-    scheduler = getattr(bv, "add_analysis_completion_event", None)
-    if scheduler is None:
-        return
-
-    def recover_after_initial_analysis() -> None:
-        try:
-            recovered = _recover_direct_string_call_parameters(bv, verbose=False)
-            if recovered:
-                bv.update_analysis()
-        except Exception as exc:
-            log_warn(f"Could not recover R12 string call parameters: {exc}")
-
-    try:
-        scheduler(recover_after_initial_analysis)
-    except Exception as exc:
-        log_warn(f"Could not schedule R12 string call recovery: {exc}")
 
 
 def _decoded_return_kind(ins) -> Optional[str]:
@@ -4519,7 +4554,6 @@ class MSP430F5438BinaryView(BinaryView):
         _seed_sparse_code_island_functions(self, verbose=False)
         _seed_address_jump_table_target_functions(self, verbose=False)
         _seed_address_jump_table_indirect_branches(self, verbose=False)
-        _schedule_string_call_parameter_recovery(self)
         reset = _read_u16(self, spec.reset_vector)
         if reset is not None and _is_probable_code_pointer(reset):
             self._entry_point = reset

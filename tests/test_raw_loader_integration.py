@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from binaryninja import (
     BinaryView,
@@ -54,17 +55,20 @@ class RawLoaderIntegrationTests(unittest.TestCase):
             ):
                 expected_minimum = memory_map.ASCII_STRING_MIN_LEN
 
-            view = view_type.create(raw)
-            self.assertIsNotNone(view)
-            string_minimum = Settings().get_integer(
-                memory_map.AUTO_STRING_MIN_LENGTH_SETTING,
-                view,
-            )
-            self.assertEqual(string_minimum, expected_minimum)
-            view.update_analysis_and_wait()
-            # The loader's one-shot completion hook can queue a focused second
-            # pass after recovering string-bearing call prototypes.
-            view.update_analysis_and_wait()
+            with mock.patch.object(
+                memory_map,
+                "_recover_direct_string_call_parameters",
+                wraps=memory_map._recover_direct_string_call_parameters,
+            ) as recover_string_calls:
+                view = view_type.create(raw)
+                self.assertIsNotNone(view)
+                string_minimum = Settings().get_integer(
+                    memory_map.AUTO_STRING_MIN_LENGTH_SETTING,
+                    view,
+                )
+                self.assertEqual(string_minimum, expected_minimum)
+                view.update_analysis_and_wait()
+                self.assertEqual(recover_string_calls.call_count, 0)
 
             self.assertEqual(view.view_type, "MSP430F5438")
             self.assertEqual(str(view.arch), "msp430x")
@@ -153,13 +157,46 @@ class RawLoaderIntegrationTests(unittest.TestCase):
             string_target = view.get_function_at(STRING_CALL_TARGET_ADDRESS)
             self.assertIsNotNone(string_caller)
             self.assertIsNotNone(string_target)
-            hlil_text = "\n".join(
+            string_call_address = STRING_CALLER_ADDRESS + 0xA
+            original_string_target_type = str(string_target.type)
+            self.assertIsNone(
+                string_caller.get_call_type_adjustment(string_call_address)
+            )
+            initial_hlil_text = "\n".join(
                 str(instruction)
                 for block in string_caller.hlil
                 for instruction in block
             )
-            self.assertIn(STRING_CALL_ARGUMENT[:-1].decode("ascii"), hlil_text)
+            self.assertNotIn(
+                STRING_CALL_ARGUMENT[:-1].decode("ascii"),
+                initial_hlil_text,
+            )
+
+            with mock.patch.object(
+                memory_map,
+                "_recover_direct_string_call_parameters",
+                wraps=memory_map._recover_direct_string_call_parameters,
+            ) as manual_recovery:
+                memory_map._refresh_msp430x_analysis(view, verbose=False)
+                self.assertEqual(manual_recovery.call_count, 1)
+            string_caller = view.get_function_at(STRING_CALLER_ADDRESS)
+            string_target = view.get_function_at(STRING_CALL_TARGET_ADDRESS)
+            refreshed_hlil_text = "\n".join(
+                str(instruction)
+                for block in string_caller.hlil
+                for instruction in block
+            )
             self.assertIn(
+                STRING_CALL_ARGUMENT[:-1].decode("ascii"),
+                refreshed_hlil_text,
+            )
+            call_adjustment = string_caller.get_call_type_adjustment(
+                string_call_address
+            )
+            self.assertIsNotNone(call_adjustment)
+            self.assertEqual(call_adjustment.parameters[0].name, "format")
+            self.assertEqual(str(string_target.type), original_string_target_type)
+            self.assertNotIn(
                 "r12",
                 memory_map._register_parameter_names(string_target),
             )

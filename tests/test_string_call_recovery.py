@@ -9,6 +9,7 @@ import msp430x_arch  # noqa: F401
 CALLER_ADDRESS = 0x71E0
 CALLEE_ADDRESS = 0x7AE0
 STRING_ADDRESS = 0x30E69
+CALL_ADDRESS = 0x7204
 
 # Exact bytes reduced from the UI failure.  The MOVA at 0x7200 loads the
 # format string into R12 immediately before the direct CALL at 0x7204.
@@ -66,10 +67,11 @@ class StringCallRecoveryTests(unittest.TestCase):
             callee = view.get_function_at(CALLEE_ADDRESS)
             self.assertIsNotNone(caller)
             self.assertIsNotNone(callee)
+            original_callee_type = str(callee.type)
 
             # The decoder and LLIL already know R12.  It disappears only when
             # the callee's auto prototype omits that input.
-            r12_at_call = caller.get_reg_value_at(0x7204, "r12")
+            r12_at_call = caller.get_reg_value_at(CALL_ADDRESS, "r12")
             self.assertEqual(r12_at_call.value, STRING_ADDRESS)
             self.assertNotIn("module=startup", self._hlil_text(caller))
             self.assertEqual(
@@ -77,9 +79,9 @@ class StringCallRecoveryTests(unittest.TestCase):
                 {"r4", "r5", "r6"},
             )
             decoder, _ = memory_map._msp430x_decode_api()
-            self.assertIn(0x7204, [site.address for site in caller.call_sites])
+            self.assertIn(CALL_ADDRESS, [site.address for site in caller.call_sites])
             self.assertEqual(
-                memory_map._direct_msp430_call_target(view, 0x7204, decoder),
+                memory_map._direct_msp430_call_target(view, CALL_ADDRESS, decoder),
                 CALLEE_ADDRESS,
             )
             self.assertEqual(
@@ -109,19 +111,52 @@ class StringCallRecoveryTests(unittest.TestCase):
             caller = view.get_function_at(CALLER_ADDRESS)
             callee = view.get_function_at(CALLEE_ADDRESS)
             self.assertIn("module=startup state=%u result=%u", self._hlil_text(caller))
-            self.assertEqual(callee.type.parameters[0].name, "format")
-            self.assertIn("char", str(callee.type.parameters[0].type))
+            call_adjustment = caller.get_call_type_adjustment(CALL_ADDRESS)
+            self.assertIsNotNone(call_adjustment)
+            self.assertEqual(call_adjustment.parameters[0].name, "format")
+            self.assertIn("char", str(call_adjustment.parameters[0].type))
+            self.assertTrue(call_adjustment.has_variable_arguments.value)
+
+            # Evidence from one call site must not rewrite the callee globally.
+            self.assertEqual(str(callee.type), original_callee_type)
             self.assertEqual(
                 memory_map._register_parameter_names(callee),
-                {"r4", "r5", "r6", "r12"},
+                {"r4", "r5", "r6"},
             )
-            self.assertTrue(callee.has_variable_arguments.value)
 
-            # The recovered R12 parameter makes a second pass a no-op.
+            # The automatic call adjustment survives analysis and makes a
+            # second recovery pass a no-op.
+            view.update_analysis_and_wait()
             self.assertEqual(
                 memory_map._recover_direct_string_call_parameters(view),
                 0,
             )
+            self.assertIn("module=startup state=%u result=%u", self._hlil_text(caller))
+        finally:
+            view.file.close()
+
+    def test_existing_user_call_adjustment_is_never_replaced(self):
+        view = self._new_view()
+        try:
+            caller = view.get_function_at(CALLER_ADDRESS)
+            callee = view.get_function_at(CALLEE_ADDRESS)
+            original_callee_type = str(callee.type)
+            user_adjustment = Type.function(
+                callee.return_type,
+                [FunctionParameter(Type.int(2, False), "event")],
+                calling_convention=self.arch.default_calling_convention,
+            )
+            caller.set_call_type_adjustment(CALL_ADDRESS, user_adjustment)
+            view.update_analysis_and_wait()
+
+            self.assertEqual(
+                memory_map._recover_direct_string_call_parameters(view),
+                0,
+            )
+            retained_adjustment = caller.get_call_type_adjustment(CALL_ADDRESS)
+            self.assertIsNotNone(retained_adjustment)
+            self.assertEqual(retained_adjustment.parameters[0].name, "event")
+            self.assertEqual(str(callee.type), original_callee_type)
         finally:
             view.file.close()
 
@@ -177,6 +212,24 @@ class StringCallRecoveryTests(unittest.TestCase):
         self.assertTrue(memory_map._has_format_argument("result=%04x"))
         self.assertFalse(memory_map._has_format_argument("literal %%u"))
         self.assertTrue(memory_map._has_format_argument("literal %%%u then value"))
+
+    def test_affected_callers_are_refreshed_incrementally(self):
+        updates = []
+
+        class Caller:
+            def reanalyze(self):
+                raise AssertionError("full caller reanalysis must not be requested")
+
+            def mark_updates_required(self, update_type):
+                updates.append(update_type)
+
+        callers = [Caller() for _ in range(3)]
+        memory_map._mark_incremental_function_updates(callers)
+
+        self.assertEqual(
+            updates,
+            [memory_map.FunctionUpdateType.IncrementalAutoFunctionUpdate] * 3,
+        )
 
 
 if __name__ == "__main__":
