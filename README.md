@@ -13,6 +13,29 @@ core features include:
 artifacts that Ghidra generally leaves.
 - Pure Python. No external dependencies used making porting and installation easier.
 
+## Binary Ninja + MSP430X Lens vs. Ghidra
+
+The same function (`__msp430f5438_flash_start` at `0x5c00`) from the same raw
+firmware image, decompiled with MSP430X Lens on Binary Ninja versus Ghidra's
+stock MSP430 support:
+
+| Binary Ninja + MSP430X Lens | Ghidra |
+| --- | --- |
+| ![Binary Ninja decompilation](ss/ss-readme-bn.png) | ![Ghidra decompilation](ss/ss-readme-ghidra.png) |
+
+Ghidra's decompiler declares a page of `undefined`/`uVar`/`unaff_R3`-typed
+locals up front and replays every `CALLA` as manual stack-pointer writes
+(`*(undefined4 *)(uVar3 - 4) = 0x5c0a; FUN_0000a9d8(0xfe);`), plus a stale
+`_`-prefixed global overlap warning at the top of the listing. The loop it
+recovers keeps a raw memory-mapped counter (`_DAT_00005372`) instead of a
+local variable.
+
+MSP430X Lens's simplification passes collapse that same code to
+`sub_a9d8(0xfe)` calls, typed factory globals (`data_536e` instead of
+`DAT_0000536e`), and a `do`/`while` loop with real induction variables
+(`len`, `len_1`, `len_2`). The output reads close to the original C rather
+than a disassembly transcript with the artifacts Ghidra leaves behind.
+
 ## Agentic Augmented
 
 The beginning of this project (i.e lifting) was written by hand to ensure the correct
