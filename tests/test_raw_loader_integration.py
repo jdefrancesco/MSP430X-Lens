@@ -4,6 +4,13 @@ from binaryninja import BinaryView, BinaryViewType
 
 import msp430f5438_memory_map as memory_map
 from tests.fixture_firmware import (
+    CINIT_PAYLOAD_ADDRESSES,
+    CINIT_RECORD_ADDRESSES,
+    CINIT_TABLE_ADDRESS,
+    CINIT_TABLE_END,
+    ERASED_GAP_ADDRESS,
+    PACKED_ISR_ROUTINES,
+    PACKED_ISR_STARTS,
     RESET_HANDLER,
     SPARSE_FUNCTION,
     SPARSE_FUNCTION_ADDRESS,
@@ -30,8 +37,25 @@ class RawLoaderIntegrationTests(unittest.TestCase):
                 SPARSE_FUNCTION,
             )
             self.assertTrue(view.get_segment_at(SPARSE_FUNCTION_ADDRESS).executable)
+            self.assertFalse(view.get_segment_at(ERASED_GAP_ADDRESS).executable)
             self.assertIsNotNone(view.get_function_at(RESET_HANDLER))
             self.assertIsNotNone(view.get_function_at(SPARSE_FUNCTION_ADDRESS))
+            for start in PACKED_ISR_STARTS:
+                self.assertIsNotNone(view.get_function_at(start))
+            self.assertEqual(
+                bytes(view.read(PACKED_ISR_STARTS[0], sum(map(len, PACKED_ISR_ROUTINES)))),
+                b"".join(PACKED_ISR_ROUTINES),
+            )
+            cinit_functions = sorted(
+                function.start
+                for function in view.functions
+                if CINIT_TABLE_ADDRESS <= function.start < CINIT_TABLE_END
+            )
+            self.assertEqual(cinit_functions, [])
+            for record in CINIT_RECORD_ADDRESSES:
+                self.assertIsNotNone(view.get_data_var_at(record))
+            for payload in CINIT_PAYLOAD_ADDRESSES:
+                self.assertIsNone(view.get_function_at(payload))
         finally:
             raw.file.close()
 

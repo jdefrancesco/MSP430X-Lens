@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
 import importlib
 import json
@@ -83,6 +84,15 @@ CinitRecordInfo = tuple[int, int, int]
 CinitRecord = tuple[int, int, int, int]
 CinitCandidate = tuple[int, int, tuple[CinitRecord, ...]]
 CpuxFallback = tuple[int, str, str, bytes]
+
+
+@dataclass(frozen=True, slots=True)
+class _RoutineShape:
+    """Conservative bounds and terminal-flow kind for one decoded routine."""
+
+    length: int
+    termination_kind: str
+    instruction_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -2273,19 +2283,273 @@ def _looks_like_msp430_function_entry(data: bytes) -> bool:
     return (word & 0xFFF0) == 0x4100 and dst_reg >= 4
 
 
-def _looks_like_msp430_function_island(data: bytes) -> bool:
-    """Require both a strong entry and a return inside a small backed island."""
+def _msp430x_decode_api():
+    """Return local decode and control-flow helpers for either import style."""
 
-    if len(data) < 4 or not _looks_like_msp430_function_entry(data):
+    package = globals().get("__package__")
+    module_names = []
+    if package:
+        module_names.append(f"{package}.msp430x_arch")
+    module_names.append("msp430x_arch")
+    for module_name in module_names:
+        try:
+            module = importlib.import_module(module_name)
+            decoder = getattr(module, "decode", None)
+            branch_edges = getattr(module, "decoded_branch_edges", None)
+            if decoder is not None and branch_edges is not None:
+                return decoder, branch_edges
+        except ImportError:
+            continue
+    return None, None
+
+
+def _decoded_return_kind(ins) -> Optional[str]:
+    """Return the architectural return kind for a decoded instruction."""
+
+    if (
+        getattr(ins, "fmt", None) == "single"
+        and getattr(ins, "mnemonic", None) in ("ret", "reta", "reti")
+    ):
+        return ins.mnemonic
+    if (
+        getattr(ins, "fmt", None) != "double"
+        or getattr(ins, "mnemonic", None) not in ("mov", "mova")
+    ):
+        return None
+    src = getattr(ins, "src", None)
+    dst = getattr(ins, "dst", None)
+    if (
+        getattr(src, "kind", None) == "indirect"
+        and getattr(src, "reg", None) == 1
+        and getattr(src, "autoinc", False)
+        and getattr(dst, "kind", None) == "reg"
+        and getattr(dst, "reg", None) == 0
+    ):
+        return "reta" if getattr(ins, "size", 2) == 4 else "ret"
+    return None
+
+
+def _looks_like_msp430_reti_leaf_entry(
+    data: bytes,
+    addr: int,
+    *,
+    decoder,
+    branch_edges,
+) -> bool:
+    """Reject padding and control transfers as unevidenced leaf-ISR entries."""
+
+    if len(data) < 4 or _u16_from_le(data, 0) in (0x0000, 0x4303, 0xFFFF):
         return False
-    scan = data[:SPARSE_CODE_ISLAND_RETURN_SCAN_BYTES]
-    # RET (MOV @SP+,PC), RETA (MOVA @SP+,PC), and RETI.  Looking only at
-    # word-aligned positions and requiring a prologue keeps embedded constants
-    # and lookup tables from becoming functions merely because they are backed.
-    return any(
-        _u16_from_le(scan, offset) in (0x4130, 0x0110, 0x1300)
-        for offset in range(2, len(scan) - 1, 2)
+    try:
+        ins = decoder(data, addr)
+        flow = tuple(branch_edges(ins, addr)) if ins is not None else ()
+    except Exception:
+        return False
+    return (
+        ins is not None
+        and getattr(ins, "fmt", None) not in ("bad", "cpux")
+        and getattr(ins, "mnemonic", None) not in (None, "???", "cpux")
+        and not flow
     )
+
+
+def _decode_msp430_routine(
+    data: bytes,
+    addr: int,
+    *,
+    decoder=None,
+    branch_edges=None,
+) -> Optional[_RoutineShape]:
+    """Recover a dense, terminal-bounded routine with a small CFG walk.
+
+    This intentionally rejects indirect exits, ambiguous instruction overlap,
+    and code that cannot reach a return or direct tail exit. It is a validation
+    helper for sparse discovery, not a replacement for Binary Ninja's full
+    function analysis.
+    """
+
+    if decoder is None or branch_edges is None:
+        default_decoder, default_branch_edges = _msp430x_decode_api()
+        decoder = decoder or default_decoder
+        branch_edges = branch_edges or default_branch_edges
+    if decoder is None or branch_edges is None:
+        return None
+
+    scan = data[:SPARSE_CODE_ISLAND_RETURN_SCAN_BYTES]
+    window_end = addr + len(scan)
+    pending = [addr]
+    decoded = {}
+    occupied_words = set()
+    successors = {}
+    predecessors = {}
+    return_nodes = set()
+    tail_exit_nodes = set()
+    return_kinds = set()
+
+    while pending:
+        instruction_addr = pending.pop()
+        if instruction_addr in decoded:
+            continue
+        if (
+            instruction_addr & 1
+            or instruction_addr < addr
+            or instruction_addr + 2 > window_end
+        ):
+            return None
+
+        offset = instruction_addr - addr
+        try:
+            ins = decoder(scan[offset:], instruction_addr)
+        except Exception:
+            return None
+        if ins is None or getattr(ins, "fmt", None) in ("bad", "cpux"):
+            return None
+        if getattr(ins, "mnemonic", None) in (None, "???", "cpux"):
+            return None
+        if any(
+            operand is not None and getattr(operand, "kind", None) == "bad"
+            for operand in (getattr(ins, "src", None), getattr(ins, "dst", None))
+        ):
+            return None
+
+        length = getattr(ins, "length", 0)
+        instruction_end = (
+            instruction_addr + length if isinstance(length, int) else instruction_addr
+        )
+        if (
+            not isinstance(length, int)
+            or length < 2
+            or length & 1
+            or instruction_end > window_end
+        ):
+            return None
+
+        instruction_words = range(instruction_addr, instruction_end, 2)
+        if any(word_addr in occupied_words for word_addr in instruction_words):
+            return None
+        occupied_words.update(instruction_words)
+        decoded[instruction_addr] = (instruction_end, ins)
+
+        return_kind = _decoded_return_kind(ins)
+        try:
+            flow = tuple(branch_edges(ins, instruction_addr))
+        except Exception:
+            return None
+
+        if return_kind is not None:
+            if flow != (("return", None),):
+                return None
+            next_addresses = ()
+            return_nodes.add(instruction_addr)
+            return_kinds.add(return_kind)
+        elif not flow:
+            next_addresses = (instruction_end,)
+        elif len(flow) == 1 and flow[0][0] == "call":
+            next_addresses = (instruction_end,)
+        elif len(flow) == 1 and flow[0][0] == "unconditional":
+            next_addresses = (flow[0][1],)
+        elif len(flow) == 1 and flow[0][0] == "unconditional_pc":
+            target = flow[0][1]
+            if (
+                not isinstance(target, int)
+                or target & 1
+                or target < addr
+                or target >= window_end
+            ):
+                return None
+            next_addresses = ()
+            tail_exit_nodes.add(instruction_addr)
+        elif (
+            len(flow) == 2
+            and {kind for kind, _target in flow} == {"true", "false"}
+        ):
+            next_addresses = tuple(target for _kind, target in flow)
+        else:
+            return None
+
+        if any(
+            not isinstance(target, int)
+            or target & 1
+            or target < addr
+            or target >= window_end
+            for target in next_addresses
+        ):
+            return None
+        successors[instruction_addr] = next_addresses
+        for target in next_addresses:
+            predecessors.setdefault(target, set()).add(instruction_addr)
+        pending.extend(target for target in next_addresses if target not in decoded)
+
+    terminal_nodes = return_nodes | tail_exit_nodes
+    if len(decoded) < 2 or not terminal_nodes or len(return_kinds) > 1:
+        return None
+
+    can_reach_terminal = set(terminal_nodes)
+    reachable_pending = list(terminal_nodes)
+    while reachable_pending:
+        instruction_addr = reachable_pending.pop()
+        for predecessor in predecessors.get(instruction_addr, ()):
+            if predecessor in can_reach_terminal:
+                continue
+            can_reach_terminal.add(predecessor)
+            reachable_pending.append(predecessor)
+    if len(can_reach_terminal) != len(decoded):
+        return None
+
+    cursor = addr
+    for instruction_addr, (instruction_end, _ins) in sorted(decoded.items()):
+        if instruction_addr != cursor:
+            return None
+        cursor = instruction_end
+    if not any(decoded[node][0] == cursor for node in terminal_nodes):
+        return None
+
+    if tail_exit_nodes:
+        termination_kind = "mixed" if return_nodes else "tail"
+    else:
+        termination_kind = next(iter(return_kinds))
+
+    return _RoutineShape(
+        length=cursor - addr,
+        termination_kind=termination_kind,
+        instruction_count=len(decoded),
+    )
+
+
+def _code_window_end(addr: int, island_end: int, data_spans: Sequence[AddressSpan]) -> int:
+    """Bound code validation at the next known data range."""
+
+    end = island_end
+    for data_start, data_end in data_spans:
+        if data_start <= addr < data_end:
+            return addr
+        if addr < data_start:
+            return min(end, data_start)
+    return end
+
+
+def _data_variable_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
+    """Return defensively sized spans for data variables already in the view."""
+
+    try:
+        items = tuple(getattr(bv, "data_vars", {}).items())
+    except Exception:
+        return ()
+
+    spans = []
+    for start, data_var in items:
+        try:
+            start = int(start)
+        except (TypeError, ValueError):
+            continue
+        data_type = getattr(data_var, "type", None)
+        width = getattr(data_type, "width", getattr(data_var, "width", 1))
+        try:
+            width = max(1, int(width))
+        except (TypeError, ValueError):
+            width = 1
+        spans.append((start, start + width))
+    return _merge_spans(spans)
 
 
 def _executable_backed_islands(bv: BinaryView) -> tuple[AddressSpan, ...]:
@@ -2321,10 +2585,22 @@ def _executable_backed_islands(bv: BinaryView) -> tuple[AddressSpan, ...]:
 
 
 def _seed_sparse_code_island_functions(bv: BinaryView, verbose: bool = False) -> int:
-    """Seed unreferenced functions isolated by erased bytes in executable maps."""
+    """Seed conservative function chains inside backed executable islands.
+
+    Besides an island's prologue-shaped first routine, compiler output may pack
+    several small functions together without erased padding. A decoded return
+    or direct tail exit is a reliable boundary for another prologue-shaped
+    routine. RETI-to-RETI chains also admit leaf handlers without a
+    saved-register prologue, matching the compact interrupt-handler layout used
+    by TI toolchains.
+    """
 
     add_function = getattr(bv, "add_function", None)
     if add_function is None or getattr(bv, "platform", None) is None:
+        return 0
+
+    decoder, branch_edges = _msp430x_decode_api()
+    if decoder is None or branch_edges is None:
         return 0
 
     known_data_spans = _merge_spans((
@@ -2332,29 +2608,124 @@ def _seed_sparse_code_island_functions(bv: BinaryView, verbose: bool = False) ->
         *_flash_numeric_lookup_table_spans(bv),
         *_flash_address_jump_table_spans(bv),
         *_flash_cinit_table_spans(bv),
+        *_data_variable_spans(bv),
     ))
     created = 0
-    for start, end in _executable_backed_islands(bv):
-        length = end - start
-        if (
-            start & 1
-            or length < 4
-            or _has_function_at(bv, start)
-            or _has_data_var_at(bv, start)
-            or _addr_in_spans(start, known_data_spans)
-        ):
+    for island_start, island_end in _executable_backed_islands(bv):
+        length = island_end - island_start
+        if island_start & 1 or length < 4:
             continue
         try:
-            data = bytes(bv.read(start, length))
+            data = bytes(bv.read(island_start, length))
         except Exception:
             continue
-        if not _looks_like_msp430_function_island(data):
-            continue
-        try:
-            add_function(start)
+
+        def candidate_is_blocked(addr: int) -> bool:
+            return (
+                addr & 1
+                or addr < island_start
+                or addr + 4 > island_end
+                or _has_data_var_at(bv, addr)
+                or _addr_in_spans(addr, known_data_spans)
+            )
+
+        function_starts = set()
+        for func in getattr(bv, "functions", ()):
+            function_start = getattr(func, "start", None)
+            if isinstance(function_start, int) and island_start <= function_start < island_end:
+                function_starts.add(function_start)
+        sorted_function_starts = sorted(function_starts)
+
+        def remember_function_start(addr: int) -> None:
+            if addr in function_starts:
+                return
+            function_starts.add(addr)
+            bisect.insort(sorted_function_starts, addr)
+
+        def ensure_function(addr: int, description: str) -> bool:
+            nonlocal created
+            if _has_function_at(bv, addr):
+                remember_function_start(addr)
+                return True
+            try:
+                added = add_function(addr)
+            except Exception as exc:
+                log_warn(f"Could not add {description} function at {addr:#x}: {exc}")
+                return False
+            if added is None and not _has_function_at(bv, addr):
+                log_warn(f"Binary Ninja rejected {description} function at {addr:#x}.")
+                return False
             created += 1
-        except Exception as exc:
-            log_warn(f"Could not add sparse code-island function at {start:#x}: {exc}")
+            remember_function_start(addr)
+            return True
+
+        def decode_at(addr: int) -> Optional[_RoutineShape]:
+            if candidate_is_blocked(addr):
+                return None
+            window_end = _code_window_end(addr, island_end, known_data_spans)
+            next_function_index = bisect.bisect_right(sorted_function_starts, addr)
+            if next_function_index < len(sorted_function_starts):
+                window_end = min(window_end, sorted_function_starts[next_function_index])
+            if window_end - addr < 4:
+                return None
+            offset = addr - island_start
+            return _decode_msp430_routine(
+                data[offset:offset + (window_end - addr)],
+                addr,
+                decoder=decoder,
+                branch_edges=branch_edges,
+            )
+
+        anchors = set(function_starts)
+        partition_starts = {island_start}
+        partition_starts.update(
+            data_end
+            for data_start, data_end in known_data_spans
+            if data_start < island_end and island_start < data_end < island_end
+        )
+        for partition_start in sorted(partition_starts):
+            offset = partition_start - island_start
+            routine = decode_at(partition_start)
+            if routine is None or not _looks_like_msp430_function_entry(data[offset:]):
+                continue
+            if not ensure_function(partition_start, "sparse code-island"):
+                continue
+            anchors.add(partition_start)
+
+        pending = list(anchors)
+        processed = set()
+        while pending:
+            function_start = pending.pop()
+            if function_start in processed or candidate_is_blocked(function_start):
+                continue
+            processed.add(function_start)
+            routine = decode_at(function_start)
+            if routine is None:
+                continue
+
+            next_start = function_start + routine.length
+            next_routine = decode_at(next_start)
+            if next_routine is None:
+                continue
+            next_offset = next_start - island_start
+            has_strong_entry = _looks_like_msp430_function_entry(data[next_offset:])
+            is_packed_isr = (
+                routine.termination_kind == "reti"
+                and next_routine.termination_kind == "reti"
+                and _looks_like_msp430_reti_leaf_entry(
+                    data[next_offset:],
+                    next_start,
+                    decoder=decoder,
+                    branch_edges=branch_edges,
+                )
+            )
+            if not has_strong_entry and not is_packed_isr:
+                continue
+
+            if not ensure_function(next_start, "packed code-island"):
+                continue
+            if next_start not in processed:
+                pending.append(next_start)
 
     if verbose and created:
         print(f"Seeded {created} unreferenced MSP430X sparse code-island function(s).")

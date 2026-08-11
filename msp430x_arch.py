@@ -158,6 +158,9 @@ class Decoded:
     targets: Tuple[int, ...] = ()
 
 
+DecodedBranch = Tuple[str, Optional[int]]
+
+
 def u16(data: bytes, offset: int = 0) -> Optional[int]:
     """Read one little-endian instruction word, or return ``None`` if short."""
 
@@ -1122,6 +1125,38 @@ def is_pushx_alias(ins: Decoded) -> bool:
     return ins.fmt == "single" and ins.ext is not None and ins.mnemonic == "push"
 
 
+def decoded_branch_edges(ins: Decoded, addr: int) -> Tuple[DecodedBranch, ...]:
+    """Return normalized branch edges for a decoded instruction.
+
+    Keeping this independent of Binary Ninja's ``InstructionInfo`` lets
+    conservative loader-side analysis use exactly the same control-flow rules
+    as the architecture implementation.
+    """
+
+    if ins.fmt == "jump":
+        if ins.cond == "al":
+            return (("unconditional", ins.target),)
+        return (("true", ins.target), ("false", addr + ins.length))
+    if ins.fmt == "single" and ins.mnemonic in ("call", "calla"):
+        target = ins.src.value if ins.src and ins.src.kind == "imm" else None
+        return (("call", target),)
+    if ins.fmt == "single" and ins.mnemonic in ("reta", "reti"):
+        return (("return", None),)
+    if ins.fmt == "multi" and ins.mnemonic == "brajt.a":
+        return (("indirect", None),)
+    if ins.fmt == "double" and ins.dst and ins.dst.kind == "reg" and ins.dst.reg == 0:
+        if is_reta_alias(ins) or is_ret_alias(ins):
+            return (("return", None),)
+        if (
+            ins.src
+            and ins.src.kind == "imm"
+            and (is_bra_alias(ins) or is_br_alias(ins))
+        ):
+            return (("unconditional_pc", ins.src.value),)
+        return (("indirect", None),)
+    return ()
+
+
 class MSP430XCallingConvention(CallingConvention):
     """Conservative register convention used when firmware lacks type data."""
 
@@ -1439,28 +1474,23 @@ class MSP430XArchitecture(Architecture):
             return None
         result = InstructionInfo()
         result.length = ins.length
-        if ins.fmt == "jump":
-            if ins.cond == "al":
-                result.add_branch(BranchType.UnconditionalBranch, ins.target)
+        branch_types = {
+            "unconditional": BranchType.UnconditionalBranch,
+            "unconditional_pc": BranchType.UnconditionalBranch,
+            "true": BranchType.TrueBranch,
+            "false": BranchType.FalseBranch,
+            "call": BranchType.CallDestination,
+            "return": BranchType.FunctionReturn,
+            "indirect": BranchType.IndirectBranch,
+        }
+        for kind, target in decoded_branch_edges(ins, addr):
+            branch_type = branch_types[kind]
+            if kind == "call" and target is None:
+                branch_type = BranchType.IndirectBranch
+            if target is None:
+                result.add_branch(branch_type)
             else:
-                result.add_branch(BranchType.TrueBranch, ins.target)
-                result.add_branch(BranchType.FalseBranch, addr + ins.length)
-        elif ins.fmt == "single" and ins.mnemonic in ("call", "calla"):
-            if ins.src and ins.src.kind == "imm":
-                result.add_branch(BranchType.CallDestination, ins.src.value)
-            else:
-                result.add_branch(BranchType.IndirectBranch)
-        elif ins.fmt == "single" and ins.mnemonic in ("reta", "reti"):
-            result.add_branch(BranchType.FunctionReturn)
-        elif ins.fmt == "multi" and ins.mnemonic == "brajt.a":
-            result.add_branch(BranchType.IndirectBranch)
-        elif ins.fmt == "double" and ins.dst and ins.dst.kind == "reg" and ins.dst.reg == 0:
-            if is_reta_alias(ins) or is_ret_alias(ins):
-                result.add_branch(BranchType.FunctionReturn)
-            elif ins.src and ins.src.kind == "imm":
-                result.add_branch(BranchType.UnconditionalBranch, ins.src.value)
-            else:
-                result.add_branch(BranchType.IndirectBranch)
+                result.add_branch(branch_type, target)
         return result
 
     def get_instruction_text(self, data: bytes, addr: int):
