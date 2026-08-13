@@ -48,6 +48,31 @@ CALLEE_BYTES = bytes.fromhex(
 )
 FORMAT_STRING = b"boot_validate_header: enter seq=%u flags=%04x\x00"
 
+ZERO_PARAM_CALLER_ADDRESS = 0x7D20
+ZERO_PARAM_CALLEE_ADDRESS = 0xC100
+ZERO_PARAM_STRING_ADDRESS = 0x30E04
+ZERO_PARAM_CALL_ADDRESS = 0x7D44
+
+# Exact caller bytes from the second UI failure. MOVA at 0x7d40 loads the
+# format string, then CALL at 0x7d44 reaches a zero-parameter no-return target.
+ZERO_PARAM_CALLER_BYTES = bytes.fromhex(
+    "04 12 05 12 06 12 "
+    "34 40 92 5e "
+    "15 42 c6 41 "
+    "36 40 07 00 "
+    "04 55 "
+    "34 e0 6b fa "
+    "84 10 "
+    "15 53 "
+    "16 83 "
+    "f9 23 "
+    "8c 03 04 0e "
+    "b0 12 00 c1 "
+    "82 44 c6 41 "
+    "36 41 35 41 34 41 30 41"
+)
+ZERO_PARAM_FORMAT_STRING = b"module=kernel state=%u result=%d\x00"
+
 
 class StringCallRecoveryTests(unittest.TestCase):
     def setUp(self):
@@ -63,6 +88,28 @@ class StringCallRecoveryTests(unittest.TestCase):
         view.platform = self.arch.standalone_platform
         self.assertIsNotNone(view.add_function(CALLER_ADDRESS))
         self.assertIsNotNone(view.add_function(CALLEE_ADDRESS))
+        view.update_analysis_and_wait()
+        return view
+
+    def _new_zero_parameter_view(self):
+        backing = bytearray(b"\xff" * 0x31000)
+        caller_end = ZERO_PARAM_CALLER_ADDRESS + len(ZERO_PARAM_CALLER_BYTES)
+        backing[ZERO_PARAM_CALLER_ADDRESS:caller_end] = ZERO_PARAM_CALLER_BYTES
+        # A self-loop gives the target the same zero-parameter no-return shape
+        # that Binary Ninja inferred for sub_c100 in the real firmware.
+        backing[ZERO_PARAM_CALLEE_ADDRESS:ZERO_PARAM_CALLEE_ADDRESS + 2] = b"\xff\x3f"
+        string_end = ZERO_PARAM_STRING_ADDRESS + len(ZERO_PARAM_FORMAT_STRING)
+        backing[ZERO_PARAM_STRING_ADDRESS:string_end] = ZERO_PARAM_FORMAT_STRING
+
+        view = BinaryView.new(bytes(backing))
+        view.platform = self.arch.standalone_platform
+        self.assertIsNotNone(view.add_function(ZERO_PARAM_CALLER_ADDRESS))
+        callee = view.add_function(ZERO_PARAM_CALLEE_ADDRESS)
+        self.assertIsNotNone(callee)
+        view.update_analysis_and_wait()
+        # Match the real sub_c100 effective type. The minimal self-loop alone
+        # does not make BN 5.3 lower can_return automatically.
+        callee.set_auto_can_return(False)
         view.update_analysis_and_wait()
         return view
 
@@ -217,35 +264,30 @@ class StringCallRecoveryTests(unittest.TestCase):
             view.file.close()
 
     def test_proven_string_call_recovers_zero_parameter_noreturn_auto_type(self):
-        view = self._new_view()
+        view = self._new_zero_parameter_view()
         try:
-            caller = view.get_function_at(CALLER_ADDRESS)
-            callee = view.get_function_at(CALLEE_ADDRESS)
-            auto_type = Type.function(
-                Type.void(),
-                [],
-                calling_convention=self.arch.default_calling_convention,
-            )
-            auto_type = auto_type.mutable_copy()
-            auto_type.can_return = False
-            callee.set_auto_type(auto_type)
-            caller.reanalyze()
-            view.update_analysis_and_wait()
+            caller = view.get_function_at(ZERO_PARAM_CALLER_ADDRESS)
+            callee = view.get_function_at(ZERO_PARAM_CALLEE_ADDRESS)
 
             self.assertFalse(callee.has_user_type)
             self.assertEqual(callee.type.parameters, [])
+            self.assertFalse(callee.can_return.value)
+            self.assertEqual(
+                caller.get_reg_value_at(ZERO_PARAM_CALL_ADDRESS, "r12").value,
+                ZERO_PARAM_STRING_ADDRESS,
+            )
             self.assertEqual(
                 memory_map._recover_direct_string_call_parameters(view),
                 1,
             )
             view.update_analysis_and_wait()
 
-            adjustment = caller.get_call_type_adjustment(CALL_ADDRESS)
+            adjustment = caller.get_call_type_adjustment(ZERO_PARAM_CALL_ADDRESS)
             self.assertIsNotNone(adjustment)
             self.assertEqual(adjustment.parameters[0].name, "format")
             self.assertFalse(adjustment.can_return.value)
             self.assertIn(
-                "boot_validate_header: enter seq=%u flags=%04x",
+                "module=kernel state=%u result=%d",
                 self._hlil_text(caller),
             )
 

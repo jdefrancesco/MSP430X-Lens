@@ -2926,11 +2926,11 @@ def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False
 
     This runs only after function analysis.  It requires a direct CALL/CALLA,
     a constant R12 value at that call, a fully file-backed printable C string,
-    and an untyped target whose inferred inputs consist exclusively of MSP430
-    callee-saved registers. Existing incompatible call adjustments, user types,
-    zero-argument functions, and more specific prototypes are never replaced.
-    Keeping the adjustment on the proven call site prevents Binary Ninja's
-    interprocedural inference from repeatedly replacing a callee-wide auto type.
+    and an untyped target whose inferred inputs are empty or consist exclusively
+    of MSP430 callee-saved registers. Existing call adjustments, user types, and
+    more specific prototypes are never replaced. Keeping the adjustment on the
+    proven call site prevents Binary Ninja's interprocedural inference from
+    repeatedly replacing a callee-wide auto type.
     """
 
     decoder, _branch_edges = _msp430x_decode_api()
