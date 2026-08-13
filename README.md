@@ -63,6 +63,11 @@ directory:
 Restart Binary Ninja after installing. To uninstall a manual installation,
 remove only the `msp430xlens` directory or symlink you created.
 
+Do not leave both a Plugin Manager installation and a development symlink
+enabled. Binary Ninja registers Architecture/BinaryView plugins at startup, so
+two copies make behavior depend on load order. Disable the Plugin Manager copy
+while testing a checkout, then restart Binary Ninja.
+
 The plugin has no third-party Python dependencies. It requires Binary Ninja
 5.3.9757 or newer.
 
@@ -77,6 +82,17 @@ MSP430F5438 Raw Firmware (MSP430X)
 The mapped view creates segments, sections, header labels, interrupt vectors,
 and entry points before Binary Ninja's first analysis pass. Avoid opening as
 plain `Raw`, analyzing, and then retrofitting the map.
+
+ELF executables open through Binary Ninja's normal `ELF` view. The plugin
+selects the `msp430x` platform before initial analysis while preserving the
+ELF's segments, sections, permissions, symbols, and existing function types.
+Absolute F5438/F5438A annotations are added automatically only when a valid
+factory TLV block identifies the device. If an ELF omits TLV data, set `MSP430
+ELF Device Profile` in Open With Options (or Binary Ninja Settings) before
+opening it to force the matching revision, or use that device menu's `Re-run
+MSP430X analysis` command afterward.
+Relocatable `.o` files receive the architecture selection but not absolute
+device annotations.
 
 Best path for a raw dump:
 
@@ -161,25 +177,30 @@ string tables from decompiling into noisy carry/flag-heavy pseudocode or tiny
 `bra @pc` functions.
 
 Binary Ninja can also hide a valid string load when an untyped callee is
-auto-inferred from its R4-R10 save/restore prologue: the call prototype omits
-R12, so HLIL removes the proven R12 assignment as dead. `Re-run MSP430X
-analysis` recovers direct CALL/CALLA sites whose R12 value points to a fully
-backed, printable C string. It adds a local automatic type adjustment to the
-proven call site (and recognizes format strings) while retaining uncertain
-auto-inferred inputs. The callee's global type, user-authored types, and existing
-call-site adjustments are never replaced. Recovery is deliberately explicit
-rather than chained onto initial analysis, because a common logging target can
-have hundreds of callers. Use the command for mapped, ELF, or BNDB views after
-their initial analysis finishes.
+auto-inferred with no parameters or with false R4-R10 inputs from its
+save/restore prologue: the call prototype omits R12, so HLIL removes the proven
+R12 assignment as dead. `Re-run MSP430X analysis` recovers direct CALL/CALLA
+sites whose R12 value points to a fully backed, printable C string. It adds a
+durable local call-site type adjustment to the proven call (and recognizes
+format strings) while retaining uncertain auto-inferred inputs and no-return
+behavior. Binary Ninja otherwise discards the equivalent automatic adjustment
+during later analysis. The callee's global type, user-authored types, and
+existing call-site adjustments are never replaced. Recovery is deliberately
+explicit rather than chained onto initial analysis, because a common logging
+target can have hundreds of callers. Use the command for mapped, ELF, or BNDB
+views after their initial analysis finishes. The durable adjustment is stored
+with a BNDB as a user call-site override. The command synchronously confirms it
+through a bounded incremental pass. Long map/re-run menu commands execute as
+Binary Ninja background tasks so analysis can finish without blocking the UI
+thread.
 
 To keep random firmware bytes out of Binary Ninja's Strings sidebar, the mapped
-loader raises the inherited `analysis.limits.minStringLength` setting from four
-to eight before initial analysis. Explicit User, Project, and Resource values
-are preserved. For ELF files, set that option to eight before opening the file;
-the mapped-raw loader cannot apply its per-view default to an ELF yet. Binary
-Ninja does not rediscover strings during ordinary reanalysis, so reopen the
-original firmware after changing this setting or updating the plugin; an
-existing BNDB keeps its previously discovered strings.
+raw and ELF loaders raise the inherited `analysis.limits.minStringLength`
+setting from four to eight before initial analysis. Explicit User, Project, and
+distinct Resource values are preserved. Binary Ninja does not rediscover
+strings during ordinary reanalysis, so reopen the original firmware after
+changing this setting or updating the plugin; an existing BNDB keeps its
+previously discovered strings.
 
 After importing external symbols or types, such as names recovered from a
 Ghidra project, use `Tools -> MSP430F5438 -> Re-run MSP430X analysis`. This
@@ -194,14 +215,16 @@ TI-style `sfrb`/`sfrw` register definitions, module base labels, vector labels,
 TLV labels, and simple aliases such as board/HAL names that point at a known
 register label.
 
-When bytes at `0x1a00-0x1aff` are present, the mapped-raw loader reads the
-factory device descriptors before its first analysis pass. For an ELF or other
-custom view, use `Re-run MSP430X analysis` to apply the same annotations until
-the planned ELF pre-analysis hook is available. The info block, die record,
-ADC12 calibration, reference calibration, and known record layouts receive
-packed types; peripheral discovery and unknown records remain bounded byte
-arrays. The report command lists every discovered peripheral, including the
-CRC16 interfaces advertised by the device.
+When bytes at `0x1a00-0x1aff` are present, the mapped-raw and ELF loaders read
+the factory device descriptors before their first analysis pass. A CRC-valid
+supported device ID permits exact automatic variant selection on ELF. For
+another custom view, or an ELF without enough evidence, set `MSP430 ELF Device
+Profile` in Open With Options (or Binary Ninja Settings) before opening it, or
+use the matching F5438/F5438A `Re-run MSP430X analysis` command. The info block,
+die record, ADC12 calibration, reference calibration, and known record layouts
+receive packed types; peripheral discovery and unknown records remain bounded
+byte arrays. The report command lists every discovered peripheral, including
+the CRC16 interfaces advertised by the device.
 
 The stored word at `0x1a02` is checked as CRC-16/CCITT-FALSE over
 `0x1a04-0x1aff`. A mismatch is reported and left visible but does not hide

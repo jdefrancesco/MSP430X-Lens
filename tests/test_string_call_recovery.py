@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from binaryninja import Architecture, BinaryView, FunctionParameter, Type
 
@@ -6,33 +7,46 @@ import msp430f5438_memory_map as memory_map
 import msp430x_arch  # noqa: F401
 
 
-CALLER_ADDRESS = 0x71E0
-CALLEE_ADDRESS = 0x7AE0
-STRING_ADDRESS = 0x30E69
-CALL_ADDRESS = 0x7204
+CALLER_ADDRESS = 0x7000
+CALLEE_ADDRESS = 0x7120
+STRING_ADDRESS = 0x30FF4
+CALL_ADDRESS = 0x7024
 
-# Exact bytes reduced from the UI failure.  The MOVA at 0x7200 loads the
-# format string into R12 immediately before the direct CALL at 0x7204.
+# Exact bytes reduced from the UI failure. The MOVA at 0x7020 loads the
+# format string into R12 immediately before the direct CALL at 0x7024.
 CALLER_BYTES = bytes.fromhex(
     "04 12 05 12 06 12 "
-    "34 40 fc e4 "
-    "15 42 04 1d "
-    "36 40 04 00 "
+    "34 40 c7 48 "
+    "15 42 7a 40 "
+    "36 40 05 00 "
     "04 55 "
-    "34 e0 4d e8 "
-    "84 10 "
+    "34 e0 31 77 "
+    "04 54 "
+    "15 53 "
+    "16 83 "
+    "f9 23 "
+    "8c 03 f4 0f "
+    "b0 12 20 71 "
+    "82 44 7a 40 "
+    "36 41 35 41 34 41 30 41"
+)
+CALLEE_BYTES = bytes.fromhex(
+    "04 12 05 12 06 12 "
+    "34 40 c9 0b "
+    "15 42 6a 40 "
+    "36 40 03 00 "
+    "04 55 "
+    "34 e0 55 67 "
+    "04 54 "
     "15 53 "
     "16 83 "
     "f9 23 "
     "8c 03 69 0e "
-    "b0 12 e0 7a "
-    "82 44 04 1d "
+    "b0 12 00 8b "
+    "82 44 6a 40 "
     "36 41 35 41 34 41 30 41"
 )
-CALLEE_BYTES = bytes.fromhex(
-    "04 12 05 12 06 12 36 41 35 41 34 41 30 41"
-)
-FORMAT_STRING = b"module=startup state=%u result=%u\x00"
+FORMAT_STRING = b"boot_validate_header: enter seq=%u flags=%04x\x00"
 
 
 class StringCallRecoveryTests(unittest.TestCase):
@@ -73,7 +87,7 @@ class StringCallRecoveryTests(unittest.TestCase):
             # the callee's auto prototype omits that input.
             r12_at_call = caller.get_reg_value_at(CALL_ADDRESS, "r12")
             self.assertEqual(r12_at_call.value, STRING_ADDRESS)
-            self.assertNotIn("module=startup", self._hlil_text(caller))
+            self.assertNotIn("boot_validate_header", self._hlil_text(caller))
             self.assertEqual(
                 memory_map._register_parameter_names(callee),
                 {"r4", "r5", "r6"},
@@ -110,7 +124,10 @@ class StringCallRecoveryTests(unittest.TestCase):
 
             caller = view.get_function_at(CALLER_ADDRESS)
             callee = view.get_function_at(CALLEE_ADDRESS)
-            self.assertIn("module=startup state=%u result=%u", self._hlil_text(caller))
+            self.assertIn(
+                "boot_validate_header: enter seq=%u flags=%04x",
+                self._hlil_text(caller),
+            )
             call_adjustment = caller.get_call_type_adjustment(CALL_ADDRESS)
             self.assertIsNotNone(call_adjustment)
             self.assertEqual(call_adjustment.parameters[0].name, "format")
@@ -124,14 +141,32 @@ class StringCallRecoveryTests(unittest.TestCase):
                 {"r4", "r5", "r6"},
             )
 
-            # The automatic call adjustment survives analysis and makes a
+            # The durable call adjustment survives later analysis and makes a
             # second recovery pass a no-op.
             view.update_analysis_and_wait()
             self.assertEqual(
                 memory_map._recover_direct_string_call_parameters(view),
                 0,
             )
-            self.assertIn("module=startup state=%u result=%u", self._hlil_text(caller))
+            self.assertIn(
+                "boot_validate_header: enter seq=%u flags=%04x",
+                self._hlil_text(caller),
+            )
+
+            # A full later caller reanalysis used to delete the private
+            # automatic adjustment and make Pseudo C revert. The public local
+            # adjustment must survive that lifecycle as well.
+            caller.reanalyze()
+            view.update_analysis_and_wait()
+            self.assertIsNotNone(caller.get_call_type_adjustment(CALL_ADDRESS))
+            self.assertIn(
+                "boot_validate_header: enter seq=%u flags=%04x",
+                self._hlil_text(caller),
+            )
+            self.assertEqual(
+                memory_map._recover_direct_string_call_parameters(view),
+                0,
+            )
         finally:
             view.file.close()
 
@@ -181,27 +216,43 @@ class StringCallRecoveryTests(unittest.TestCase):
         finally:
             view.file.close()
 
-    def test_explicit_zero_parameter_auto_type_is_not_guessed_over(self):
+    def test_proven_string_call_recovers_zero_parameter_noreturn_auto_type(self):
         view = self._new_view()
         try:
+            caller = view.get_function_at(CALLER_ADDRESS)
             callee = view.get_function_at(CALLEE_ADDRESS)
-            callee.set_auto_type(
-                Type.function(
-                    Type.void(),
-                    [],
-                    calling_convention=self.arch.default_calling_convention,
-                )
+            auto_type = Type.function(
+                Type.void(),
+                [],
+                calling_convention=self.arch.default_calling_convention,
             )
-            view.get_function_at(CALLER_ADDRESS).reanalyze()
+            auto_type = auto_type.mutable_copy()
+            auto_type.can_return = False
+            callee.set_auto_type(auto_type)
+            caller.reanalyze()
             view.update_analysis_and_wait()
 
             self.assertFalse(callee.has_user_type)
             self.assertEqual(callee.type.parameters, [])
             self.assertEqual(
                 memory_map._recover_direct_string_call_parameters(view),
-                0,
+                1,
             )
+            view.update_analysis_and_wait()
+
+            adjustment = caller.get_call_type_adjustment(CALL_ADDRESS)
+            self.assertIsNotNone(adjustment)
+            self.assertEqual(adjustment.parameters[0].name, "format")
+            self.assertFalse(adjustment.can_return.value)
+            self.assertIn(
+                "boot_validate_header: enter seq=%u flags=%04x",
+                self._hlil_text(caller),
+            )
+
+            # Recovery is local to the proven call; the shared callee remains
+            # an auto-inferred zero-parameter no-return function.
             self.assertEqual(callee.type.parameters, [])
+            self.assertFalse(callee.has_user_type)
         finally:
             view.file.close()
 
@@ -230,6 +281,40 @@ class StringCallRecoveryTests(unittest.TestCase):
             updates,
             [memory_map.FunctionUpdateType.IncrementalAutoFunctionUpdate] * 3,
         )
+
+    def test_recovery_runs_to_a_bounded_fixed_point(self):
+        view = object()
+        with mock.patch.object(
+            memory_map,
+            "_recover_direct_string_call_parameters",
+            side_effect=(109, 41, 0),
+        ) as recover, mock.patch.object(memory_map, "_update_analysis") as update:
+            passes = memory_map._stabilize_direct_string_call_parameters(view)
+
+        self.assertEqual(passes, (109, 41, 0))
+        self.assertEqual(recover.call_count, 3)
+        self.assertEqual(update.call_count, 2)
+        update.assert_has_calls([mock.call(view), mock.call(view)])
+
+    def test_recovery_stops_at_its_analysis_pass_limit(self):
+        view = object()
+        with mock.patch.object(
+            memory_map,
+            "_recover_direct_string_call_parameters",
+            return_value=1,
+        ) as recover, mock.patch.object(
+            memory_map,
+            "_update_analysis",
+        ) as update, mock.patch.object(memory_map, "log_warn") as warn:
+            passes = memory_map._stabilize_direct_string_call_parameters(
+                view,
+                max_passes=3,
+            )
+
+        self.assertEqual(passes, (1, 1, 1))
+        self.assertEqual(recover.call_count, 3)
+        self.assertEqual(update.call_count, 3)
+        warn.assert_called_once()
 
 
 if __name__ == "__main__":

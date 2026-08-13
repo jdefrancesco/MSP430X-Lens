@@ -12,12 +12,15 @@ from tests.fixture_firmware import (
 
 
 class FakeSettings:
-    def __init__(self, value, scope):
+    def __init__(self, value, scope, inherited=None):
         self.value = value
         self.scope = scope
+        self.inherited = inherited
         self.set_calls = []
 
-    def get_integer_with_scope(self, key, resource):
+    def get_integer_with_scope(self, key, resource, scope=None):
+        if scope == SettingsScope.SettingsProjectScope and self.inherited is not None:
+            return self.inherited
         return self.value, self.scope
 
     def set_integer(self, key, value, resource, scope):
@@ -92,6 +95,61 @@ class AsciiStringTests(unittest.TestCase):
                     result = memory_map._configure_auto_string_minimum(view)
 
                 self.assertEqual(result, 5)
+                self.assertEqual(settings.set_calls, [])
+
+    def test_elf_loader_snapshot_of_schema_default_is_raised(self):
+        view = object()
+        settings = FakeSettings(
+            4,
+            SettingsScope.SettingsResourceScope,
+            inherited=(4, SettingsScope.SettingsDefaultScope),
+        )
+
+        with patch.object(memory_map, "Settings", return_value=settings):
+            result = memory_map._configure_elf_auto_string_minimum(view)
+
+        self.assertEqual(result, 8)
+        self.assertEqual(
+            settings.set_calls,
+            [
+                (
+                    memory_map.AUTO_STRING_MIN_LENGTH_SETTING,
+                    8,
+                    view,
+                    SettingsScope.SettingsResourceScope,
+                )
+            ],
+        )
+
+    def test_elf_explicit_string_minimums_are_preserved(self):
+        view = object()
+        cases = (
+            # A Resource value distinct from the inherited default is an
+            # explicit per-view override.
+            (
+                5,
+                SettingsScope.SettingsResourceScope,
+                (4, SettingsScope.SettingsDefaultScope),
+            ),
+            # An inherited User or Project value remains authoritative even
+            # if ELF copied it into Resource scope.
+            (
+                5,
+                SettingsScope.SettingsResourceScope,
+                (5, SettingsScope.SettingsUserScope),
+            ),
+            (
+                5,
+                SettingsScope.SettingsResourceScope,
+                (5, SettingsScope.SettingsProjectScope),
+            ),
+        )
+        for value, scope, inherited in cases:
+            with self.subTest(value=value, inherited_scope=inherited[1]):
+                settings = FakeSettings(value, scope, inherited=inherited)
+                with patch.object(memory_map, "Settings", return_value=settings):
+                    result = memory_map._configure_elf_auto_string_minimum(view)
+                self.assertEqual(result, value)
                 self.assertEqual(settings.set_calls, [])
 
 

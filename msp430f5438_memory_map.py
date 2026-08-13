@@ -12,6 +12,7 @@ from typing import Iterable, Optional, Sequence
 
 from binaryninja import (
     Architecture,
+    BackgroundTaskThread,
     BinaryView,
     BinaryViewType,
     Endianness,
@@ -27,10 +28,12 @@ from binaryninja import (
     SymbolType,
     Type,
     core_version,
+    core_ui_enabled,
+    execute_on_main_thread,
+    log_error_for_exception,
     log_info,
     log_warn,
 )
-from binaryninja import _binaryninjacore as _bn_core
 from binaryninja.enums import FunctionUpdateType, RegisterValueType, VariableSourceType
 
 try:
@@ -99,6 +102,10 @@ RAM_SIZE = RAM_END - RAM_START + 1
 STACK_TOP = RAM_END
 _REGISTERED_PLATFORM_RECOGNIZER = False
 DEVICE_VARIANT_METADATA_KEY = "msp430x_lens.device_variant"
+ELF_PREPARED_METADATA_KEY = "msp430x_lens.elf_prepared"
+EM_MSP430 = 105
+_ELF_RECOGNIZER_MARKER = "_msp430x_lens_elf_recognizer_registered"
+_ELF_FINALIZER_MARKER = "_msp430x_lens_elf_finalizer_registered"
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,7 +227,11 @@ SPARSE_CODE_ISLAND_RETURN_SCAN_BYTES = 0x1000
 EXECUTABLE_SEGMENT_SCAN_MAX_BYTES = 0x200000
 ASCII_STRING_MIN_LEN = 8
 STRING_CALL_MAX_BYTES = 0x400
+STRING_CALL_RECOVERY_MAX_PASSES = 4
 AUTO_STRING_MIN_LENGTH_SETTING = "analysis.limits.minStringLength"
+ELF_DEVICE_PROFILE_SETTING = "msp430xLens.elfDeviceProfile"
+ELF_DEVICE_PROFILE_AUTO = "auto"
+ELF_DEVICE_PROFILE_NONE = "none"
 ASCII_STRING_PADDING_MAX_LEN = 4
 ASCII_STRING_CLUSTER_MAX_GAP = 0x80
 BYTE_LOOKUP_TABLE_MIN_LEN = 16
@@ -1453,6 +1464,91 @@ def _configure_auto_string_minimum(bv: BinaryView) -> int:
     return ASCII_STRING_MIN_LEN
 
 
+def _configure_elf_auto_string_minimum(bv: BinaryView) -> int:
+    """Raise an ELF loader snapshot of BN's default string minimum.
+
+    The ELF loader copies the inherited schema default into Resource scope
+    before BinaryView finalization.  Distinct explicit User, Project, and
+    Resource values remain authoritative; only an unchanged copy of the
+    inherited default is promoted to the firmware-oriented minimum.
+    """
+
+    settings = Settings()
+    try:
+        current, current_scope = settings.get_integer_with_scope(
+            AUTO_STRING_MIN_LENGTH_SETTING,
+            bv,
+        )
+        inherited, inherited_scope = settings.get_integer_with_scope(
+            AUTO_STRING_MIN_LENGTH_SETTING,
+            bv,
+            SettingsScope.SettingsProjectScope,
+        )
+    except Exception as exc:
+        log_warn(f"Could not read Binary Ninja's ELF automatic-string minimum: {exc}")
+        return 0
+
+    if current >= ASCII_STRING_MIN_LEN:
+        return current
+    if current_scope != SettingsScope.SettingsResourceScope:
+        return _configure_auto_string_minimum(bv)
+    if inherited_scope != SettingsScope.SettingsDefaultScope or current != inherited:
+        return current
+
+    try:
+        changed = settings.set_integer(
+            AUTO_STRING_MIN_LENGTH_SETTING,
+            ASCII_STRING_MIN_LEN,
+            bv,
+            SettingsScope.SettingsResourceScope,
+        )
+    except Exception as exc:
+        log_warn(f"Could not set Binary Ninja's ELF automatic-string minimum: {exc}")
+        return current
+    if not changed:
+        log_warn("Binary Ninja rejected the MSP430 ELF automatic-string minimum.")
+        return current
+    return ASCII_STRING_MIN_LEN
+
+
+def _register_msp430x_settings() -> None:
+    """Expose persistent ELF pre-analysis choices in Binary Ninja Settings."""
+
+    settings = Settings()
+    try:
+        settings.register_group("msp430xLens", "MSP430X Lens")
+        if not settings.contains(ELF_DEVICE_PROFILE_SETTING):
+            settings.register_setting(
+                ELF_DEVICE_PROFILE_SETTING,
+                json.dumps(
+                    {
+                        "title": "MSP430 ELF Device Profile",
+                        "description": (
+                            "Select absolute device annotations before initial ELF "
+                            "analysis. Auto requires a CRC-valid supported factory "
+                            "TLV block; None keeps the ELF architecture-only."
+                        ),
+                        "type": "string",
+                        "default": ELF_DEVICE_PROFILE_AUTO,
+                        "enum": [
+                            ELF_DEVICE_PROFILE_AUTO,
+                            ELF_DEVICE_PROFILE_NONE,
+                            "MSP430F5438",
+                            "MSP430F5438A",
+                        ],
+                        "enumDescriptions": [
+                            "Auto-detect from factory TLV",
+                            "No absolute device profile",
+                            "MSP430F5438",
+                            "MSP430F5438A",
+                        ],
+                    }
+                ),
+            )
+    except Exception as exc:
+        log_warn(f"Could not register MSP430X Lens settings: {exc}")
+
+
 def _read_u16(bv: BinaryView, addr: int) -> Optional[int]:
     try:
         data = bv.read(addr, 2)
@@ -1653,7 +1749,14 @@ def _define_vector_data_var(
             return False
 
 
-def _set_vector_handler_type(bv: BinaryView, addr: int, name: str, func=None) -> None:
+def _set_vector_handler_type(
+    bv: BinaryView,
+    addr: int,
+    name: str,
+    func=None,
+    *,
+    auto_defined: bool = False,
+) -> None:
     if func is None:
         try:
             func = bv.get_function_at(addr)
@@ -1668,17 +1771,24 @@ def _set_vector_handler_type(bv: BinaryView, addr: int, name: str, func=None) ->
         return
 
     try:
-        func.name = name
-    except Exception:
-        pass
-
-    try:
-        func.set_user_type(_vector_handler_type(bv))
-    except Exception:
+        handler_type = _vector_handler_type(bv)
+        if auto_defined and hasattr(func, "set_auto_type"):
+            func.set_auto_type(handler_type)
+        else:
+            func.name = name
+            func.set_user_type(handler_type)
+    except Exception as exc:
+        if auto_defined:
+            log_warn(f"Could not set automatic vector handler type for {name} at {addr:#06x}: {exc}")
+            return
         try:
+            func.name = name
             func.type = _vector_handler_type(bv)
-        except Exception as exc:
-            log_warn(f"Could not set vector handler type for {name} at {addr:#06x}: {exc}")
+        except Exception as fallback_exc:
+            log_warn(
+                f"Could not set vector handler type for {name} at {addr:#06x}: "
+                f"{fallback_exc}"
+            )
 
 
 def _add_function_symbol(
@@ -1690,6 +1800,21 @@ def _add_function_symbol(
     auto_defined: bool = False,
 ) -> bool:
     try:
+        existing = None
+        getter = getattr(bv, "get_function_at", None)
+        if getter is not None:
+            try:
+                platform = getattr(bv, "platform", None)
+                existing = getter(addr, platform) if platform is not None else getter(addr)
+            except TypeError:
+                existing = getter(addr)
+            except Exception:
+                existing = None
+        # ELF symbols and debug information are stronger evidence than the
+        # device profile.  Automatic preparation must not rename or retype an
+        # existing function such as `_start` at the reset vector.
+        if auto_defined and existing is not None:
+            return False
         if entry:
             bv.add_entry_point(addr)
         func = None
@@ -1701,7 +1826,13 @@ def _add_function_symbol(
             Symbol(SymbolType.FunctionSymbol, addr, name),
             auto_defined=auto_defined,
         )
-        _set_vector_handler_type(bv, addr, name, func)
+        _set_vector_handler_type(
+            bv,
+            addr,
+            name,
+            func,
+            auto_defined=auto_defined,
+        )
         return True
     except Exception as exc:
         log_warn(f"Could not add function {name} at {addr:#06x}: {exc}")
@@ -2725,10 +2856,11 @@ def _register_parameter_names(func) -> set[str]:
 def _preservable_auto_parameters(func) -> Optional[tuple]:
     """Keep only the narrow auto-prototype shape that causes lost string inputs.
 
-    Binary Ninja can infer PUSH/POP preservation of R4-R10 as formal inputs for
-    this 20-bit architecture.  We retain those uncertain inputs rather than
-    deleting them, but refuse to rewrite a prototype containing stack,
-    implicit, caller-saved, or otherwise meaningful parameters.
+    Binary Ninja can infer either no inputs or PUSH/POP preservation of R4-R10
+    as formal inputs for this 20-bit architecture. We retain those uncertain
+    inputs rather than deleting them, but refuse to rewrite a user type or an
+    auto prototype containing stack, implicit, caller-saved, or otherwise
+    meaningful parameters.
     """
 
     if bool(getattr(func, "has_user_type", False)):
@@ -2739,7 +2871,7 @@ def _preservable_auto_parameters(func) -> Optional[tuple]:
     except Exception:
         return None
     if not parameters:
-        return None
+        return parameters
     for parameter in parameters:
         location = getattr(parameter, "location", None)
         if (
@@ -2757,29 +2889,27 @@ def _preservable_auto_parameters(func) -> Optional[tuple]:
     return parameters
 
 
-def _set_auto_call_type_adjustment(caller, addr: int, adjusted_type) -> None:
-    """Apply an automatic, call-site-local type without creating a user type."""
+def _set_recovered_call_type_adjustment(caller, addr: int, adjusted_type) -> None:
+    """Persist a proven call-site type through subsequent auto-analysis passes.
 
-    setter = getattr(caller, "set_auto_call_type_adjustment", None)
-    if setter is not None:
-        try:
-            setter(addr, adjusted_type, arch=caller.arch)
-        except TypeError:
-            setter(addr, adjusted_type)
-        return
+    Binary Ninja can discard an automatic call adjustment after it has already
+    regenerated MLIL/HLIL.  The public call-site adjustment API is durable, and
+    this recovery is only applied after exact CALL, register-value, and backed
+    string evidence has been established.  Existing incompatible adjustments
+    are never passed to this helper.
+    """
 
-    setter = getattr(_bn_core, "BNSetAutoCallTypeAdjustment", None)
+    setter = getattr(caller, "set_call_type_adjustment", None)
     if setter is None:
-        raise RuntimeError("Binary Ninja has no automatic call type adjustment API")
-    immutable_type = adjusted_type.immutable_copy()
-    type_confidence = _bn_core.BNTypeWithConfidence()
-    type_confidence.type = immutable_type.handle
-    type_confidence.confidence = immutable_type.confidence
-    setter(caller.handle, caller.arch.handle, addr, type_confidence)
+        raise RuntimeError("Binary Ninja has no durable call type adjustment API")
+    try:
+        setter(addr, adjusted_type, arch=caller.arch)
+    except TypeError:
+        setter(addr, adjusted_type)
 
 
 def _mark_incremental_function_updates(functions: Iterable) -> None:
-    """Invalidate only affected callers without forcing full user reanalysis."""
+    """Regenerate affected callers after applying a durable call-site fact."""
 
     for caller in functions:
         marker = getattr(caller, "mark_updates_required", None)
@@ -2792,12 +2922,12 @@ def _mark_incremental_function_updates(functions: Iterable) -> None:
 
 
 def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False) -> int:
-    """Restore proven R12 strings with automatic call-site type adjustments.
+    """Restore proven R12 strings with durable call-site type adjustments.
 
     This runs only after function analysis.  It requires a direct CALL/CALLA,
     a constant R12 value at that call, a fully file-backed printable C string,
     and an untyped target whose inferred inputs consist exclusively of MSP430
-    callee-saved registers.  Existing call adjustments, user types,
+    callee-saved registers. Existing incompatible call adjustments, user types,
     zero-argument functions, and more specific prototypes are never replaced.
     Keeping the adjustment on the proven call site prevents Binary Ninja's
     interprocedural inference from repeatedly replacing a callee-wide auto type.
@@ -2865,21 +2995,6 @@ def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False
         if existing_parameters is None:
             continue
 
-        getter = getattr(caller, "get_call_type_adjustment", None)
-        if getter is None:
-            continue
-        try:
-            existing_adjustment = getter(call_addr, caller.arch)
-        except TypeError:
-            try:
-                existing_adjustment = getter(call_addr)
-            except Exception:
-                continue
-        except Exception:
-            continue
-        if existing_adjustment is not None:
-            continue
-
         calling_convention = getattr(callee, "calling_convention", None)
         if calling_convention is None:
             calling_convention = getattr(
@@ -2913,7 +3028,42 @@ def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False
             ).mutable_copy()
             adjusted_type.can_return = current_type.can_return
             adjusted_type.pure = current_type.pure
-            _set_auto_call_type_adjustment(caller, call_addr, adjusted_type)
+        except Exception as exc:
+            if verbose:
+                print(
+                    f"Could not recover R12 string parameter at call "
+                    f"{call_addr:#x}: {exc}"
+                )
+            log_warn(
+                f"Could not recover R12 string parameter at call "
+                f"{call_addr:#x}: {exc}"
+            )
+            continue
+
+        getter = getattr(caller, "get_call_type_adjustment", None)
+        if getter is None:
+            continue
+        try:
+            existing_adjustment = getter(call_addr, caller.arch)
+        except TypeError:
+            try:
+                existing_adjustment = getter(call_addr)
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+        # Binary Ninja does not expose whether an effective adjustment was
+        # authored by a user, another plugin, or analysis. Never replace one.
+        if existing_adjustment is not None:
+            continue
+
+        try:
+            _set_recovered_call_type_adjustment(
+                caller,
+                call_addr,
+                adjusted_type,
+            )
         except Exception as exc:
             if verbose:
                 print(
@@ -2939,6 +3089,46 @@ def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False
             f"Recovered R12 string parameter(s) at {recovered} direct call site(s)."
         )
     return recovered
+
+
+def _stabilize_direct_string_call_parameters(
+    bv: BinaryView,
+    *,
+    verbose: bool = False,
+    max_passes: int = STRING_CALL_RECOVERY_MAX_PASSES,
+) -> tuple[int, ...]:
+    """Recover call-site strings and synchronously confirm a fixed point.
+
+    Keep this bounded orchestration on explicit analysis commands so it cannot
+    extend the initial loader pass. Durable call-site adjustments normally
+    converge after one analysis pass; the bound protects against core/API
+    behavior changes without blocking initial firmware loading.
+    """
+
+    if max_passes <= 0:
+        return ()
+
+    recovered_per_pass = []
+    for _pass_index in range(max_passes):
+        recovered = _recover_direct_string_call_parameters(bv, verbose=verbose)
+        recovered_per_pass.append(recovered)
+        if recovered == 0:
+            if verbose and len(recovered_per_pass) > 1:
+                applied = ", ".join(str(count) for count in recovered_per_pass[:-1])
+                print(
+                    "R12 string recovery stabilized after "
+                    f"{len(recovered_per_pass) - 1} analysis pass(es) "
+                    f"(adjustments applied per pass: {applied})."
+                )
+            return tuple(recovered_per_pass)
+        _update_analysis(bv)
+
+    log_warn(
+        "R12 string recovery reached its bounded analysis-pass limit "
+        f"({max_passes}); run Re-run MSP430X analysis again if a call site "
+        "still omits its string argument."
+    )
+    return tuple(recovered_per_pass)
 
 
 def _decoded_return_kind(ins) -> Optional[str]:
@@ -4022,10 +4212,9 @@ def _mapped_regions_present(bv: BinaryView, regions: Iterable[Region]) -> bool:
 
 
 def _update_analysis(bv: BinaryView) -> None:
-    try:
-        bv.update_analysis_and_wait()
-    except Exception:
-        bv.update_analysis()
+    """Run and synchronously drain analysis from a non-UI Python thread."""
+
+    bv.update_analysis_and_wait()
 
 
 def _function_block_ranges(func) -> tuple[AddressSpan, ...]:
@@ -4251,9 +4440,10 @@ def _refresh_msp430x_analysis(
     _seed_address_jump_table_indirect_branches(bv, verbose=verbose)
 
     _update_analysis(bv)
-    recovered_string_calls = _recover_direct_string_call_parameters(bv, verbose=verbose)
-    if recovered_string_calls:
-        _update_analysis(bv)
+    string_call_recovery_passes = _stabilize_direct_string_call_parameters(
+        bv,
+        verbose=verbose,
+    )
 
     if verbose and arch is None:
         print(
@@ -4269,7 +4459,7 @@ def _refresh_msp430x_analysis(
     log_info(
         "Refreshed MSP430X analysis "
         f"variant={spec.name}, vector_functions={vector_functions}, "
-        f"string_call_targets={recovered_string_calls}"
+        f"string_call_recovery_passes={string_call_recovery_passes}"
     )
     return vector_functions
 
@@ -4381,9 +4571,10 @@ def apply_msp430f5438_memory_map(
     _seed_address_jump_table_indirect_branches(bv, verbose=verbose)
 
     _update_analysis(bv)
-    recovered_string_calls = _recover_direct_string_call_parameters(bv, verbose=verbose)
-    if recovered_string_calls:
-        _update_analysis(bv)
+    string_call_recovery_passes = _stabilize_direct_string_call_parameters(
+        bv,
+        verbose=verbose,
+    )
 
     if verbose and arch is None:
         print(
@@ -4400,7 +4591,8 @@ def apply_msp430f5438_memory_map(
         f"Applied {spec.name} memory map "
         f"variant={variant}, raw_len={raw_len:#x}, image_base={effective_image_base:#x}, "
         f"flash={spec.flash_start:#x}-{spec.flash_end:#x}, ram={spec.ram_start:#x}-{spec.ram_end:#x}, "
-        f"vector_functions={vector_functions}, string_call_targets={recovered_string_calls}"
+        f"vector_functions={vector_functions}, "
+        f"string_call_recovery_passes={string_call_recovery_passes}"
     )
 
 
@@ -4445,6 +4637,134 @@ def rerun_msp430x_analysis(bv: BinaryView) -> None:
     vector_functions = _refresh_msp430x_analysis(bv, arch_name="msp430x", verbose=True)
     print(f"Re-ran MSP430X analysis and refreshed {vector_functions} vector target function(s).")
     diagnose_msp430f5438_view(bv)
+
+
+def rerun_msp430f5438a_analysis(bv: BinaryView) -> None:
+    """Refresh an existing view with the explicit MSP430F5438A profile."""
+
+    if _is_raw_binary_view(bv):
+        register_msp430f5438_binary_view()
+        _emit_raw_view_guidance()
+        return
+
+    vector_functions = _refresh_msp430x_analysis(
+        bv,
+        variant="MSP430F5438A",
+        arch_name="msp430x",
+        verbose=True,
+    )
+    print(
+        "Re-ran MSP430X analysis with the MSP430F5438A profile and refreshed "
+        f"{vector_functions} vector target function(s)."
+    )
+    diagnose_msp430f5438_view(bv)
+
+
+class _Msp430xCommandTask(BackgroundTaskThread):
+    """Run a long analysis command on a normal Python background thread."""
+
+    def __init__(self, progress_text: str, action, bv: BinaryView):
+        super().__init__(progress_text, can_cancel=False)
+        self._action = action
+        self._bv = bv
+
+    def run(self) -> None:
+        try:
+            self._action(self._bv)
+        except Exception:
+            log_error_for_exception(f"{self.progress} failed")
+            return
+        _schedule_ui_view_refresh(self._bv)
+
+
+def _same_ui_binary_view(candidate, target: BinaryView) -> bool:
+    """Return whether two UI wrappers refer to the command's open file."""
+
+    if candidate is None:
+        return False
+    try:
+        if candidate == target:
+            return True
+    except Exception:
+        pass
+    try:
+        return candidate.file.session_id == target.file.session_id
+    except Exception:
+        return False
+
+
+def _refresh_matching_ui_views(bv: BinaryView) -> None:
+    """Refresh every open UI pane displaying ``bv`` after analysis changes."""
+
+    try:
+        from binaryninjaui import UIContext
+    except Exception:
+        return
+
+    try:
+        contexts = tuple(UIContext.allContexts())
+    except Exception:
+        return
+
+    for context in contexts:
+        try:
+            tabs = tuple(context.getTabs())
+        except Exception:
+            continue
+        for tab in tabs:
+            try:
+                frames = tuple(context.getAllViewFramesForTab(tab))
+            except Exception:
+                continue
+            for frame in frames:
+                try:
+                    frame_bv = frame.getCurrentBinaryView()
+                    if not _same_ui_binary_view(frame_bv, bv):
+                        continue
+                    view = frame.getCurrentViewInterface()
+                    if view is not None:
+                        view.refreshContents()
+                except Exception:
+                    continue
+
+
+def _schedule_ui_view_refresh(bv: BinaryView) -> None:
+    """Schedule a best-effort repaint without importing UI APIs headlessly."""
+
+    try:
+        if not core_ui_enabled():
+            return
+        execute_on_main_thread(lambda: _refresh_matching_ui_views(bv))
+    except Exception:
+        # Analysis has already succeeded; a presentation refresh must not turn
+        # the completed command into a failure.
+        return
+
+
+def _run_background_analysis_command(
+    bv: BinaryView,
+    *,
+    progress_text: str,
+    action,
+) -> _Msp430xCommandTask:
+    """Start a UI command without blocking Binary Ninja's UI thread."""
+
+    task = _Msp430xCommandTask(progress_text, action, bv)
+    task.start()
+    return task
+
+
+def _background_command(action, progress_text: str):
+    """Wrap one synchronous analysis helper for PluginCommand registration."""
+
+    def start_task(bv: BinaryView) -> None:
+        _run_background_analysis_command(
+            bv,
+            progress_text=progress_text,
+            action=action,
+        )
+
+    return start_task
 
 
 class MSP430F5438BinaryView(BinaryView):
@@ -4575,10 +4895,163 @@ class MSP430F5438BinaryView(BinaryView):
         return 4
 
 
+def _prepare_msp430x_elf_view(bv: BinaryView) -> bool:
+    """Apply device annotations to an MSP430X ELF before initial analysis."""
+
+    if _view_type_name(bv) != "ELF":
+        return False
+    if str(getattr(bv, "arch", "")).lower() != "msp430x":
+        return False
+    try:
+        if not bv.executable or bv.relocatable or bv.has_database:
+            return False
+    except Exception:
+        return False
+    try:
+        if bv.query_metadata(ELF_PREPARED_METADATA_KEY):
+            return False
+    except Exception:
+        pass
+
+    _configure_elf_auto_string_minimum(bv)
+
+    # EM_MSP430 selects an instruction-set family, not an F5438 device. Apply
+    # absolute device annotations only when a CRC-valid factory descriptor or
+    # an explicit load option identifies one of our supported profiles.
+    try:
+        requested_profile = Settings().get_string(ELF_DEVICE_PROFILE_SETTING, bv)
+    except Exception:
+        requested_profile = ELF_DEVICE_PROFILE_AUTO
+    requested_profile = str(requested_profile).strip()
+    requested_spec_name = DEVICE_SPEC_ALIASES.get(requested_profile.upper())
+    spec = DEVICE_SPEC_BY_NAME.get(requested_spec_name) if requested_spec_name else None
+    allow_auto_detection = requested_profile.lower() != ELF_DEVICE_PROFILE_NONE
+
+    if not isinstance(spec, DeviceSpec) and allow_auto_detection:
+        spec = getattr(bv, "spec", None)
+    if not isinstance(spec, DeviceSpec) and allow_auto_detection:
+        try:
+            variant = bv.query_metadata(DEVICE_VARIANT_METADATA_KEY)
+        except Exception:
+            variant = None
+        if isinstance(variant, str):
+            spec_name = DEVICE_SPEC_ALIASES.get(variant.upper())
+            spec = DEVICE_SPEC_BY_NAME.get(spec_name) if spec_name is not None else None
+        else:
+            spec = None
+    if not isinstance(spec, DeviceSpec) and allow_auto_detection:
+        spec = _detect_device_spec_from_mapped_tlv(bv)
+    if not isinstance(spec, DeviceSpec):
+        try:
+            bv.store_metadata(ELF_PREPARED_METADATA_KEY, True, isAuto=True)
+        except Exception as exc:
+            log_warn(f"Could not record generic MSP430X ELF preparation state: {exc}")
+        log_info(
+            "Selected MSP430X for ELF before initial analysis; no supported "
+            "device profile was selected, so absolute F5438 annotations were skipped."
+        )
+        return True
+
+    _set_view_device_spec(bv, spec)
+    vector_functions = _seed_interrupt_vectors(
+        bv,
+        False,
+        spec=spec,
+        auto_defined=True,
+        create_functions=getattr(bv, "platform", None) is not None,
+    )
+    _define_symbols(
+        bv,
+        spec.symbols,
+        auto_defined=True,
+        skip_function_starts=False,
+    )
+    try:
+        apply_msp430_header_labels(bv, auto_defined=True, verbose=False)
+    except Exception as exc:
+        log_warn(f"Could not apply MSP430 header labels during ELF load: {exc}")
+    _annotate_tlv_descriptor(
+        bv,
+        spec=spec,
+        auto_defined=True,
+        verbose=False,
+    )
+    # ELF segments, sections, symbols, and existing functions are authoritative.
+    # Only add bounded data annotations and conservative missing-function seeds;
+    # never rebuild or remove loader-provided state from this callback.
+    _define_ascii_string_data_vars(bv, auto_defined=True, verbose=False)
+    _define_ascii_string_padding_data_vars(bv, auto_defined=True, verbose=False)
+    _define_ascii_string_gap_data_vars(bv, auto_defined=True, verbose=False)
+    _define_numeric_lookup_table_data_vars(bv, auto_defined=True, verbose=False)
+    _define_address_jump_table_data_vars(bv, auto_defined=True, verbose=False)
+    _define_cinit_table_data_vars(bv, auto_defined=True, verbose=False)
+    _seed_sparse_code_island_functions(bv, verbose=False)
+    _seed_address_jump_table_target_functions(bv, verbose=False)
+    _seed_address_jump_table_indirect_branches(bv, verbose=False)
+
+    try:
+        bv.store_metadata(ELF_PREPARED_METADATA_KEY, True, isAuto=True)
+    except Exception as exc:
+        log_warn(f"Could not record MSP430X ELF preparation state: {exc}")
+    log_info(
+        f"Prepared {spec.name} ELF for MSP430X analysis before initial analysis "
+        f"(vector_functions={vector_functions})"
+    )
+    return True
+
+
+def _recognize_msp430x_elf_platform(_view: BinaryView, _metadata):
+    """Select the MSP430X superset platform for little-endian EM_MSP430 ELF."""
+
+    arch = _find_msp430_arch("msp430x")
+    return getattr(arch, "standalone_platform", None) if arch is not None else None
+
+
+def _prepare_finalized_msp430x_elf(bv: BinaryView) -> None:
+    """BinaryView-finalization callback retained at module scope for BN."""
+
+    try:
+        _prepare_msp430x_elf_view(bv)
+    except Exception as exc:
+        log_warn(f"Could not prepare MSP430X ELF before analysis: {exc}")
+
+
+def _register_msp430x_elf_support() -> None:
+    """Register process-wide ELF architecture selection and pre-analysis setup."""
+
+    _register_msp430x_settings()
+    try:
+        elf_view_type = BinaryViewType["ELF"]
+    except Exception as exc:
+        log_warn(f"Could not find Binary Ninja's ELF BinaryView: {exc}")
+        return
+
+    if not getattr(BinaryViewType, _ELF_RECOGNIZER_MARKER, False):
+        try:
+            elf_view_type.register_platform_recognizer(
+                EM_MSP430,
+                Endianness.LittleEndian,
+                _recognize_msp430x_elf_platform,
+            )
+            setattr(BinaryViewType, _ELF_RECOGNIZER_MARKER, True)
+        except Exception as exc:
+            log_warn(f"Could not register MSP430X ELF platform recognizer: {exc}")
+
+    if not getattr(BinaryViewType, _ELF_FINALIZER_MARKER, False):
+        try:
+            BinaryViewType.add_binaryview_finalized_event(
+                _prepare_finalized_msp430x_elf
+            )
+            setattr(BinaryViewType, _ELF_FINALIZER_MARKER, True)
+        except Exception as exc:
+            log_warn(f"Could not register MSP430X ELF finalization hook: {exc}")
+
+
 def register_msp430f5438_binary_view() -> None:
     """Register the mapped view and its default MSP430X platform once."""
 
     _try_load_local_msp430x_plugin()
+    _register_msp430x_elf_support()
     if _binary_view_type_registered(MSP430F5438BinaryView.name):
         _register_msp430f5438_default_platform()
         return
@@ -4653,17 +5126,26 @@ try:
     PluginCommand.register(
         "MSP430F5438\\Apply memory map (auto base)",
         "Create or refresh MSP430F5438 segments, sections, vectors, RAM, BSL, and flash banks using base autodetection.",
-        apply_msp430f5438_memory_map,
+        _background_command(
+            apply_msp430f5438_memory_map,
+            "Applying MSP430F5438 memory map and analysis",
+        ),
     )
     PluginCommand.register(
         "MSP430F5438\\Apply memory map (main flash @ 0x5c00)",
         "Create or refresh the MSP430F5438 map for a main-flash dump whose first byte maps to 0x5c00.",
-        apply_msp430f5438_main_flash_memory_map,
+        _background_command(
+            apply_msp430f5438_main_flash_memory_map,
+            "Applying MSP430F5438 main-flash map and analysis",
+        ),
     )
     PluginCommand.register(
         "MSP430F5438\\Apply memory map (full image @ 0)",
         "Create or refresh the MSP430F5438 map for a full address-space image whose first byte maps to 0.",
-        apply_msp430f5438_full_image_memory_map,
+        _background_command(
+            apply_msp430f5438_full_image_memory_map,
+            "Applying MSP430F5438 full-image map and analysis",
+        ),
     )
     PluginCommand.register(
         "MSP430F5438\\Diagnose active view",
@@ -4683,7 +5165,10 @@ try:
     PluginCommand.register(
         "MSP430F5438\\Re-run MSP430X analysis",
         "Refresh MSP430X architecture, vector functions, and Binary Ninja analysis without rebuilding segments.",
-        rerun_msp430x_analysis,
+        _background_command(
+            rerun_msp430x_analysis,
+            "Refreshing MSP430X analysis",
+        ),
     )
     PluginCommand.register(
         "MSP430F5438\\Apply MSP430 header labels",
@@ -4693,17 +5178,34 @@ try:
     PluginCommand.register(
         "MSP430F5438A\\Apply memory map (auto base)",
         "Create or refresh MSP430F5438A segments, sections, vectors, RAM, BSL, and flash banks using base autodetection.",
-        apply_msp430f5438a_memory_map,
+        _background_command(
+            apply_msp430f5438a_memory_map,
+            "Applying MSP430F5438A memory map and analysis",
+        ),
     )
     PluginCommand.register(
         "MSP430F5438A\\Apply memory map (main flash @ 0x5c00)",
         "Create or refresh the MSP430F5438A map for a main-flash dump whose first byte maps to 0x5c00.",
-        apply_msp430f5438a_main_flash_memory_map,
+        _background_command(
+            apply_msp430f5438a_main_flash_memory_map,
+            "Applying MSP430F5438A main-flash map and analysis",
+        ),
     )
     PluginCommand.register(
         "MSP430F5438A\\Apply memory map (full image @ 0)",
         "Create or refresh the MSP430F5438A map for a full address-space image whose first byte maps to 0.",
-        apply_msp430f5438a_full_image_memory_map,
+        _background_command(
+            apply_msp430f5438a_full_image_memory_map,
+            "Applying MSP430F5438A full-image map and analysis",
+        ),
+    )
+    PluginCommand.register(
+        "MSP430F5438A\\Re-run MSP430X analysis",
+        "Refresh an existing mapped or ELF view with the explicit MSP430F5438A profile without rebuilding segments.",
+        _background_command(
+            rerun_msp430f5438a_analysis,
+            "Refreshing MSP430X analysis with MSP430F5438A profile",
+        ),
     )
 except Exception:
     pass

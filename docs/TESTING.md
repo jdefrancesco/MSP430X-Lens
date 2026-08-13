@@ -25,6 +25,11 @@ prototype recovery. A second base-zero lower-64-KiB fixture verifies F5438A
 device-ID selection, typed factory TLV records, peripheral discovery,
 CRC-16/CCITT-FALSE validation, and annotation idempotence.
 
+The ELF factory-path integration test constructs a dependency-free ELF32
+`EM_MSP430` executable and verifies that `msp430x`, string filtering, vectors,
+header labels, and TLV annotations are installed before initial analysis
+without changing ELF sections or creating duplicate-platform functions.
+
 ## UI smoke test
 
 Link this checkout into Binary Ninja's user plugin directory and generate the
@@ -39,8 +44,14 @@ The linker refuses to replace an existing plugin or symlink. Set
 Restart Binary Ninja after creating the link or changing plugin code because
 Architecture and BinaryView plugins are loaded at startup.
 
-`make fixture` creates both `build/sparse-code-islands.bin` and
-`build/base-zero-low64k-tlv.bin`. Open either using:
+Disable any Plugin Manager installation of MSP430X Lens while the development
+symlink is active. Two enabled copies can register different versions in
+load-order-dependent fashion; restart Binary Ninja after enabling or disabling
+either copy.
+
+`make fixture` creates `build/sparse-code-islands.bin`,
+`build/base-zero-low64k-tlv.bin`, and `build/msp430x-lens-fixture.elf`. Open the
+two raw images using:
 
 ```text
 MSP430F5438 Raw Firmware (MSP430X)
@@ -95,17 +106,37 @@ The synthetic descriptor order and peripheral payload follow the device
 descriptor table in TI's
 [MSP430F5438A datasheet](https://www.ti.com/lit/ds/symlink/msp430f5419a.pdf).
 
-If `Open With Options` predicts ARM/Thumb, close the view and reopen it with
-the exact MSP430F5438 view type. The generic firmware loader is not the mapped
-MSP430F5438 loader.
+Open `build/msp430x-lens-fixture.elf` with the normal `ELF` view and verify,
+before running any manual plugin command:
+
+1. Architecture and platform are both `msp430x`.
+2. `_start` remains the single function at `0x5c00`; there is no parallel
+   built-in `msp430` function.
+3. `.tlv`, `.text`, `.rodata`, and `.vectors` retain their ELF permissions.
+4. The F5438A TLV types/CRC comment, `vector_reset`, and `WDTCTL` label are
+   already present.
+5. The five-character string at `0x6800` is absent while the strings at
+   `0x6820` and `0x6840` are present.
+
+The fixture carries a CRC-valid F5438A TLV block, which is why the device labels
+appear automatically. An MSP430 ELF without a supported descriptor still opens
+as `msp430x`, but intentionally receives no assumed F5438 addresses. After its
+initial analysis, choose the matching F5438 or F5438A `Re-run MSP430X analysis`
+command to select that profile explicitly. To select it before initial analysis,
+set `MSP430 ELF Device Profile` in Open With Options (or Binary Ninja Settings)
+before opening the ELF. `Auto` does not infer a device from flash bounds alone:
+multiple MSP430 variants share the F5438 memory size and address range.
+
+For the two `.bin` fixtures only: if `Open With Options` predicts ARM/Thumb,
+close the view and reopen it with the exact MSP430F5438 raw view type. Do not
+open the `.elf` fixture with the raw view; it must remain on the normal `ELF`
+loader path.
 
 Automatic strings are discovered only during Binary Ninja's first analysis
 pass. If short junk strings remain after a plugin update, close the old view and
 reopen the original firmware; `Re-run MSP430X analysis` cannot remove entries
-already recorded by the core string scanner. The mapped-raw loader applies the
-eight-character minimum automatically. Before opening an ELF, set Binary
-Ninja's `analysis.limits.minStringLength` option to eight manually; the planned
-ELF pre-analysis hook will make that per-view setup automatic.
+already recorded by the core string scanner. Both mapped-raw and ELF executable
+views apply the inherited eight-character minimum automatically.
 
 For an already-open mapped or ELF file, run
 `Tools -> MSP430F5438 -> Re-run MSP430X analysis` and check the log for:
@@ -117,8 +148,16 @@ Seeded N unreferenced MSP430X sparse code-island function(s).
 For a direct call preceded by a constant R12 string load, also confirm the log
 reports recovered R12 string parameters and that the string appears as the
 first argument in Pseudo C. The recovery is intentionally skipped when the
-target already has a user type, an R12 parameter, or a more specific inferred
-prototype.
+target already has a user type, an R12 parameter, a more specific inferred
+prototype, or any existing call-site override. Zero-parameter auto-inferred
+callees remain eligible; their no-return behavior is preserved. The recovered
+fact is stored as a durable user override on that one call site because Binary
+Ninja can remove an automatic adjustment during later analysis. The command
+runs as a background task, and the log must not contain `UI threads are not
+permitted to wait for analysis completion`. When it finishes, an already open
+Pseudo C pane should repaint with the recovered string argument; navigating
+away and back must not be required. After Binary Ninja becomes idle, confirm
+the argument does not disappear again.
 
 ## Larger-firmware readiness
 

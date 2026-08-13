@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import struct
 import sys
 
 
@@ -26,6 +27,9 @@ ERASED_GAP_ADDRESS = 0x6050
 SHORT_JUNK_STRING_ADDRESS = 0x6800
 EXACT_MIN_STRING_ADDRESS = 0x6820
 LONG_STRING_ADDRESS = 0x6840
+ELF_STRING_REGION_END = 0x6880
+ELF_MACHINE_MSP430 = 105
+ELF_FLAGS_MSP430X54 = 54
 
 # The short printable run resembles the accidental strings Binary Ninja finds
 # in instruction bytes at its default four-byte threshold. The other two cover
@@ -34,6 +38,11 @@ SHORT_JUNK_STRING = b"BDI6@\x00"
 EXACT_MIN_STRING = b"MSP430X!\x00"
 LONG_STRING = b"cmd_enter_bootloader: request/response descriptor 11\x00"
 STRING_CALL_ARGUMENT = b"module=startup state=%u result=%u\x00"
+
+# A small, ordinary leaf function for the ELF entry point.  Keeping this
+# independent of the raw fixture's call graph makes the ELF factory-path test
+# exercise loader setup without creating references to absent sections.
+ELF_RESET_FUNCTION = bytes.fromhex("03 43 30 41")
 
 # call #0x7de0; call #0x6d00; call #0x6e00; ret. Direct references make the
 # integration helpers deterministic analysis roots.
@@ -167,26 +176,313 @@ def build_base_zero_low64k_firmware() -> bytes:
     return bytes(image)
 
 
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) & -alignment
+
+
+def build_msp430_elf_firmware() -> bytes:
+    """Return a minimal linked ELF32/MSP430 image for factory-path tests.
+
+    The fixture is assembled directly so the test suite does not depend on an
+    MSP430 compiler or linker.  It contains only standard ELF headers, four
+    loadable device sections, and a conventional ``_start`` function symbol.
+    """
+
+    rodata = bytearray(
+        b"\xff" * (ELF_STRING_REGION_END - SHORT_JUNK_STRING_ADDRESS)
+    )
+
+    def place_rodata(address: int, data: bytes) -> None:
+        offset = address - SHORT_JUNK_STRING_ADDRESS
+        rodata[offset:offset + len(data)] = data
+
+    place_rodata(SHORT_JUNK_STRING_ADDRESS, SHORT_JUNK_STRING)
+    place_rodata(EXACT_MIN_STRING_ADDRESS, EXACT_MIN_STRING)
+    place_rodata(LONG_STRING_ADDRESS, LONG_STRING)
+
+    vectors = bytearray(b"\xff" * (MAIN_FLASH_END - 0xFF80 + 1))
+    vectors[RESET_VECTOR - 0xFF80:RESET_VECTOR - 0xFF80 + 2] = (
+        RESET_HANDLER.to_bytes(2, "little")
+    )
+
+    # name, virtual address, contents, program-header flags, section flags
+    # ELF PF_R/PF_X are 4/1 and SHF_ALLOC/SHF_EXECINSTR are 2/4.
+    loadable_sections = (
+        (".tlv", TLV_DESCRIPTOR_ADDRESS, TLV_DESCRIPTOR, 4, 2),
+        (".text", RESET_HANDLER, ELF_RESET_FUNCTION, 5, 6),
+        (".rodata", SHORT_JUNK_STRING_ADDRESS, bytes(rodata), 4, 2),
+        (".vectors", 0xFF80, bytes(vectors), 4, 2),
+    )
+
+    elf_header_size = 52
+    program_header_size = 32
+    section_header_size = 40
+    program_header_count = len(loadable_sections)
+    cursor = _align_up(
+        elf_header_size + program_header_size * program_header_count,
+        16,
+    )
+
+    offsets: dict[str, int] = {}
+    contents: dict[str, bytes] = {}
+    for name, _address, data, _program_flags, _section_flags in loadable_sections:
+        offsets[name] = cursor
+        contents[name] = data
+        cursor = _align_up(cursor + len(data), 4)
+
+    symbol_names = ("_start", "__msp430f5438_flash_start")
+    symbol_name_offsets = {}
+    string_table_builder = bytearray(b"\x00")
+    for name in symbol_names:
+        symbol_name_offsets[name] = len(string_table_builder)
+        string_table_builder.extend(name.encode("ascii") + b"\x00")
+    string_table = bytes(string_table_builder)
+    offsets[".strtab"] = cursor
+    contents[".strtab"] = string_table
+    cursor = _align_up(cursor + len(string_table), 4)
+
+    # Elf32_Sym: null, global STT_FUNC `_start`, then a loader-owned boundary
+    # STT_OBJECT. The latter proves pre-analysis preparation never removes an
+    # existing ELF symbol merely because a function begins at the same address.
+    symbol_table = (
+        bytes(16)
+        + struct.pack(
+            "<IIIBBH",
+            symbol_name_offsets["_start"],
+            RESET_HANDLER,
+            len(ELF_RESET_FUNCTION),
+            0x12,
+            0,
+            2,
+        )
+        + struct.pack(
+            "<IIIBBH",
+            symbol_name_offsets["__msp430f5438_flash_start"],
+            RESET_HANDLER,
+            0,
+            0x11,
+            0,
+            2,
+        )
+    )
+    offsets[".symtab"] = cursor
+    contents[".symtab"] = symbol_table
+    cursor = _align_up(cursor + len(symbol_table), 4)
+
+    section_names = (
+        "",
+        ".tlv",
+        ".text",
+        ".rodata",
+        ".vectors",
+        ".symtab",
+        ".strtab",
+        ".shstrtab",
+    )
+    section_name_offsets = {"": 0}
+    section_name_table = bytearray(b"\x00")
+    for name in section_names[1:]:
+        section_name_offsets[name] = len(section_name_table)
+        section_name_table.extend(name.encode("ascii") + b"\x00")
+
+    offsets[".shstrtab"] = cursor
+    contents[".shstrtab"] = bytes(section_name_table)
+    cursor = _align_up(cursor + len(section_name_table), 4)
+
+    section_header_offset = cursor
+    section_header_count = len(section_names)
+    image = bytearray(
+        section_header_offset + section_header_size * section_header_count
+    )
+    for name, data in contents.items():
+        start = offsets[name]
+        image[start:start + len(data)] = data
+
+    elf_ident = b"\x7fELF" + bytes((1, 1, 1, 0xFF, 0)) + bytes(7)
+    struct.pack_into(
+        "<16sHHIIIIIHHHHHH",
+        image,
+        0,
+        elf_ident,
+        2,  # ET_EXEC
+        ELF_MACHINE_MSP430,
+        1,
+        RESET_HANDLER,
+        elf_header_size,
+        section_header_offset,
+        ELF_FLAGS_MSP430X54,
+        elf_header_size,
+        program_header_size,
+        program_header_count,
+        section_header_size,
+        section_header_count,
+        section_names.index(".shstrtab"),
+    )
+
+    for index, (name, address, data, program_flags, _section_flags) in enumerate(
+        loadable_sections
+    ):
+        struct.pack_into(
+            "<IIIIIIII",
+            image,
+            elf_header_size + program_header_size * index,
+            1,  # PT_LOAD
+            offsets[name],
+            address,
+            address,
+            len(data),
+            len(data),
+            program_flags,
+            2,
+        )
+
+    # Elf32_Shdr fields: name, type, flags, address, offset, size, link, info,
+    # alignment, entry size.  Section indexes are fixed by section_names.
+    section_headers = (
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        (
+            section_name_offsets[".tlv"],
+            1,
+            2,
+            TLV_DESCRIPTOR_ADDRESS,
+            offsets[".tlv"],
+            len(TLV_DESCRIPTOR),
+            0,
+            0,
+            1,
+            0,
+        ),
+        (
+            section_name_offsets[".text"],
+            1,
+            6,
+            RESET_HANDLER,
+            offsets[".text"],
+            len(ELF_RESET_FUNCTION),
+            0,
+            0,
+            2,
+            0,
+        ),
+        (
+            section_name_offsets[".rodata"],
+            1,
+            2,
+            SHORT_JUNK_STRING_ADDRESS,
+            offsets[".rodata"],
+            len(rodata),
+            0,
+            0,
+            1,
+            0,
+        ),
+        (
+            section_name_offsets[".vectors"],
+            1,
+            2,
+            0xFF80,
+            offsets[".vectors"],
+            len(vectors),
+            0,
+            0,
+            2,
+            0,
+        ),
+        (
+            section_name_offsets[".symtab"],
+            2,
+            0,
+            0,
+            offsets[".symtab"],
+            len(symbol_table),
+            section_names.index(".strtab"),
+            1,
+            4,
+            16,
+        ),
+        (
+            section_name_offsets[".strtab"],
+            3,
+            0,
+            0,
+            offsets[".strtab"],
+            len(string_table),
+            0,
+            0,
+            1,
+            0,
+        ),
+        (
+            section_name_offsets[".shstrtab"],
+            3,
+            0,
+            0,
+            offsets[".shstrtab"],
+            len(section_name_table),
+            0,
+            0,
+            1,
+            0,
+        ),
+    )
+    for index, fields in enumerate(section_headers):
+        struct.pack_into(
+            "<IIIIIIIIII",
+            image,
+            section_header_offset + section_header_size * index,
+            *fields,
+        )
+
+    return bytes(image)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
-    low64k_image = bool(args and args[0] == "--low64k")
+    elf_image = bool(args and args[0] == "--elf")
+    if elf_image:
+        args = args[1:]
+    low64k_image = not elf_image and bool(args and args[0] == "--low64k")
     if low64k_image:
         args = args[1:]
     default_name = (
-        "build/base-zero-low64k-tlv.bin"
-        if low64k_image
-        else "build/sparse-code-islands.bin"
+        "build/msp430x-lens-fixture.elf"
+        if elf_image
+        else (
+            "build/base-zero-low64k-tlv.bin"
+            if low64k_image
+            else "build/sparse-code-islands.bin"
+        )
     )
     output = Path(args[0] if args else default_name)
     firmware = (
-        build_base_zero_low64k_firmware()
-        if low64k_image
-        else build_sparse_raw_firmware()
+        build_msp430_elf_firmware()
+        if elf_image
+        else (
+            build_base_zero_low64k_firmware()
+            if low64k_image
+            else build_sparse_raw_firmware()
+        )
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(firmware)
     print(f"Wrote {len(firmware):#x} bytes to {output}")
-    print("Open with: MSP430F5438 Raw Firmware (MSP430X)")
+    print(
+        "Open with: ELF"
+        if elf_image
+        else "Open with: MSP430F5438 Raw Firmware (MSP430X)"
+    )
+    if elf_image:
+        print(
+            f"Expected TLV descriptors: {TLV_DESCRIPTOR_ADDRESS:#x} "
+            f"(stored CRC16 {TLV_STORED_CRC:#06x})"
+        )
+        print(f"Expected reset function: {RESET_HANDLER:#x}")
+        print(
+            "Expected accepted strings: "
+            f"{EXACT_MIN_STRING_ADDRESS:#x}, {LONG_STRING_ADDRESS:#x}"
+        )
+        print(f"Expected rejected junk string: {SHORT_JUNK_STRING_ADDRESS:#x}")
+        return 0
     if low64k_image:
         print(
             f"Expected TLV descriptors: {TLV_DESCRIPTOR_ADDRESS:#x} "

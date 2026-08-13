@@ -174,8 +174,8 @@ class RawLoaderIntegrationTests(unittest.TestCase):
 
             with mock.patch.object(
                 memory_map,
-                "_recover_direct_string_call_parameters",
-                wraps=memory_map._recover_direct_string_call_parameters,
+                "_stabilize_direct_string_call_parameters",
+                wraps=memory_map._stabilize_direct_string_call_parameters,
             ) as manual_recovery:
                 memory_map._refresh_msp430x_analysis(view, verbose=False)
                 self.assertEqual(manual_recovery.call_count, 1)
