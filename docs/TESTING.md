@@ -71,9 +71,9 @@ Verify the loader and registration:
     `0x6840` are present.
 13. Open Pseudo C at `0x6e00` and confirm the call at `0x6e0a` includes
     `"module=startup state=%u result=%u"`. In Disassembly, confirm the string
-    address is loaded into R12 immediately before that call. The target at
-    `0x6e40` should have a first `char *format` parameter rather than losing the
-    R12 value during HLIL simplification.
+    address is loaded into R12 immediately before that call. The call-site type
+    adjustment should have a first `char *format` parameter while the target at
+    `0x6e40` retains its original auto-inferred type.
 14. Confirm the long `0xff` ranges between code islands remain
     non-executable data.
 15. Spot-check reset/vector and MSP430 header labels.

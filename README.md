@@ -164,12 +164,13 @@ Binary Ninja can also hide a valid string load when an untyped callee is
 auto-inferred from its R4-R10 save/restore prologue: the call prototype omits
 R12, so HLIL removes the proven R12 assignment as dead. `Re-run MSP430X
 analysis` recovers direct CALL/CALLA sites whose R12 value points to a fully
-backed, printable C string. It adds the string as the callee's first automatic
-parameter (and recognizes format strings) while retaining uncertain
-auto-inferred inputs. User-authored types and more specific prototypes are never
-replaced. Recovery is deliberately explicit rather than chained onto initial
-analysis, because a common logging target can have hundreds of callers. Use the
-command for mapped, ELF, or BNDB views after their initial analysis finishes.
+backed, printable C string. It adds a local automatic type adjustment to the
+proven call site (and recognizes format strings) while retaining uncertain
+auto-inferred inputs. The callee's global type, user-authored types, and existing
+call-site adjustments are never replaced. Recovery is deliberately explicit
+rather than chained onto initial analysis, because a common logging target can
+have hundreds of callers. Use the command for mapped, ELF, or BNDB views after
+their initial analysis finishes.
 
 To keep random firmware bytes out of Binary Ninja's Strings sidebar, the mapped
 loader raises the inherited `analysis.limits.minStringLength` setting from four
