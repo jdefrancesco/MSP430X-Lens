@@ -1173,8 +1173,10 @@ class MSP430XCallingConvention(CallingConvention):
     caller_saved_regs = ["r11", "r12", "r13", "r14", "r15"]
     callee_saved_regs = ["r4", "r5", "r6", "r7", "r8", "r9", "r10"]
     int_arg_regs = ["r12", "r13", "r14", "r15"]
-    # IAR/GCC place unnamed variadic arguments on the stack rather than using
-    # the remaining ordinary argument registers.
+    # MSP430 EABI variadic calls place the last explicitly declared argument and
+    # all remaining arguments on the stack. Binary Ninja's exposed knob covers
+    # the unnamed arguments, so local recovery code must avoid inferring
+    # ellipsis from a format-looking string that is proven in R12.
     arg_regs_for_varargs = False
     int_return_reg = "r12"
     high_int_return_reg = "r13"

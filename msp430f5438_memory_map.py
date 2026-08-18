@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import bisect
 from dataclasses import dataclass
 import importlib
@@ -168,6 +169,7 @@ class _HeaderSfrDefinition:
     address: int
     width: int
     read_only: bool
+    enum_members: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +258,11 @@ CINIT_TABLE_MIN_RECORDS = 4
 CINIT_RECORD_MAX_PAYLOAD = 0x1000
 CINIT_TABLE_PADDING_MAX_LEN = 4
 MSP430_HEADER_PATHS_ENV = "MSP430_HEADER_PATHS"
+MSP430_HEADER_SFR_ENUM_TYPE_SOURCE = "msp430x-lens:msp430-header-sfr-enums"
+HEADER_CONTEXT_SFR_ALIASES = {
+    "PMMIE": ("PMMRIE",),
+    "WDT": ("WDTCTL",),
+}
 LOCAL_MSP430_HEADER_CANDIDATES = (
     "msp430.h",
     "msp430f5438.h",
@@ -267,9 +274,18 @@ DEFINE_RE = re.compile(r"^\s*#define\s+([A-Za-z_][A-Za-z0-9_]*)\s+(.+?)\s*(?://.
 SFR_RE = re.compile(
     r"^\s*(const_)?(sfr[bwa])\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([^)]+?)\s*\)\s*;"
 )
+HEADER_BITS_COMMENT_RE = re.compile(
+    r"^\s*(?:/\*|//)\s*(?:Definitions\s+for\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+    r"(?=[\s*/])(?=.*\b(?:Bits|Definitions)\b)"
+)
 VECTOR_COMMENT_RE = re.compile(r"/\*\s*(0x[0-9A-Fa-f]+)")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 NUMBER_RE = re.compile(r"^(?:0x[0-9A-Fa-f]+|\d+)$")
+HEADER_EXPR_ALLOWED_RE = re.compile(r"^[A-Za-z0-9_()+\-|&~<>\s]+$")
+INTEGER_SUFFIX_RE = re.compile(
+    r"\b(0x[0-9A-Fa-f]+|\d+)(?:[uUlL]+)\b"
+)
 
 
 MAP_REGIONS: tuple[Region, ...] = (
@@ -993,12 +1009,51 @@ def _define_symbol(
 
 def _clean_define_expr(expr: str) -> str:
     expr = re.sub(r"/\*.*?\*/", "", expr).strip()
+    expr = INTEGER_SUFFIX_RE.sub(r"\1", expr)
     while expr.startswith("(") and expr.endswith(")"):
         inner = expr[1:-1].strip()
         if inner.count("(") != inner.count(")"):
             break
         expr = inner
     return expr
+
+
+def _eval_header_expr_ast(node: ast.AST, constants: dict[str, int]) -> Optional[int]:
+    if isinstance(node, ast.Expression):
+        return _eval_header_expr_ast(node.body, constants)
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, int) else None
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    if isinstance(node, ast.UnaryOp):
+        value = _eval_header_expr_ast(node.operand, constants)
+        if value is None:
+            return None
+        if isinstance(node.op, ast.UAdd):
+            return value
+        if isinstance(node.op, ast.USub):
+            return -value
+        if isinstance(node.op, ast.Invert):
+            return ~value
+        return None
+    if isinstance(node, ast.BinOp):
+        left = _eval_header_expr_ast(node.left, constants)
+        right = _eval_header_expr_ast(node.right, constants)
+        if left is None or right is None:
+            return None
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.BitOr):
+            return left | right
+        if isinstance(node.op, ast.BitAnd):
+            return left & right
+        if isinstance(node.op, ast.LShift) and 0 <= right <= 64:
+            return left << right
+        if isinstance(node.op, ast.RShift) and 0 <= right <= 64:
+            return left >> right
+    return None
 
 
 def _eval_header_expr(expr: str, constants: dict[str, int]) -> Optional[int]:
@@ -1010,13 +1065,20 @@ def _eval_header_expr(expr: str, constants: dict[str, int]) -> Optional[int]:
             return None
 
     match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)([+-](?:0x[0-9A-Fa-f]+|\d+))?", expr)
-    if not match:
+    if match:
+        base = constants.get(match.group(1))
+        if base is None:
+            return None
+        delta = int(match.group(2) or "0", 0)
+        return base + delta
+
+    if not HEADER_EXPR_ALLOWED_RE.match(expr):
         return None
-    base = constants.get(match.group(1))
-    if base is None:
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
         return None
-    delta = int(match.group(2) or "0", 0)
-    return base + delta
+    return _eval_header_expr_ast(tree, constants)
 
 
 def _is_header_label_address(addr: int) -> bool:
@@ -1027,21 +1089,208 @@ def _is_header_label_address(addr: int) -> bool:
     )
 
 
+_HeaderDefine = tuple[str, str, str, Optional[str]]
+_RawHeaderSfr = tuple[bool, int, str, str]
+_HeaderEnumTarget = tuple[str, int]
+
+
+def _header_sfr_enum_type_name(definition: _HeaderSfrDefinition) -> str:
+    return f"{definition.name}_bits"
+
+
+def _is_header_byte_alias_name(name: str) -> bool:
+    return name.endswith(("_L", "_H"))
+
+
+def _header_enum_member_allowed(
+    name: str,
+    value: int,
+    definition: _HeaderSfrDefinition,
+    sfr_names: set[str],
+) -> bool:
+    if (
+        not IDENTIFIER_RE.match(name)
+        or name.startswith("__")
+        or name in sfr_names
+        or name.endswith("_")
+        or name.endswith("_BASE")
+        or value < 0
+    ):
+        return False
+    if definition.width > 1 and _is_header_byte_alias_name(name):
+        return False
+    max_value = (1 << (definition.width * 8)) - 1
+    return value <= max_value
+
+
+def _header_context_matches_sfr(context: str, sfr_name: str) -> bool:
+    if context == sfr_name:
+        return True
+    if "x" not in context and "X" not in context:
+        return False
+
+    pattern = []
+    cursor = 0
+    while cursor < len(context):
+        char = context[cursor]
+        if char in "xX":
+            while cursor < len(context) and context[cursor] in "xX":
+                cursor += 1
+            pattern.append(r"[A-Za-z0-9]+")
+            continue
+        pattern.append(re.escape(char))
+        cursor += 1
+    return re.fullmatch("".join(pattern), sfr_name) is not None
+
+
+def _header_enum_context_targets(
+    context: Optional[str],
+    definitions: Sequence[_HeaderSfrDefinition],
+    labels_by_name: dict[str, int],
+) -> tuple[_HeaderEnumTarget, ...]:
+    if context is None:
+        return ()
+
+    targets: dict[str, int] = {}
+    for definition in definitions:
+        if _header_context_matches_sfr(context, definition.name):
+            targets.setdefault(definition.name, 0)
+    definitions_by_name = {definition.name: definition for definition in definitions}
+    for alias_target in HEADER_CONTEXT_SFR_ALIASES.get(context, ()):
+        if alias_target in definitions_by_name:
+            targets.setdefault(alias_target, 0)
+
+    for label_name, label_addr in labels_by_name.items():
+        if not _header_context_matches_sfr(context, label_name):
+            continue
+        for definition in definitions:
+            if not (
+                definition.address
+                <= label_addr
+                < definition.address + definition.width
+            ):
+                continue
+            shift = (label_addr - definition.address) * 8
+            existing = targets.get(definition.name)
+            if existing is None or shift < existing:
+                targets[definition.name] = shift
+            break
+
+    return tuple(
+        sorted(
+            targets.items(),
+            key=lambda item: (len(item[0]), item[0], item[1]),
+        )
+    )
+
+
+def _header_enum_targets_for_define(
+    name: str,
+    context: Optional[str],
+    definitions: Sequence[_HeaderSfrDefinition],
+    labels_by_name: dict[str, int],
+) -> tuple[_HeaderEnumTarget, ...]:
+    targets = list(_header_enum_context_targets(context, definitions, labels_by_name))
+    target_names = {target_name for target_name, _shift in targets}
+
+    for definition in sorted(definitions, key=lambda item: len(item.name), reverse=True):
+        if name.startswith(f"{definition.name}_") and definition.name not in target_names:
+            targets.append((definition.name, 0))
+            target_names.add(definition.name)
+    return tuple(targets)
+
+
+def _header_sfr_enum_members(
+    defines: Sequence[_HeaderDefine],
+    constants: dict[str, int],
+    definitions: Sequence[_HeaderSfrDefinition],
+    labels_by_name: dict[str, int],
+) -> dict[str, tuple[tuple[str, int], ...]]:
+    by_name = {definition.name: definition for definition in definitions}
+    sfr_names = set(by_name)
+    members_by_sfr: dict[str, list[tuple[str, int]]] = {}
+    seen_by_sfr: dict[str, set[str]] = {}
+
+    for name, expr, _line, context in defines:
+        value = _eval_header_expr(expr, constants)
+        if value is None:
+            continue
+        for target, shift in _header_enum_targets_for_define(
+            name,
+            context,
+            definitions,
+            labels_by_name,
+        ):
+            definition = by_name[target]
+            shifted_value = value << shift
+            if not _header_enum_member_allowed(
+                name,
+                shifted_value,
+                definition,
+                sfr_names,
+            ):
+                continue
+            seen = seen_by_sfr.setdefault(target, set())
+            if name in seen:
+                continue
+            seen.add(name)
+            members_by_sfr.setdefault(target, []).append((name, shifted_value))
+
+    return {
+        name: tuple(members)
+        for name, members in members_by_sfr.items()
+        if members
+    }
+
+
+def _deduplicate_header_sfr_definitions(
+    definitions: Sequence[_HeaderSfrDefinition],
+) -> tuple[_HeaderSfrDefinition, ...]:
+    merged: dict[tuple[str, int, int, bool], list[tuple[str, int]]] = {}
+    seen_members: dict[tuple[str, int, int, bool], set[str]] = {}
+    for definition in definitions:
+        key = (
+            definition.name,
+            definition.address,
+            definition.width,
+            definition.read_only,
+        )
+        members = merged.setdefault(key, [])
+        seen = seen_members.setdefault(key, set())
+        for member in definition.enum_members:
+            if member[0] in seen:
+                continue
+            seen.add(member[0])
+            members.append(member)
+
+    return tuple(
+        _HeaderSfrDefinition(name, address, width, read_only, tuple(members))
+        for (name, address, width, read_only), members in merged.items()
+    )
+
+
 def _parse_msp430_header_definitions(
     texts: Sequence[str],
 ) -> tuple[tuple[SymbolDefinition, ...], tuple[_HeaderSfrDefinition, ...]]:
     """Extract safe labels and typed SFR declarations from TI headers."""
 
-    defines: list[tuple[str, str, str]] = []
-    sfrs: list[tuple[bool, int, str, str]] = []
+    defines: list[_HeaderDefine] = []
+    sfrs: list[_RawHeaderSfr] = []
     constants: dict[str, int] = {}
 
     for text in texts:
+        current_bit_context: Optional[str] = None
         for line in text.splitlines():
+            bits_comment_match = HEADER_BITS_COMMENT_RE.match(line)
+            if bits_comment_match:
+                current_bit_context = bits_comment_match.group(1)
+            elif line.strip().startswith("/***"):
+                current_bit_context = None
+
             define_match = DEFINE_RE.match(line)
             if define_match:
                 name, expr = define_match.groups()
-                defines.append((name, expr, line))
+                defines.append((name, expr, line, current_bit_context))
                 value = _eval_header_expr(expr, constants)
                 if value is not None:
                     constants[name] = value
@@ -1054,7 +1303,7 @@ def _parse_msp430_header_definitions(
 
     for _ in range(8):
         changed = False
-        for name, expr, _line in defines:
+        for name, expr, _line, _context in defines:
             if name in constants:
                 continue
             value = _eval_header_expr(expr, constants)
@@ -1073,7 +1322,7 @@ def _parse_msp430_header_definitions(
         if _is_header_label_address(addr):
             labels_by_name.setdefault(name, addr)
 
-    sfr_definitions: list[_HeaderSfrDefinition] = []
+    sfr_definition_fields: list[_RawHeaderSfr] = []
     for read_only, width, name, expr in sfrs:
         value = _eval_header_expr(expr, constants)
         if value is not None:
@@ -1083,11 +1332,9 @@ def _parse_msp430_header_definitions(
                 and PERIPHERALS_START <= value
                 and value + width - 1 <= PERIPHERALS_END
             ):
-                sfr_definitions.append(
-                    _HeaderSfrDefinition(name, value, width, read_only)
-                )
+                sfr_definition_fields.append((read_only, width, name, expr))
 
-    for name, expr, line in defines:
+    for name, expr, line, _context in defines:
         value = _eval_header_expr(expr, constants)
         if value is None:
             continue
@@ -1104,7 +1351,7 @@ def _parse_msp430_header_definitions(
 
     for _ in range(8):
         changed = False
-        for name, expr, _line in defines:
+        for name, expr, _line, _context in defines:
             target = _clean_define_expr(expr)
             if not IDENTIFIER_RE.match(target) or name in labels_by_name:
                 continue
@@ -1116,10 +1363,34 @@ def _parse_msp430_header_definitions(
         if not changed:
             break
 
+    sfr_definitions = []
+    for read_only, width, name, expr in sfr_definition_fields:
+        value = _eval_header_expr(expr, constants)
+        if value is None:
+            continue
+        sfr_definitions.append(_HeaderSfrDefinition(name, value, width, read_only))
+    enum_targets = _canonical_header_sfr_definitions(sfr_definitions)
+    enum_members_by_sfr = _header_sfr_enum_members(
+        defines,
+        constants,
+        enum_targets,
+        labels_by_name,
+    )
+    sfr_definitions = _deduplicate_header_sfr_definitions([
+        _HeaderSfrDefinition(
+            definition.name,
+            definition.address,
+            definition.width,
+            definition.read_only,
+            enum_members_by_sfr.get(definition.name, ()),
+        )
+        for definition in sfr_definitions
+    ])
+
     labels = tuple(sorted(labels_by_name.items(), key=lambda item: (item[1], item[0])))
     typed_sfrs = tuple(
         sorted(
-            set(sfr_definitions),
+            sfr_definitions,
             key=lambda definition: (
                 definition.address,
                 -definition.width,
@@ -1390,8 +1661,45 @@ def _canonical_header_sfr_definitions(
     return tuple(sorted(selected, key=lambda item: (item.address, item.name)))
 
 
-def _volatile_sfr_type(definition: _HeaderSfrDefinition):
-    builder = Type.int(definition.width, False).mutable_copy()
+def _registered_header_sfr_enum_type(
+    bv: BinaryView,
+    definition: _HeaderSfrDefinition,
+):
+    if not definition.enum_members:
+        return None
+
+    name = _header_sfr_enum_type_name(definition)
+    type_id = Type.generate_auto_type_id(MSP430_HEADER_SFR_ENUM_TYPE_SOURCE, name)
+    registered_name = None
+    try:
+        registered_name = bv.get_type_name_by_id(type_id)
+    except Exception:
+        pass
+
+    try:
+        enum_type = Type.enumeration(
+            members=list(definition.enum_members),
+            width=definition.width,
+            sign=False,
+        )
+        registered_name = bv.define_type(type_id, name, enum_type)
+    except Exception as exc:
+        if registered_name is None:
+            log_warn(f"Could not register MSP430 SFR enum {name}: {exc}")
+            return None
+
+    try:
+        return Type.named_type_from_registered_type(bv, registered_name)
+    except Exception as exc:
+        log_warn(f"Could not reference MSP430 SFR enum {registered_name}: {exc}")
+        return None
+
+
+def _volatile_sfr_type(bv: BinaryView, definition: _HeaderSfrDefinition):
+    base_type = _registered_header_sfr_enum_type(bv, definition)
+    if base_type is None:
+        base_type = Type.int(definition.width, False)
+    builder = base_type.mutable_copy()
     builder.volatile = True
     if definition.read_only:
         builder.const = True
@@ -1411,13 +1719,18 @@ def _data_var_interval(data_var) -> tuple[int, int]:
     return start, start + width
 
 
-def _sfr_data_var_matches(data_var, definition: _HeaderSfrDefinition) -> bool:
+def _sfr_data_var_matches(
+    data_var,
+    definition: _HeaderSfrDefinition,
+    expected_type,
+) -> bool:
     var_type = getattr(data_var, "type", None)
     return (
         getattr(data_var, "address", None) == definition.address
         and int(getattr(var_type, "width", 0)) == definition.width
         and _type_qualifier_value(var_type, "volatile")
         and _type_qualifier_value(var_type, "const") == definition.read_only
+        and str(var_type) == str(expected_type)
     )
 
 
@@ -1436,6 +1749,7 @@ def _define_header_sfr_data_vars(
 
     defined = 0
     for definition in _canonical_header_sfr_definitions(definitions):
+        var_type = _volatile_sfr_type(bv, definition)
         definition_end = definition.address + definition.width
         overlaps = [
             data_var
@@ -1443,7 +1757,10 @@ def _define_header_sfr_data_vars(
             if definition.address < _data_var_interval(data_var)[1]
             and _data_var_interval(data_var)[0] < definition_end
         ]
-        if any(_sfr_data_var_matches(data_var, definition) for data_var in overlaps):
+        if any(
+            _sfr_data_var_matches(data_var, definition, var_type)
+            for data_var in overlaps
+        ):
             continue
         if any(not bool(getattr(data_var, "auto_discovered", False)) for data_var in overlaps):
             continue
@@ -1462,7 +1779,6 @@ def _define_header_sfr_data_vars(
         if not removed_all:
             continue
         try:
-            var_type = _volatile_sfr_type(definition)
             if auto_defined and hasattr(bv, "define_data_var"):
                 bv.define_data_var(definition.address, var_type, definition.name)
             elif hasattr(bv, "define_user_data_var"):
@@ -3242,9 +3558,13 @@ def _recover_direct_string_call_parameters(
     a constant R12 value at that call, a fully file-backed printable C string,
     and an untyped target whose inferred inputs are empty or consist exclusively
     of MSP430 callee-saved registers. Existing call adjustments, user types, and
-    more specific prototypes are never replaced. Keeping the adjustment on the
-    proven call site prevents Binary Ninja's interprocedural inference from
-    repeatedly replacing a callee-wide auto type.
+    more specific prototypes are never replaced. Format-like strings only name
+    the recovered R12 parameter; they do not prove a variadic call. The MSP430
+    EABI places the last explicitly declared parameter of a variadic function
+    and all remaining arguments on the stack, while this recovery is
+    specifically based on a string pointer proven in R12. Keeping the adjustment
+    on the proven call site prevents Binary Ninja's interprocedural inference
+    from repeatedly replacing a callee-wide auto type.
     """
 
     decoder, _branch_edges = _msp430x_decode_api()
@@ -3323,22 +3643,22 @@ def _recover_direct_string_call_parameters(
         if not argument_registers or str(argument_registers[0]) != "r12":
             continue
 
-        is_format = bool(candidate["format"])
+        is_format_like = bool(candidate["format"])
         try:
             current_type = callee.type
             pointer_type = Type.pointer(callee.arch, Type.char())
             adjusted_type = Type.function(
                 callee.return_type,
                 [
-                    FunctionParameter(pointer_type, "format" if is_format else "text"),
+                    FunctionParameter(
+                        pointer_type,
+                        "format" if is_format_like else "text",
+                    ),
                     *existing_parameters,
                 ],
                 calling_convention=calling_convention,
-                variable_arguments=(
-                    is_format
-                    or bool(
-                        getattr(current_type.has_variable_arguments, "value", False)
-                    )
+                variable_arguments=bool(
+                    getattr(current_type.has_variable_arguments, "value", False)
                 ),
                 stack_adjust=getattr(current_type, "stack_adjustment", None),
             ).mutable_copy()

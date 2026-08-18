@@ -150,9 +150,12 @@ selecting `Re-run MSP430X analysis`. Recovery is
 intentionally skipped when the target already has a user type, an R12
 parameter, a more specific inferred prototype, or any existing call-site
 override. Zero-parameter auto-inferred callees remain eligible; their no-return
-behavior is preserved. The recovered fact is stored as a durable user override
-on that one call site because Binary Ninja can remove an automatic adjustment
-during later analysis. Recovery runs as a background task, and the log must not
+behavior is preserved. A string containing `%` conversions should name the
+local parameter `format`, but must not infer ellipsis or extra arguments unless
+the call-site instructions prove those arguments. The recovered fact is stored
+as a durable user override on that one call site because Binary Ninja can
+remove an automatic adjustment during later analysis. Recovery runs as a
+background task, and the log must not
 contain `UI threads are not permitted to wait for analysis completion`. When it
 finishes, an already open Pseudo C pane should repaint with the recovered string
 argument; navigating away and back must not be required. After Binary Ninja

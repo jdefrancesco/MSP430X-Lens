@@ -179,7 +179,11 @@ class StringCallRecoveryTests(unittest.TestCase):
             self.assertIsNotNone(call_adjustment)
             self.assertEqual(call_adjustment.parameters[0].name, "format")
             self.assertIn("char", str(call_adjustment.parameters[0].type))
-            self.assertTrue(call_adjustment.has_variable_arguments.value)
+            # A printf-looking string only proves the fixed R12 pointer at this
+            # call. MSP430 EABI variadic calls pass the last declared parameter
+            # and all unnamed arguments on the stack, so do not infer ellipsis
+            # from '%' conversions.
+            self.assertFalse(call_adjustment.has_variable_arguments.value)
 
             # Evidence from one call site must not rewrite the callee globally.
             self.assertEqual(str(callee.type), original_callee_type)

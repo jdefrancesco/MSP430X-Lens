@@ -184,8 +184,12 @@ save/restore prologue: the call prototype omits R12, so HLIL removes the proven
 R12 assignment as dead. After initial analysis completes for a mapped-raw or
 prepared ELF view, MSP430X Lens automatically recovers direct CALL/CALLA sites
 whose R12 value points to a fully backed, printable C string. It adds a durable
-local call-site type adjustment to the proven call (and recognizes format
-strings) while retaining uncertain auto-inferred inputs and no-return behavior.
+local call-site type adjustment to the proven call while retaining uncertain
+auto-inferred inputs and no-return behavior. Strings with printf-style
+conversions are named `format`, but the pass does not infer ellipsis or extra
+arguments from `%` text alone. Per the MSP430 EABI, variadic calls place the
+last declared argument and all following arguments on the stack; a string proven
+in R12 is therefore treated as fixed call-site evidence.
 The callee's global type,
 user-authored types, and existing call-site adjustments are never replaced.
 Recovery runs as a separate background task and synchronously confirms a fixed
@@ -217,10 +221,15 @@ in `MSP430_HEADER_PATHS` separated by your shell path separator. It recognizes
 TI-style `sfrb`/`sfrw`/`sfra` register definitions, module base labels, vector
 labels, TLV labels, and simple aliases such as board/HAL names that point at a
 known register label. SFR declarations also become width-correct volatile data
-variables. Direct reads of those variables lift as side-effecting
-`mmio_read8`/`mmio_read16`/`mmio_read20` operations so an unused hardware read
-remains visible in Pseudo C; ordinary RAM and flash reads retain normal load
-semantics.
+variables. When the headers document register bit names or exact register
+presets, those SFR variables use registered enum types such as
+`WDTCTL_bits`, making MMIO writes expose values like `WDTPW`, `WDTHOLD`, and
+documented timer presets instead of only raw integers. This includes TI's
+wildcard register families such as `TAxCTL` and byte aliases such as
+`UCA0IE`/`UCA0IFG` when they resolve to a canonical SFR. Direct reads of those
+variables lift as side-effecting `mmio_read8`/`mmio_read16`/`mmio_read20`
+operations so an unused hardware read remains visible in Pseudo C; ordinary RAM
+and flash reads retain normal load semantics.
 
 When bytes at `0x1a00-0x1aff` are present, the mapped-raw and ELF loaders read
 the factory device descriptors before their first analysis pass. A CRC-valid
