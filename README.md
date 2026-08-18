@@ -42,7 +42,7 @@ The beginning of this project (i.e lifting) was written by hand to ensure the co
 semantics were being preserved. Since the core of this plugin has been constructed;
 agentic programming is utilized. Agentic code should still be read in full,
 keeping technical debt to a minimum. If you would like to contribute to this plugin
-please read the [CONTRIBUTION](./CONTRIBUTION.md). It contains guidance on how
+please read the [contributor guide](./AGENTS.md). It contains guidance on how
 agentic code should be utilized if you choose to use it.
 
 
