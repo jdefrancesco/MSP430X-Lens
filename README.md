@@ -7,7 +7,7 @@ core features include:
 
 - `MSP430X` ISA support; lifting the MSP430/MSP430X CPUX forms for better analysis (duh)..
 - Ability to map raw firmware MSP430F5438/F5438A images. TI-TXT/ELF firmware is supported if available.
-- Vector-table seeding, Flash/RAM/Peripheral sections, and TI header labels.
+- Vector-table seeding, Flash/RAM/Peripheral sections, and typed TI SFR labels.
 - Typed factory TLV calibration/device records with stored CRC16 validation.
 - Collapsing and simplifying the decompilation output without all the
 artifacts that Ghidra generally leaves.
@@ -136,6 +136,8 @@ After installing or changing plugin registration code:
 5. Confirm `Tools -> MSP430F5438` commands are present.
 6. Run `Tools -> MSP430F5438 -> Diagnose active view`.
 7. Spot-check that reset/vector labels and header-derived peripheral labels are present.
+8. For an unused peripheral read, confirm Pseudo C retains a side-effecting
+   expression such as `mmio_read16(&DMACTL0)` instead of deleting the access.
 
 If the options dialog shows ARM/Thumb, close that view and reopen with the
 exact MSP430F5438 view type. The generic firmware loader is not this plugin.
@@ -179,20 +181,21 @@ string tables from decompiling into noisy carry/flag-heavy pseudocode or tiny
 Binary Ninja can also hide a valid string load when an untyped callee is
 auto-inferred with no parameters or with false R4-R10 inputs from its
 save/restore prologue: the call prototype omits R12, so HLIL removes the proven
-R12 assignment as dead. `Re-run MSP430X analysis` recovers direct CALL/CALLA
-sites whose R12 value points to a fully backed, printable C string. It adds a
-durable local call-site type adjustment to the proven call (and recognizes
-format strings) while retaining uncertain auto-inferred inputs and no-return
-behavior. Binary Ninja otherwise discards the equivalent automatic adjustment
-during later analysis. The callee's global type, user-authored types, and
-existing call-site adjustments are never replaced. Recovery is deliberately
-explicit rather than chained onto initial analysis, because a common logging
-target can have hundreds of callers. Use the command for mapped, ELF, or BNDB
-views after their initial analysis finishes. The durable adjustment is stored
-with a BNDB as a user call-site override. The command synchronously confirms it
-through a bounded incremental pass. Long map/re-run menu commands execute as
-Binary Ninja background tasks so analysis can finish without blocking the UI
-thread.
+R12 assignment as dead. After initial analysis completes for a mapped-raw or
+prepared ELF view, MSP430X Lens automatically recovers direct CALL/CALLA sites
+whose R12 value points to a fully backed, printable C string. It adds a durable
+local call-site type adjustment to the proven call (and recognizes format
+strings) while retaining uncertain auto-inferred inputs and no-return behavior.
+The callee's global type,
+user-authored types, and existing call-site adjustments are never replaced.
+Recovery runs as a separate background task and synchronously confirms a fixed
+point through bounded incremental passes, so the analysis-completion callback
+itself never waits for analysis. The durable adjustment is stored with a BNDB
+as a user call-site override. Reopened MSP430X ELF databases also receive the
+automatic pass, including older databases that predate the recovery feature.
+`Re-run MSP430X analysis` remains available after importing symbols/types or
+when refreshing an older already-open view. Long map/re-run menu commands use
+the same background-task path so analysis never blocks the UI thread.
 
 To keep random firmware bytes out of Binary Ninja's Strings sidebar, the mapped
 raw and ELF loaders raise the inherited `analysis.limits.minStringLength`
@@ -211,9 +214,13 @@ function prototypes.
 MSP430 header labels are applied automatically during mapped-view creation and
 analysis refresh. The parser reads headers under `inc/`, plus any paths listed
 in `MSP430_HEADER_PATHS` separated by your shell path separator. It recognizes
-TI-style `sfrb`/`sfrw` register definitions, module base labels, vector labels,
-TLV labels, and simple aliases such as board/HAL names that point at a known
-register label.
+TI-style `sfrb`/`sfrw`/`sfra` register definitions, module base labels, vector
+labels, TLV labels, and simple aliases such as board/HAL names that point at a
+known register label. SFR declarations also become width-correct volatile data
+variables. Direct reads of those variables lift as side-effecting
+`mmio_read8`/`mmio_read16`/`mmio_read20` operations so an unused hardware read
+remains visible in Pseudo C; ordinary RAM and flash reads retain normal load
+semantics.
 
 When bytes at `0x1a00-0x1aff` are present, the mapped-raw and ELF loaders read
 the factory device descriptors before their first analysis pass. A CRC-valid

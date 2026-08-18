@@ -23,6 +23,8 @@ from tests.fixture_firmware import (
     INDIRECT_CALL_WRAPPER_ADDRESS,
     LONG_STRING,
     LONG_STRING_ADDRESS,
+    MMIO_READ_FUNCTION,
+    MMIO_READ_FUNCTION_ADDRESS,
     PACKED_ISR_ROUTINES,
     PACKED_ISR_STARTS,
     RESET_HANDLER,
@@ -44,6 +46,17 @@ class RawLoaderIntegrationTests(unittest.TestCase):
         try:
             view_type = BinaryViewType[memory_map.MSP430F5438BinaryView.name]
             self.assertTrue(view_type.is_valid_for_data(raw))
+            scheduled_string_recoveries = []
+
+            def capture_string_recovery(
+                view,
+                *,
+                progress_text,
+                action,
+            ):
+                scheduled_string_recoveries.append(
+                    (view, progress_text, action)
+                )
 
             inherited_minimum, inherited_scope = Settings().get_integer_with_scope(
                 memory_map.AUTO_STRING_MIN_LENGTH_SETTING,
@@ -59,7 +72,11 @@ class RawLoaderIntegrationTests(unittest.TestCase):
                 memory_map,
                 "_recover_direct_string_call_parameters",
                 wraps=memory_map._recover_direct_string_call_parameters,
-            ) as recover_string_calls:
+            ) as recover_string_calls, mock.patch.object(
+                memory_map,
+                "_run_background_analysis_command",
+                side_effect=capture_string_recovery,
+            ):
                 view = view_type.create(raw)
                 self.assertIsNotNone(view)
                 string_minimum = Settings().get_integer(
@@ -68,7 +85,24 @@ class RawLoaderIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(string_minimum, expected_minimum)
                 view.update_analysis_and_wait()
+
+                # Initial-analysis callbacks must only enqueue work. Running a
+                # synchronous analysis drain inside the callback produces BN's
+                # UI-thread wait warning and can deadlock UI callers.
                 self.assertEqual(recover_string_calls.call_count, 0)
+                self.assertEqual(len(scheduled_string_recoveries), 1)
+                recovery_view, progress_text, recovery_action = (
+                    scheduled_string_recoveries[0]
+                )
+                self.assertEqual(recovery_view, view)
+                self.assertIn("R12", progress_text)
+
+                # Execute the captured background action deterministically.
+                # Its internal analysis update must not recursively fire the
+                # one-shot initial-analysis callback.
+                recovery_action(view)
+                self.assertGreater(recover_string_calls.call_count, 0)
+                self.assertEqual(len(scheduled_string_recoveries), 1)
 
             self.assertEqual(view.view_type, "MSP430F5438")
             self.assertEqual(str(view.arch), "msp430x")
@@ -143,6 +177,12 @@ class RawLoaderIntegrationTests(unittest.TestCase):
             self.assertIsNotNone(ret_il)
             self.assertEqual(ret_il.operation, LowLevelILOperation.LLIL_RET)
             self.assertTrue(wrapper.can_return.value)
+            wrapper_hlil_text = "\n".join(
+                str(instruction)
+                for block in wrapper.hlil
+                for instruction in block
+            )
+            self.assertNotIn("mmio_read", wrapper_hlil_text)
 
             self.assertEqual(
                 bytes(
@@ -159,36 +199,14 @@ class RawLoaderIntegrationTests(unittest.TestCase):
             self.assertIsNotNone(string_target)
             string_call_address = STRING_CALLER_ADDRESS + 0xA
             original_string_target_type = str(string_target.type)
-            self.assertIsNone(
-                string_caller.get_call_type_adjustment(string_call_address)
-            )
-            initial_hlil_text = "\n".join(
-                str(instruction)
-                for block in string_caller.hlil
-                for instruction in block
-            )
-            self.assertNotIn(
-                STRING_CALL_ARGUMENT[:-1].decode("ascii"),
-                initial_hlil_text,
-            )
-
-            with mock.patch.object(
-                memory_map,
-                "_stabilize_direct_string_call_parameters",
-                wraps=memory_map._stabilize_direct_string_call_parameters,
-            ) as manual_recovery:
-                memory_map._refresh_msp430x_analysis(view, verbose=False)
-                self.assertEqual(manual_recovery.call_count, 1)
-            string_caller = view.get_function_at(STRING_CALLER_ADDRESS)
-            string_target = view.get_function_at(STRING_CALL_TARGET_ADDRESS)
-            refreshed_hlil_text = "\n".join(
+            recovered_hlil_text = "\n".join(
                 str(instruction)
                 for block in string_caller.hlil
                 for instruction in block
             )
             self.assertIn(
                 STRING_CALL_ARGUMENT[:-1].decode("ascii"),
-                refreshed_hlil_text,
+                recovered_hlil_text,
             )
             call_adjustment = string_caller.get_call_type_adjustment(
                 string_call_address
@@ -204,6 +222,29 @@ class RawLoaderIntegrationTests(unittest.TestCase):
                 memory_map._recover_direct_string_call_parameters(view),
                 0,
             )
+
+            mmio_read = view.get_function_at(MMIO_READ_FUNCTION_ADDRESS)
+            self.assertIsNotNone(mmio_read)
+            self.assertEqual(
+                bytes(
+                    view.read(
+                        MMIO_READ_FUNCTION_ADDRESS,
+                        len(MMIO_READ_FUNCTION),
+                    )
+                ),
+                MMIO_READ_FUNCTION,
+            )
+            dmactl0 = view.get_data_var_at(0x0500)
+            self.assertIsNotNone(dmactl0)
+            self.assertEqual(dmactl0.type.width, 2)
+            self.assertTrue(dmactl0.type.volatile.value)
+            mmio_hlil_text = "\n".join(
+                str(instruction)
+                for block in mmio_read.hlil
+                for instruction in block
+            )
+            self.assertIn("mmio_read16", mmio_hlil_text)
+            self.assertIn("DMACTL0", mmio_hlil_text)
         finally:
             raw.file.close()
 

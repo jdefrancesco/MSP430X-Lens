@@ -64,8 +64,9 @@ Verify the loader and registration:
 2. Confirm the architecture/platform is `msp430x`.
 3. Confirm the `Tools -> MSP430F5438` commands are present.
 4. Run `Tools -> MSP430F5438 -> Diagnose active view`.
-5. Let initial analysis finish, then run
-   `Tools -> MSP430F5438 -> Re-run MSP430X analysis` once.
+5. Let initial analysis and the automatic `Recovering MSP430X R12 string call
+   sites` background task finish. Do not run a manual analysis command for this
+   smoke test.
 6. Confirm `0x5c00` is the reset-handler function.
 7. Confirm `0x6000` is recovered as a function even though nothing references
    it.
@@ -87,7 +88,11 @@ Verify the loader and registration:
     `0x6e40` retains its original auto-inferred type.
 14. Confirm the long `0xff` ranges between code islands remain
     non-executable data.
-15. Spot-check reset/vector and MSP430 header labels.
+15. Open Pseudo C at `0x6f00` and confirm the unused hardware read remains
+    visible as `mmio_read16(&DMACTL0)`. Confirm `DMACTL0` at `0x500` is a
+    volatile two-byte data variable; the `_L`/`_H` aliases should remain
+    navigable symbols without overlapping data variables.
+16. Spot-check reset/vector and other MSP430 header labels.
 
 For the synthetic `build/base-zero-low64k-tlv.bin`, also verify:
 
@@ -138,26 +143,31 @@ reopen the original firmware; `Re-run MSP430X analysis` cannot remove entries
 already recorded by the core string scanner. Both mapped-raw and ELF executable
 views apply the inherited eight-character minimum automatically.
 
+For a direct call preceded by a constant R12 string load in a newly opened
+mapped-raw or prepared ELF view, confirm the log reports automatic R12 string
+recovery and that the string appears as the first argument in Pseudo C without
+selecting `Re-run MSP430X analysis`. Recovery is
+intentionally skipped when the target already has a user type, an R12
+parameter, a more specific inferred prototype, or any existing call-site
+override. Zero-parameter auto-inferred callees remain eligible; their no-return
+behavior is preserved. The recovered fact is stored as a durable user override
+on that one call site because Binary Ninja can remove an automatic adjustment
+during later analysis. Recovery runs as a background task, and the log must not
+contain `UI threads are not permitted to wait for analysis completion`. When it
+finishes, an already open Pseudo C pane should repaint with the recovered string
+argument; navigating away and back must not be required. After Binary Ninja
+becomes idle, confirm the argument does not disappear again. The manual re-run
+command remains the fallback for older already-open views and for analysis
+changes made after the automatic pass. Reopening an executable MSP430X ELF
+BNDB should schedule the same recovery even though Binary Ninja does not save
+the plugin's auto preparation marker in databases.
+
 For an already-open mapped or ELF file, run
 `Tools -> MSP430F5438 -> Re-run MSP430X analysis` and check the log for:
 
 ```text
 Seeded N unreferenced MSP430X sparse code-island function(s).
 ```
-
-For a direct call preceded by a constant R12 string load, also confirm the log
-reports recovered R12 string parameters and that the string appears as the
-first argument in Pseudo C. The recovery is intentionally skipped when the
-target already has a user type, an R12 parameter, a more specific inferred
-prototype, or any existing call-site override. Zero-parameter auto-inferred
-callees remain eligible; their no-return behavior is preserved. The recovered
-fact is stored as a durable user override on that one call site because Binary
-Ninja can remove an automatic adjustment during later analysis. The command
-runs as a background task, and the log must not contain `UI threads are not
-permitted to wait for analysis completion`. When it finishes, an already open
-Pseudo C pane should repaint with the recovered string argument; navigating
-away and back must not be required. After Binary Ninja becomes idle, confirm
-the argument does not disappear again.
 
 ## Larger-firmware readiness
 

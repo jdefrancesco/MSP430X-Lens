@@ -23,6 +23,7 @@ INDIRECT_CALL_POINTER_ADDRESS = 0xE000
 STRING_CALL_ARGUMENT_ADDRESS = 0x6A00
 STRING_CALLER_ADDRESS = 0x6E00
 STRING_CALL_TARGET_ADDRESS = 0x6E40
+MMIO_READ_FUNCTION_ADDRESS = 0x6F00
 ERASED_GAP_ADDRESS = 0x6050
 SHORT_JUNK_STRING_ADDRESS = 0x6800
 EXACT_MIN_STRING_ADDRESS = 0x6820
@@ -44,10 +45,10 @@ STRING_CALL_ARGUMENT = b"module=startup state=%u result=%u\x00"
 # exercise loader setup without creating references to absent sections.
 ELF_RESET_FUNCTION = bytes.fromhex("03 43 30 41")
 
-# call #0x7de0; call #0x6d00; call #0x6e00; ret. Direct references make the
-# integration helpers deterministic analysis roots.
+# call #0x7de0; call #0x6d00; call #0x6e00; call #0x6f00; ret. Direct
+# references make the integration helpers deterministic analysis roots.
 RESET_FUNCTION = bytes.fromhex(
-    "b0 12 e0 7d b0 12 00 6d b0 12 00 6e 30 41"
+    "b0 12 e0 7d b0 12 00 6d b0 12 00 6e b0 12 00 6f 30 41"
 )
 
 # push r4; mov r14,r4; mov r12,0(r13); add #2,r13; sub #1,r4;
@@ -106,6 +107,14 @@ STRING_CALL_TARGET = bytes.fromhex(
     "04 12 05 12 06 12 36 41 35 41 34 41 30 41"
 )
 
+# push r12; mov &DMACTL0,r12; pop r12; ret.  The restored r12 makes the MMIO
+# read's result deliberately unused.  A normal load therefore disappears
+# during MLIL dead-code elimination, while a side-effecting MMIO read must
+# remain visible in Pseudo C as a reference to the header-derived DMACTL0 name.
+MMIO_READ_FUNCTION = bytes.fromhex(
+    "0c 12 1c 42 00 05 3c 41 30 41"
+)
+
 # Synthetic MSP430F5438A values arranged like the datasheet's descriptor table.
 # The CRC word at 0x1a02 is little-endian CRC-16/CCITT-FALSE over the inclusive
 # range 0x1a04..0x1aff.  Keeping the literal checksum here (rather than deriving
@@ -157,6 +166,7 @@ def build_sparse_raw_firmware() -> bytes:
     place(INDIRECT_CALL_TARGET_ADDRESS, INDIRECT_CALL_TARGET)
     place(STRING_CALLER_ADDRESS, STRING_CALLER)
     place(STRING_CALL_TARGET_ADDRESS, STRING_CALL_TARGET)
+    place(MMIO_READ_FUNCTION_ADDRESS, MMIO_READ_FUNCTION)
     place(
         INDIRECT_CALL_POINTER_ADDRESS,
         INDIRECT_CALL_TARGET_ADDRESS.to_bytes(2, "little"),
@@ -497,6 +507,9 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"Expected R12 string call in Pseudo C: {STRING_CALLER_ADDRESS:#x} "
         f"-> {STRING_CALL_TARGET_ADDRESS:#x}"
+    )
+    print(
+        f"Expected retained DMACTL0 read in Pseudo C: {MMIO_READ_FUNCTION_ADDRESS:#x}"
     )
     return 0
 

@@ -106,6 +106,9 @@ ELF_PREPARED_METADATA_KEY = "msp430x_lens.elf_prepared"
 EM_MSP430 = 105
 _ELF_RECOGNIZER_MARKER = "_msp430x_lens_elf_recognizer_registered"
 _ELF_FINALIZER_MARKER = "_msp430x_lens_elf_finalizer_registered"
+_AUTO_STRING_RECOVERY_MARKER = (
+    "_msp430x_lens_auto_string_recovery_registered"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +158,16 @@ CinitRecordInfo = tuple[int, int, int]
 CinitRecord = tuple[int, int, int, int]
 CinitCandidate = tuple[int, int, tuple[CinitRecord, ...]]
 CpuxFallback = tuple[int, str, str, bytes]
+
+
+@dataclass(frozen=True, slots=True)
+class _HeaderSfrDefinition:
+    """One typed special-function-register declaration from a TI header."""
+
+    name: str
+    address: int
+    width: int
+    read_only: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,7 +264,9 @@ LOCAL_MSP430_HEADER_CANDIDATES = (
 )
 
 DEFINE_RE = re.compile(r"^\s*#define\s+([A-Za-z_][A-Za-z0-9_]*)\s+(.+?)\s*(?://.*)?$")
-SFR_RE = re.compile(r"^\s*(?:const_)?sfr[wb]\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([^)]+?)\s*\)\s*;")
+SFR_RE = re.compile(
+    r"^\s*(const_)?(sfr[bwa])\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([^)]+?)\s*\)\s*;"
+)
 VECTOR_COMMENT_RE = re.compile(r"/\*\s*(0x[0-9A-Fa-f]+)")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 NUMBER_RE = re.compile(r"^(?:0x[0-9A-Fa-f]+|\d+)$")
@@ -481,7 +496,9 @@ MSP430F5438_SPEC = DeviceSpec(
     vector_start=VECTOR_START,
     vector_end=VECTOR_END,
     reset_vector=RESET_VECTOR,
-    regions=tuple(sorted(MAP_REGIONS + LEGACY_F5438_ONLY_REGIONS, key=lambda r: r.start)),
+    regions=tuple(
+        sorted(MAP_REGIONS + LEGACY_F5438_ONLY_REGIONS, key=lambda r: r.start)
+    ),
     symbols=SYMBOLS,
     vector_names=VECTOR_NAMES,
     tlv=MSP430F5438_TLV_SPEC,
@@ -511,7 +528,9 @@ DEVICE_SPEC_ALIASES = {
     for alias in (spec.name, *spec.aliases)
 }
 DEFAULT_DEVICE_SPEC = DEVICE_SPEC_BY_NAME[DEVICE_VARIANT]
-ALL_KNOWN_MAP_REGIONS = tuple(sorted(MAP_REGIONS + LEGACY_F5438_ONLY_REGIONS, key=lambda r: r.start))
+ALL_KNOWN_MAP_REGIONS = tuple(
+    sorted(MAP_REGIONS + LEGACY_F5438_ONLY_REGIONS, key=lambda r: r.start)
+)
 
 
 def _set_view_device_spec(bv: BinaryView, spec: DeviceSpec) -> None:
@@ -627,7 +646,9 @@ def _remove_flat_raw_segment(bv: BinaryView, raw_len: int, image_base: int) -> N
         looks_like_raw_loader_segment = (
             start in raw_starts
             and data_offset == 0
-            and (length == raw_len or end > FLASH_START or length >= min(raw_len, 0x1000))
+            and (
+                length == raw_len or end > FLASH_START or length >= min(raw_len, 0x1000)
+            )
         )
         if looks_like_raw_loader_segment:
             _remove_segment_at(bv, start, length)
@@ -663,7 +684,11 @@ def _read_file_bytes(bv: BinaryView, data_offset: int, data_length: int) -> byte
     if data_length <= 0:
         return b""
 
-    for candidate in (getattr(bv, "raw", None), getattr(getattr(bv, "file", None), "raw", None), bv):
+    for candidate in (
+        getattr(bv, "raw", None),
+        getattr(getattr(bv, "file", None), "raw", None),
+        bv,
+    ):
         if candidate is None:
             continue
         try:
@@ -683,7 +708,11 @@ def _read_raw_u16(bv: BinaryView, data_offset: int) -> Optional[int]:
 
 
 def _bytes_look_backed(data: bytes) -> bool:
-    return bool(data) and not all(byte == 0xFF for byte in data) and not all(byte == 0x00 for byte in data)
+    return (
+        bool(data)
+        and not all(byte == 0xFF for byte in data)
+        and not all(byte == 0x00 for byte in data)
+    )
 
 
 def _is_probable_vector_target(addr: int) -> bool:
@@ -773,13 +802,18 @@ def _detect_device_spec_from_tlv(
 def _has_probable_msp430_vector_table(bv: BinaryView, raw_len: int) -> bool:
     if not (0x80 <= raw_len <= DEVICE_END):
         return False
-    return max(
-        _vector_table_base_score(bv, raw_len, 0),
-        _vector_table_base_score(bv, raw_len, FLASH_START),
-    ) > 0
+    return (
+        max(
+            _vector_table_base_score(bv, raw_len, 0),
+            _vector_table_base_score(bv, raw_len, FLASH_START),
+        )
+        > 0
+    )
 
 
-def _erased_spans(data: bytes, min_run: int = ERASED_FLASH_MIN_RUN) -> tuple[AddressSpan, ...]:
+def _erased_spans(
+    data: bytes, min_run: int = ERASED_FLASH_MIN_RUN
+) -> tuple[AddressSpan, ...]:
     # Long 0xff runs are erased flash, not tiny `and.b @r15+, -1(r15)`
     # functions. Mark them data before analysis so BN does not grow nonsense CFGs.
     spans = []
@@ -921,8 +955,14 @@ def _add_region(
                 )
             return
 
-    flags = READ_ONLY_DATA if region.kind == "flash" and data_length == 0 else region.flags
-    semantics = SectionSemantics.ReadOnlyDataSectionSemantics if flags == READ_ONLY_DATA else region.semantics
+    flags = (
+        READ_ONLY_DATA if region.kind == "flash" and data_length == 0 else region.flags
+    )
+    semantics = (
+        SectionSemantics.ReadOnlyDataSectionSemantics
+        if flags == READ_ONLY_DATA
+        else region.semantics
+    )
     _add_region_chunk(
         bv,
         region.name,
@@ -936,7 +976,9 @@ def _add_region(
     )
 
 
-def _define_symbol(bv: BinaryView, symbol: Symbol, *, auto_defined: bool = False) -> None:
+def _define_symbol(
+    bv: BinaryView, symbol: Symbol, *, auto_defined: bool = False
+) -> None:
     try:
         if auto_defined and hasattr(bv, "define_auto_symbol"):
             bv.define_auto_symbol(symbol)
@@ -985,11 +1027,13 @@ def _is_header_label_address(addr: int) -> bool:
     )
 
 
-def _parse_msp430_header_symbols(texts: Sequence[str]) -> tuple[SymbolDefinition, ...]:
-    """Extract safe peripheral, TLV, vector, and alias labels from TI headers."""
+def _parse_msp430_header_definitions(
+    texts: Sequence[str],
+) -> tuple[tuple[SymbolDefinition, ...], tuple[_HeaderSfrDefinition, ...]]:
+    """Extract safe labels and typed SFR declarations from TI headers."""
 
     defines: list[tuple[str, str, str]] = []
-    sfrs: list[tuple[str, str]] = []
+    sfrs: list[tuple[bool, int, str, str]] = []
     constants: dict[str, int] = {}
 
     for text in texts:
@@ -1004,7 +1048,9 @@ def _parse_msp430_header_symbols(texts: Sequence[str]) -> tuple[SymbolDefinition
 
             sfr_match = SFR_RE.match(line)
             if sfr_match:
-                sfrs.append((sfr_match.group(1), sfr_match.group(2)))
+                const_prefix, kind, name, expr = sfr_match.groups()
+                width = {"sfrb": 1, "sfrw": 2, "sfra": 4}[kind]
+                sfrs.append((bool(const_prefix), width, name, expr))
 
     for _ in range(8):
         changed = False
@@ -1027,10 +1073,19 @@ def _parse_msp430_header_symbols(texts: Sequence[str]) -> tuple[SymbolDefinition
         if _is_header_label_address(addr):
             labels_by_name.setdefault(name, addr)
 
-    for name, expr in sfrs:
+    sfr_definitions: list[_HeaderSfrDefinition] = []
+    for read_only, width, name, expr in sfrs:
         value = _eval_header_expr(expr, constants)
         if value is not None:
             add_label(name, value)
+            if (
+                IDENTIFIER_RE.match(name)
+                and PERIPHERALS_START <= value
+                and value + width - 1 <= PERIPHERALS_END
+            ):
+                sfr_definitions.append(
+                    _HeaderSfrDefinition(name, value, width, read_only)
+                )
 
     for name, expr, line in defines:
         value = _eval_header_expr(expr, constants)
@@ -1061,7 +1116,25 @@ def _parse_msp430_header_symbols(texts: Sequence[str]) -> tuple[SymbolDefinition
         if not changed:
             break
 
-    return tuple(sorted(labels_by_name.items(), key=lambda item: (item[1], item[0])))
+    labels = tuple(sorted(labels_by_name.items(), key=lambda item: (item[1], item[0])))
+    typed_sfrs = tuple(
+        sorted(
+            set(sfr_definitions),
+            key=lambda definition: (
+                definition.address,
+                -definition.width,
+                definition.name,
+            ),
+        )
+    )
+    return labels, typed_sfrs
+
+
+def _parse_msp430_header_symbols(texts: Sequence[str]) -> tuple[SymbolDefinition, ...]:
+    """Extract safe peripheral, TLV, vector, and alias labels from TI headers."""
+
+    labels, _sfrs = _parse_msp430_header_definitions(texts)
+    return labels
 
 
 def _repo_dir() -> str:
@@ -1097,8 +1170,14 @@ def _default_msp430_header_paths() -> tuple[str, ...]:
     return tuple(result)
 
 
-def _load_msp430_header_symbols(header_paths: Optional[Sequence[str]] = None) -> tuple[SymbolDefinition, ...]:
-    paths = tuple(header_paths) if header_paths is not None else _default_msp430_header_paths()
+def _load_msp430_header_definitions(
+    header_paths: Optional[Sequence[str]] = None,
+) -> tuple[tuple[SymbolDefinition, ...], tuple[_HeaderSfrDefinition, ...]]:
+    paths = (
+        tuple(header_paths)
+        if header_paths is not None
+        else _default_msp430_header_paths()
+    )
     texts = []
     for path in paths:
         try:
@@ -1106,14 +1185,23 @@ def _load_msp430_header_symbols(header_paths: Optional[Sequence[str]] = None) ->
                 texts.append(handle.read())
         except OSError as exc:
             log_warn(f"Could not read MSP430 header labels from {path}: {exc}")
-    return _parse_msp430_header_symbols(texts)
+    return _parse_msp430_header_definitions(texts)
+
+
+def _load_msp430_header_symbols(
+    header_paths: Optional[Sequence[str]] = None,
+) -> tuple[SymbolDefinition, ...]:
+    labels, _sfrs = _load_msp430_header_definitions(header_paths)
+    return labels
 
 
 def _symbol_exists(bv: BinaryView, name: str, addr: int) -> bool:
     getter = getattr(bv, "get_symbols_by_raw_name", None)
     if getter is not None:
         try:
-            return any(getattr(symbol, "address", None) == addr for symbol in getter(name))
+            return any(
+                getattr(symbol, "address", None) == addr for symbol in getter(name)
+            )
         except Exception:
             pass
 
@@ -1121,7 +1209,8 @@ def _symbol_exists(bv: BinaryView, name: str, addr: int) -> bool:
     if getter is not None:
         try:
             return any(
-                getattr(symbol, "address", None) == addr and _symbol_raw_name(symbol) == name
+                getattr(symbol, "address", None) == addr
+                and _symbol_raw_name(symbol) == name
                 for symbol in getter(addr, 1)
             )
         except Exception:
@@ -1175,7 +1264,10 @@ def _has_function_at(bv: BinaryView, addr: int) -> bool:
             return True
 
     try:
-        return any(getattr(func, "start", None) == addr for func in getattr(bv, "functions", []))
+        return any(
+            getattr(func, "start", None) == addr
+            for func in getattr(bv, "functions", [])
+        )
     except Exception:
         return False
 
@@ -1217,7 +1309,11 @@ def _remove_boundary_symbols_at_function_starts(
             getter = getattr(bv, "get_symbols_by_raw_name", None)
             if getter is not None:
                 try:
-                    existing_symbols = [symbol for symbol in getter(name) if getattr(symbol, "address", None) == addr]
+                    existing_symbols = [
+                        symbol
+                        for symbol in getter(name)
+                        if getattr(symbol, "address", None) == addr
+                    ]
                 except Exception:
                     existing_symbols = []
 
@@ -1230,7 +1326,9 @@ def _remove_boundary_symbols_at_function_starts(
                 removed += 1
 
     if verbose and removed:
-        print(f"Removed {removed} boundary data symbol(s) that collided with functions.")
+        print(
+            f"Removed {removed} boundary data symbol(s) that collided with functions."
+        )
     return removed
 
 
@@ -1246,15 +1344,143 @@ def _define_symbols(
         _remove_boundary_symbols_at_function_starts(bv, symbols=tuple(symbols))
     defined = 0
     for name, addr in symbols:
-        if skip_function_starts and name in boundary_names and _has_function_at(bv, addr):
+        if (
+            skip_function_starts
+            and name in boundary_names
+            and _has_function_at(bv, addr)
+        ):
             continue
         if _symbol_exists(bv, name, addr):
             continue
         try:
-            _define_symbol(bv, Symbol(SymbolType.DataSymbol, addr, name), auto_defined=auto_defined)
+            _define_symbol(
+                bv, Symbol(SymbolType.DataSymbol, addr, name), auto_defined=auto_defined
+            )
             defined += 1
         except Exception as exc:
             log_warn(f"Could not define {name} at {addr:#x}: {exc}")
+    return defined
+
+
+def _canonical_header_sfr_definitions(
+    definitions: Sequence[_HeaderSfrDefinition],
+) -> tuple[_HeaderSfrDefinition, ...]:
+    """Choose one widest typed variable for each non-overlapping SFR range."""
+
+    selected: list[_HeaderSfrDefinition] = []
+    for definition in sorted(
+        set(definitions),
+        key=lambda item: (
+            -item.width,
+            item.address,
+            item.read_only,
+            item.name.endswith(("_L", "_H")),
+            len(item.name),
+            item.name,
+        ),
+    ):
+        end = definition.address + definition.width
+        if any(
+            definition.address < existing.address + existing.width
+            and existing.address < end
+            for existing in selected
+        ):
+            continue
+        selected.append(definition)
+    return tuple(sorted(selected, key=lambda item: (item.address, item.name)))
+
+
+def _volatile_sfr_type(definition: _HeaderSfrDefinition):
+    builder = Type.int(definition.width, False).mutable_copy()
+    builder.volatile = True
+    if definition.read_only:
+        builder.const = True
+    return builder.immutable_copy()
+
+
+def _type_qualifier_value(var_type, qualifier: str) -> bool:
+    try:
+        return bool(getattr(var_type, qualifier))
+    except Exception:
+        return False
+
+
+def _data_var_interval(data_var) -> tuple[int, int]:
+    start = int(getattr(data_var, "address", 0))
+    width = max(1, int(getattr(getattr(data_var, "type", None), "width", 1)))
+    return start, start + width
+
+
+def _sfr_data_var_matches(data_var, definition: _HeaderSfrDefinition) -> bool:
+    var_type = getattr(data_var, "type", None)
+    return (
+        getattr(data_var, "address", None) == definition.address
+        and int(getattr(var_type, "width", 0)) == definition.width
+        and _type_qualifier_value(var_type, "volatile")
+        and _type_qualifier_value(var_type, "const") == definition.read_only
+    )
+
+
+def _define_header_sfr_data_vars(
+    bv: BinaryView,
+    definitions: Sequence[_HeaderSfrDefinition],
+    *,
+    auto_defined: bool = False,
+) -> int:
+    """Define conservative volatile MMIO variables without replacing user data."""
+
+    try:
+        existing_data_vars = list(getattr(bv, "data_vars", {}).values())
+    except Exception:
+        existing_data_vars = []
+
+    defined = 0
+    for definition in _canonical_header_sfr_definitions(definitions):
+        definition_end = definition.address + definition.width
+        overlaps = [
+            data_var
+            for data_var in existing_data_vars
+            if definition.address < _data_var_interval(data_var)[1]
+            and _data_var_interval(data_var)[0] < definition_end
+        ]
+        if any(_sfr_data_var_matches(data_var, definition) for data_var in overlaps):
+            continue
+        if any(not bool(getattr(data_var, "auto_discovered", False)) for data_var in overlaps):
+            continue
+
+        removed_all = True
+        for data_var in overlaps:
+            try:
+                bv.undefine_data_var(data_var.address, blacklist=False)
+                existing_data_vars.remove(data_var)
+            except Exception as exc:
+                removed_all = False
+                log_warn(
+                    f"Could not replace inferred data at {data_var.address:#06x} "
+                    f"with volatile SFR {definition.name}: {exc}"
+                )
+        if not removed_all:
+            continue
+        try:
+            var_type = _volatile_sfr_type(definition)
+            if auto_defined and hasattr(bv, "define_data_var"):
+                bv.define_data_var(definition.address, var_type, definition.name)
+            elif hasattr(bv, "define_user_data_var"):
+                bv.define_user_data_var(definition.address, var_type, definition.name)
+            else:
+                continue
+            defined += 1
+            try:
+                data_var = bv.get_data_var_at(definition.address)
+                if data_var is not None:
+                    existing_data_vars.append(data_var)
+            except Exception:
+                pass
+        except Exception as exc:
+            log_warn(
+                f"Could not define volatile SFR {definition.name} "
+                f"at {definition.address:#06x}: {exc}"
+            )
     return defined
 
 
@@ -1265,13 +1491,23 @@ def apply_msp430_header_labels(
     auto_defined: bool = False,
     verbose: bool = True,
 ) -> int:
-    """Parse configured TI headers and add labels that are not already present."""
+    """Parse TI headers and add labels plus typed volatile SFR variables."""
 
-    labels = _load_msp430_header_symbols(header_paths)
-    defined = _define_symbols(bv, labels, auto_defined=auto_defined, skip_function_starts=False)
+    labels, sfr_definitions = _load_msp430_header_definitions(header_paths)
+    defined = _define_symbols(
+        bv, labels, auto_defined=auto_defined, skip_function_starts=False
+    )
+    typed = _define_header_sfr_data_vars(
+        bv,
+        sfr_definitions,
+        auto_defined=auto_defined,
+    )
     if verbose:
         if labels:
-            print(f"Applied {defined} new MSP430 header label(s) from {len(labels)} parsed label(s).")
+            print(
+                f"Applied {defined} new MSP430 header label(s) and {typed} volatile "
+                f"SFR data variable(s) from {len(labels)} parsed label(s)."
+            )
         else:
             print(
                 "No MSP430 header labels were found. Copy the TI device header into inc/ "
@@ -1326,7 +1562,9 @@ def _try_load_local_msp430x_plugin() -> None:
             importlib.import_module(module_name)
             return
         except Exception as exc:
-            log_warn(f"Could not import local MSP430X architecture module {module_name}: {exc}")
+            log_warn(
+                f"Could not import local MSP430X architecture module {module_name}: {exc}"
+            )
 
 
 def _configure_architecture(
@@ -1342,7 +1580,9 @@ def _configure_architecture(
     if arch is None:
         if verbose:
             print("MSP430 architecture was not found in this Binary Ninja install.")
-        log_warn("MSP430 architecture was not found; memory map applied without CPU analysis.")
+        log_warn(
+            "MSP430 architecture was not found; memory map applied without CPU analysis."
+        )
         return None
 
     try:
@@ -1392,7 +1632,9 @@ def _default_platform_assignment_is_safe() -> bool:
     return (major, minor) < (5, 4)
 
 
-def _set_load_setting_default(load_settings: Settings, key: str, value, *, read_only: bool = True) -> None:
+def _set_load_setting_default(
+    load_settings: Settings, key: str, value, *, read_only: bool = True
+) -> None:
     if not load_settings.contains(key):
         group = key.split(".", 1)[0]
         value_type = "number" if isinstance(value, int) else "string"
@@ -1412,7 +1654,9 @@ def _set_load_setting_default(load_settings: Settings, key: str, value, *, read_
             log_warn(f"Could not register load setting {key}: {exc}")
             return
     try:
-        load_settings.update_property(key, json.dumps({"default": value, "readOnly": read_only}))
+        load_settings.update_property(
+            key, json.dumps({"default": value, "readOnly": read_only})
+        )
     except Exception as exc:
         log_warn(f"Could not update load setting {key}: {exc}")
 
@@ -1613,7 +1857,9 @@ def _read_tlv_descriptor(
         spec = _device_spec_for_view(bv)
     layout = spec.tlv
     if layout is None:
-        return _TlvReadResult("unsupported", None, 0, "device profile has no TLV layout")
+        return _TlvReadResult(
+            "unsupported", None, 0, "device profile has no TLV layout"
+        )
 
     backed = tuple(
         _is_file_backed_byte(bv, addr)
@@ -1764,7 +2010,14 @@ def _set_vector_handler_type(
             func = None
     if func is None:
         try:
-            func = next((candidate for candidate in getattr(bv, "functions", []) if candidate.start == addr), None)
+            func = next(
+                (
+                    candidate
+                    for candidate in getattr(bv, "functions", [])
+                    if candidate.start == addr
+                ),
+                None,
+            )
         except Exception:
             func = None
     if func is None:
@@ -1779,7 +2032,9 @@ def _set_vector_handler_type(
             func.set_user_type(handler_type)
     except Exception as exc:
         if auto_defined:
-            log_warn(f"Could not set automatic vector handler type for {name} at {addr:#06x}: {exc}")
+            log_warn(
+                f"Could not set automatic vector handler type for {name} at {addr:#06x}: {exc}"
+            )
             return
         try:
             func.name = name
@@ -1805,7 +2060,9 @@ def _add_function_symbol(
         if getter is not None:
             try:
                 platform = getattr(bv, "platform", None)
-                existing = getter(addr, platform) if platform is not None else getter(addr)
+                existing = (
+                    getter(addr, platform) if platform is not None else getter(addr)
+                )
             except TypeError:
                 existing = getter(addr)
             except Exception:
@@ -1840,7 +2097,10 @@ def _add_function_symbol(
 
 
 def _vector_name_by_addr(spec: DeviceSpec = DEFAULT_DEVICE_SPEC) -> dict:
-    names = {addr: (vector_name, function_name) for addr, vector_name, function_name in spec.vector_names}
+    names = {
+        addr: (vector_name, function_name)
+        for addr, vector_name, function_name in spec.vector_names
+    }
     for addr in range(spec.vector_start, spec.vector_end + 1, 2):
         if addr not in names:
             priority = (addr - spec.vector_start) // 2
@@ -1860,7 +2120,9 @@ def _seed_interrupt_vectors(
 
     targets = {}
     vector_count = 0
-    for vector_addr, (vector_name, function_name) in sorted(_vector_name_by_addr(spec).items()):
+    for vector_addr, (vector_name, function_name) in sorted(
+        _vector_name_by_addr(spec).items()
+    ):
         target = _read_u16(bv, vector_addr)
         _define_vector_data_var(
             bv,
@@ -1875,7 +2137,13 @@ def _seed_interrupt_vectors(
             continue
 
         vector_count += 1
-        priority = 0 if vector_addr == spec.reset_vector else 2 if function_name.startswith("isr_reserved_") else 1
+        priority = (
+            0
+            if vector_addr == spec.reset_vector
+            else 2
+            if function_name.startswith("isr_reserved_")
+            else 1
+        )
         if target not in targets or priority < targets[target][0]:
             targets[target] = (
                 priority,
@@ -1903,7 +2171,9 @@ def _seed_interrupt_vectors(
                 print(f"{vector_name:>12} -> {target:#06x} {function_name}")
 
     if verbose:
-        print(f"Seeded {created} unique vector target function(s) from {vector_count} populated vector(s).")
+        print(
+            f"Seeded {created} unique vector target function(s) from {vector_count} populated vector(s)."
+        )
     return created
 
 
@@ -1926,9 +2196,13 @@ def _cleanup_peripheral_functions(bv: BinaryView, verbose: bool) -> int:
             bv.remove_function(func)
             removed += 1
         except Exception as exc:
-            log_warn(f"Could not remove low peripheral-space function at {start:#x}: {exc}")
+            log_warn(
+                f"Could not remove low peripheral-space function at {start:#x}: {exc}"
+            )
     if verbose and removed:
-        print(f"Removed {removed} stale function(s) from peripheral space below 0x1000.")
+        print(
+            f"Removed {removed} stale function(s) from peripheral space below 0x1000."
+        )
     return removed
 
 
@@ -1965,7 +2239,9 @@ def _is_printable_string_byte(byte: int) -> bool:
     return 0x20 <= byte <= 0x7E
 
 
-def _ascii_string_spans(data: bytes, base: int = 0, min_len: int = ASCII_STRING_MIN_LEN) -> tuple[AddressSpan, ...]:
+def _ascii_string_spans(
+    data: bytes, base: int = 0, min_len: int = ASCII_STRING_MIN_LEN
+) -> tuple[AddressSpan, ...]:
     """Find conservative NUL-terminated printable ASCII spans in firmware."""
 
     spans = []
@@ -1975,7 +2251,11 @@ def _ascii_string_spans(data: bytes, base: int = 0, min_len: int = ASCII_STRING_
         start = cursor
         has_alpha = False
         while cursor < data_len and _is_printable_string_byte(data[cursor]):
-            has_alpha = has_alpha or (0x41 <= data[cursor] <= 0x5A) or (0x61 <= data[cursor] <= 0x7A)
+            has_alpha = (
+                has_alpha
+                or (0x41 <= data[cursor] <= 0x5A)
+                or (0x61 <= data[cursor] <= 0x7A)
+            )
             cursor += 1
 
         length = cursor - start
@@ -2056,7 +2336,11 @@ def _ascii_string_cluster_spans(
 ) -> tuple[AddressSpan, ...]:
     """Merge nearby strings across short data-like separator gaps."""
 
-    spans = list(_merge_spans((*_ascii_string_spans(data, base), *_ascii_string_padding_spans(data, base))))
+    spans = list(
+        _merge_spans(
+            (*_ascii_string_spans(data, base), *_ascii_string_padding_spans(data, base))
+        )
+    )
     if not spans:
         return ()
 
@@ -2082,7 +2366,11 @@ def _ascii_string_gap_spans(
     *,
     max_gap: int = ASCII_STRING_CLUSTER_MAX_GAP,
 ) -> tuple[AddressSpan, ...]:
-    related = list(_merge_spans((*_ascii_string_spans(data, base), *_ascii_string_padding_spans(data, base))))
+    related = list(
+        _merge_spans(
+            (*_ascii_string_spans(data, base), *_ascii_string_padding_spans(data, base))
+        )
+    )
     spans = []
     for (_, prev_end), (start, _) in zip(related, related[1:]):
         gap_start = prev_end - base
@@ -2200,10 +2488,12 @@ def _monotonic_word_table_spans(
 
 
 def _numeric_lookup_table_spans(data: bytes, base: int = 0) -> tuple[AddressSpan, ...]:
-    return _merge_spans((
-        *_byte_lookup_table_spans(data, base),
-        *_monotonic_word_table_spans(data, base),
-    ))
+    return _merge_spans(
+        (
+            *_byte_lookup_table_spans(data, base),
+            *_monotonic_word_table_spans(data, base),
+        )
+    )
 
 
 def _is_probable_flash_jump_target(addr: int) -> bool:
@@ -2216,10 +2506,7 @@ def _address_jump_table_entries(data: bytes, table_offset: int) -> tuple[int, ..
     targets = []
     cursor = table_offset
     data_len = len(data)
-    while (
-        len(targets) < ADDRESS_JUMP_TABLE_MAX_ENTRIES
-        and cursor + 4 <= data_len
-    ):
+    while len(targets) < ADDRESS_JUMP_TABLE_MAX_ENTRIES and cursor + 4 <= data_len:
         target = _u16_from_le(data, cursor) | (
             (_u16_from_le(data, cursor + 2) & 0xF) << 16
         )
@@ -2253,7 +2540,9 @@ def _address_jump_tables(data: bytes, base: int = 0) -> tuple[AddressJumpTable, 
             cursor += 2
             continue
 
-        table_addr = ((_ext_src_hi(ext) << 16) | _u16_from_le(data, cursor + 8)) & 0xFFFFF
+        table_addr = (
+            (_ext_src_hi(ext) << 16) | _u16_from_le(data, cursor + 8)
+        ) & 0xFFFFF
         table_offset = table_addr - base
         if table_offset < 0 or table_offset + 4 > data_len:
             cursor += 2
@@ -2290,7 +2579,9 @@ def _cinit_record_next_offset(data: bytes, offset: int) -> Optional[int]:
     if length == 0 or length > CINIT_RECORD_MAX_PAYLOAD:
         return None
 
-    target = _u16_from_le(data, offset + 2) | ((_u16_from_le(data, offset + 4) & 0xF) << 16)
+    target = _u16_from_le(data, offset + 2) | (
+        (_u16_from_le(data, offset + 4) & 0xF) << 16
+    )
     target_high = _u16_from_le(data, offset + 4)
     if target_high & ~0xF:
         return None
@@ -2308,7 +2599,9 @@ def _cinit_record_info(data: bytes, offset: int) -> Optional[CinitRecordInfo]:
     if next_offset is None:
         return None
     length = _u16_from_le(data, offset)
-    target = _u16_from_le(data, offset + 2) | ((_u16_from_le(data, offset + 4) & 0xF) << 16)
+    target = _u16_from_le(data, offset + 2) | (
+        (_u16_from_le(data, offset + 4) & 0xF) << 16
+    )
     return next_offset, target, length
 
 
@@ -2434,7 +2727,9 @@ def _flash_ascii_string_padding_spans(bv: BinaryView) -> tuple[AddressSpan, ...]
 
 
 def _flash_ascii_string_related_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
-    return _merge_spans((*_flash_ascii_string_spans(bv), *_flash_ascii_string_padding_spans(bv)))
+    return _merge_spans(
+        (*_flash_ascii_string_spans(bv), *_flash_ascii_string_padding_spans(bv))
+    )
 
 
 def _flash_ascii_string_cluster_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
@@ -2493,7 +2788,10 @@ def _flash_cinit_table_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
     return tuple(
         (start, end)
         for start, end in spans
-        if not any(handler is not None and start <= handler < end for handler in vector_handlers)
+        if not any(
+            handler is not None and start <= handler < end
+            for handler in vector_handlers
+        )
     )
 
 
@@ -2558,7 +2856,9 @@ def _cleanup_ascii_string_functions(bv: BinaryView, verbose: bool) -> int:
         except Exception as exc:
             log_warn(f"Could not remove ASCII-string function at {start:#x}: {exc}")
     if verbose and removed:
-        print(f"Removed {removed} stale function(s) that start in printable ASCII flash data.")
+        print(
+            f"Removed {removed} stale function(s) that start in printable ASCII flash data."
+        )
     return removed
 
 
@@ -2578,7 +2878,9 @@ def _cleanup_numeric_lookup_table_functions(bv: BinaryView, verbose: bool) -> in
         except Exception as exc:
             log_warn(f"Could not remove numeric-table function at {start:#x}: {exc}")
     if verbose and removed:
-        print(f"Removed {removed} stale function(s) that start in numeric flash lookup tables.")
+        print(
+            f"Removed {removed} stale function(s) that start in numeric flash lookup tables."
+        )
     return removed
 
 
@@ -2596,7 +2898,9 @@ def _cleanup_address_jump_table_functions(bv: BinaryView, verbose: bool) -> int:
             bv.remove_function(func)
             removed += 1
         except Exception as exc:
-            log_warn(f"Could not remove address-jump-table function at {start:#x}: {exc}")
+            log_warn(
+                f"Could not remove address-jump-table function at {start:#x}: {exc}"
+            )
     if verbose and removed:
         print(f"Removed {removed} stale function(s) that start in address jump tables.")
     return removed
@@ -2616,13 +2920,19 @@ def _cleanup_cinit_table_functions(bv: BinaryView, verbose: bool) -> int:
             bv.remove_function(func)
             removed += 1
         except Exception as exc:
-            log_warn(f"Could not remove C initializer table function at {start:#x}: {exc}")
+            log_warn(
+                f"Could not remove C initializer table function at {start:#x}: {exc}"
+            )
     if verbose and removed:
-        print(f"Removed {removed} stale function(s) that start in C initializer tables.")
+        print(
+            f"Removed {removed} stale function(s) that start in C initializer tables."
+        )
     return removed
 
 
-def _seed_address_jump_table_indirect_branches(bv: BinaryView, verbose: bool = False) -> int:
+def _seed_address_jump_table_indirect_branches(
+    bv: BinaryView, verbose: bool = False
+) -> int:
     """Attach recovered case targets to each containing indirect branch."""
 
     arch = getattr(bv, "arch", None)
@@ -2645,7 +2955,9 @@ def _seed_address_jump_table_indirect_branches(bv: BinaryView, verbose: bool = F
                 setter(source_addr, branches)
                 seeded += 1
             except Exception as exc:
-                log_warn(f"Could not seed jump-table branches at {source_addr:#x}: {exc}")
+                log_warn(
+                    f"Could not seed jump-table branches at {source_addr:#x}: {exc}"
+                )
             break
 
     if verbose and seeded:
@@ -2694,8 +3006,10 @@ def _looks_like_msp430_function_entry(data: bytes) -> bool:
     src_reg = (word >> 8) & 0xF
     src_mode = (word >> 4) & 0x3
     dst_reg = word & 0xF
-    if opcode == 0x8 and dst_reg == 1 and (
-        (src_reg == 0 and src_mode == 3) or src_reg in (2, 3)
+    if (
+        opcode == 0x8
+        and dst_reg == 1
+        and ((src_reg == 0 and src_mode == 3) or src_reg in (2, 3))
     ):
         return True
     return (word & 0xFFF0) == 0x4100 and dst_reg >= 4
@@ -2725,9 +3039,7 @@ _FORMAT_ARGUMENT_RE = re.compile(
     r"%(?!%)(?:\d+\$)?[-+ #0']*(?:\*|\d+)?"
     r"(?:\.(?:\*|\d+))?(?:hh|h|ll|l|j|z|t|L)?[diuoxXfFeEgGaAcspn]"
 )
-_MSP430_CALLEE_SAVED_REGS = frozenset(
-    {"r4", "r5", "r6", "r7", "r8", "r9", "r10"}
-)
+_MSP430_CALLEE_SAVED_REGS = frozenset({"r4", "r5", "r6", "r7", "r8", "r9", "r10"})
 
 
 def _has_format_argument(text: str) -> bool:
@@ -2768,10 +3080,7 @@ def _read_backed_ascii_c_string(
     payload = data[:terminator]
     if not payload or not all(_is_printable_string_byte(byte) for byte in payload):
         return None
-    if not any(
-        (0x41 <= byte <= 0x5A) or (0x61 <= byte <= 0x7A)
-        for byte in payload
-    ):
+    if not any((0x41 <= byte <= 0x5A) or (0x61 <= byte <= 0x7A) for byte in payload):
         return None
     if not all(
         _is_file_backed_byte(bv, byte_addr)
@@ -2845,7 +3154,10 @@ def _register_parameter_names(func) -> set[str]:
         variables = getattr(func, "parameter_vars", ())
         variables = getattr(variables, "vars", variables)
         for variable in variables:
-            if getattr(variable, "source_type", None) != VariableSourceType.RegisterVariableSourceType:
+            if (
+                getattr(variable, "source_type", None)
+                != VariableSourceType.RegisterVariableSourceType
+            ):
                 continue
             names.add(str(arch.get_reg_name(variable.storage)))
     except Exception:
@@ -2921,7 +3233,9 @@ def _mark_incremental_function_updates(functions: Iterable) -> None:
             pass
 
 
-def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False) -> int:
+def _recover_direct_string_call_parameters(
+    bv: BinaryView, verbose: bool = False
+) -> int:
     """Restore proven R12 strings with durable call-site type adjustments.
 
     This runs only after function analysis.  It requires a direct CALL/CALLA,
@@ -3022,7 +3336,9 @@ def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False
                 calling_convention=calling_convention,
                 variable_arguments=(
                     is_format
-                    or bool(getattr(current_type.has_variable_arguments, "value", False))
+                    or bool(
+                        getattr(current_type.has_variable_arguments, "value", False)
+                    )
                 ),
                 stack_adjust=getattr(current_type, "stack_adjustment", None),
             ).mutable_copy()
@@ -3035,8 +3351,7 @@ def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False
                     f"{call_addr:#x}: {exc}"
                 )
             log_warn(
-                f"Could not recover R12 string parameter at call "
-                f"{call_addr:#x}: {exc}"
+                f"Could not recover R12 string parameter at call {call_addr:#x}: {exc}"
             )
             continue
 
@@ -3071,8 +3386,7 @@ def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False
                     f"{call_addr:#x}: {exc}"
                 )
             log_warn(
-                f"Could not recover R12 string parameter at call "
-                f"{call_addr:#x}: {exc}"
+                f"Could not recover R12 string parameter at call {call_addr:#x}: {exc}"
             )
             continue
 
@@ -3085,9 +3399,7 @@ def _recover_direct_string_call_parameters(bv: BinaryView, verbose: bool = False
 
     _mark_incremental_function_updates(affected_callers.values())
     if verbose and recovered:
-        print(
-            f"Recovered R12 string parameter(s) at {recovered} direct call site(s)."
-        )
+        print(f"Recovered R12 string parameter(s) at {recovered} direct call site(s).")
     return recovered
 
 
@@ -3099,10 +3411,10 @@ def _stabilize_direct_string_call_parameters(
 ) -> tuple[int, ...]:
     """Recover call-site strings and synchronously confirm a fixed point.
 
-    Keep this bounded orchestration on explicit analysis commands so it cannot
-    extend the initial loader pass. Durable call-site adjustments normally
-    converge after one analysis pass; the bound protects against core/API
-    behavior changes without blocking initial firmware loading.
+    Run this only from a normal Python background thread, never from Binary
+    Ninja's UI or analysis-completion callback thread. Durable call-site
+    adjustments normally converge after one analysis pass; the bound protects
+    against core/API behavior changes without blocking initial firmware loading.
     """
 
     if max_passes <= 0:
@@ -3134,14 +3446,15 @@ def _stabilize_direct_string_call_parameters(
 def _decoded_return_kind(ins) -> Optional[str]:
     """Return the architectural return kind for a decoded instruction."""
 
-    if (
-        getattr(ins, "fmt", None) == "single"
-        and getattr(ins, "mnemonic", None) in ("ret", "reta", "reti")
+    if getattr(ins, "fmt", None) == "single" and getattr(ins, "mnemonic", None) in (
+        "ret",
+        "reta",
+        "reti",
     ):
         return ins.mnemonic
-    if (
-        getattr(ins, "fmt", None) != "double"
-        or getattr(ins, "mnemonic", None) not in ("mov", "mova")
+    if getattr(ins, "fmt", None) != "double" or getattr(ins, "mnemonic", None) not in (
+        "mov",
+        "mova",
     ):
         return None
     src = getattr(ins, "src", None)
@@ -3287,10 +3600,7 @@ def _decode_msp430_routine(
                 return None
             next_addresses = ()
             tail_exit_nodes.add(instruction_addr)
-        elif (
-            len(flow) == 2
-            and {kind for kind, _target in flow} == {"true", "false"}
-        ):
+        elif len(flow) == 2 and {kind for kind, _target in flow} == {"true", "false"}:
             next_addresses = tuple(target for _kind, target in flow)
         else:
             return None
@@ -3344,7 +3654,9 @@ def _decode_msp430_routine(
     )
 
 
-def _code_window_end(addr: int, island_end: int, data_spans: Sequence[AddressSpan]) -> int:
+def _code_window_end(
+    addr: int, island_end: int, data_spans: Sequence[AddressSpan]
+) -> int:
     """Bound code validation at the next known data range."""
 
     end = island_end
@@ -3397,7 +3709,9 @@ def _executable_backed_islands(bv: BinaryView) -> tuple[AddressSpan, ...]:
             backed_length = int(backed_length)
         except (TypeError, ValueError):
             backed_length = end - start
-        length = min(end - start, max(0, backed_length), EXECUTABLE_SEGMENT_SCAN_MAX_BYTES)
+        length = min(
+            end - start, max(0, backed_length), EXECUTABLE_SEGMENT_SCAN_MAX_BYTES
+        )
         if length <= 0:
             continue
         key = (start, length)
@@ -3431,13 +3745,15 @@ def _seed_sparse_code_island_functions(bv: BinaryView, verbose: bool = False) ->
     if decoder is None or branch_edges is None:
         return 0
 
-    known_data_spans = _merge_spans((
-        *_flash_ascii_string_cluster_spans(bv),
-        *_flash_numeric_lookup_table_spans(bv),
-        *_flash_address_jump_table_spans(bv),
-        *_flash_cinit_table_spans(bv),
-        *_data_variable_spans(bv),
-    ))
+    known_data_spans = _merge_spans(
+        (
+            *_flash_ascii_string_cluster_spans(bv),
+            *_flash_numeric_lookup_table_spans(bv),
+            *_flash_address_jump_table_spans(bv),
+            *_flash_cinit_table_spans(bv),
+            *_data_variable_spans(bv),
+        )
+    )
     created = 0
     for island_start, island_end in _executable_backed_islands(bv):
         length = island_end - island_start
@@ -3460,7 +3776,10 @@ def _seed_sparse_code_island_functions(bv: BinaryView, verbose: bool = False) ->
         function_starts = set()
         for func in getattr(bv, "functions", ()):
             function_start = getattr(func, "start", None)
-            if isinstance(function_start, int) and island_start <= function_start < island_end:
+            if (
+                isinstance(function_start, int)
+                and island_start <= function_start < island_end
+            ):
                 function_starts.add(function_start)
         sorted_function_starts = sorted(function_starts)
 
@@ -3493,12 +3812,14 @@ def _seed_sparse_code_island_functions(bv: BinaryView, verbose: bool = False) ->
             window_end = _code_window_end(addr, island_end, known_data_spans)
             next_function_index = bisect.bisect_right(sorted_function_starts, addr)
             if next_function_index < len(sorted_function_starts):
-                window_end = min(window_end, sorted_function_starts[next_function_index])
+                window_end = min(
+                    window_end, sorted_function_starts[next_function_index]
+                )
             if window_end - addr < 4:
                 return None
             offset = addr - island_start
             return _decode_msp430_routine(
-                data[offset:offset + (window_end - addr)],
+                data[offset : offset + (window_end - addr)],
                 addr,
                 decoder=decoder,
                 branch_edges=branch_edges,
@@ -3560,7 +3881,9 @@ def _seed_sparse_code_island_functions(bv: BinaryView, verbose: bool = False) ->
     return created
 
 
-def _seed_address_jump_table_target_functions(bv: BinaryView, verbose: bool = False) -> int:
+def _seed_address_jump_table_target_functions(
+    bv: BinaryView, verbose: bool = False
+) -> int:
     """Create functions for backed jump-table targets not classified as data."""
 
     add_function = getattr(bv, "add_function", None)
@@ -3582,7 +3905,9 @@ def _seed_address_jump_table_target_functions(bv: BinaryView, verbose: bool = Fa
                 add_function(target)
                 created += 1
             except Exception as exc:
-                log_warn(f"Could not add jump-table target function at {target:#x}: {exc}")
+                log_warn(
+                    f"Could not add jump-table target function at {target:#x}: {exc}"
+                )
 
     if verbose and created:
         print(f"Seeded {created} MSP430X address jump table target function(s).")
@@ -3722,7 +4047,9 @@ def _data_var_overlaps(bv: BinaryView, start: int, width: int) -> bool:
     except Exception:
         try:
             for addr, variable in getattr(bv, "data_vars", {}).items():
-                variable_width = int(getattr(getattr(variable, "type", None), "width", 1))
+                variable_width = int(
+                    getattr(getattr(variable, "type", None), "width", 1)
+                )
                 if start < addr + max(1, variable_width) and addr < start + width:
                     return True
         except Exception:
@@ -3779,7 +4106,9 @@ def _tlv_record_comment(record: TlvRecord) -> str:
             f"test_results={test_results:#06x}"
         )
     if record.tag == TLV_TAG_ADC12_CAL_F5438 and record.length == 0x10:
-        values = tuple(int.from_bytes(value[i:i + 2], "little") for i in range(0, 16, 2))
+        values = tuple(
+            int.from_bytes(value[i : i + 2], "little") for i in range(0, 16, 2)
+        )
         offset = int.from_bytes(value[2:4], "little", signed=True)
         return (
             f"{prefix}; gain={values[0]:#06x}, offset={offset}, "
@@ -3787,14 +4116,16 @@ def _tlv_record_comment(record: TlvRecord) -> str:
             f"ref2.5_factor={values[5]:#06x}, ref2.5_temp={[hex(item) for item in values[6:8]]}"
         )
     if record.tag == TLV_TAG_ADC12_CAL and record.length == 0x10:
-        values = tuple(int.from_bytes(value[i:i + 2], "little") for i in range(0, 16, 2))
+        values = tuple(
+            int.from_bytes(value[i : i + 2], "little") for i in range(0, 16, 2)
+        )
         offset = int.from_bytes(value[2:4], "little", signed=True)
         return (
             f"{prefix}; gain={values[0]:#06x}, offset={offset}, "
             f"temperature_cal={[hex(item) for item in values[2:]]}"
         )
     if record.tag == TLV_TAG_REF_CAL and record.length == 0x06:
-        refs = tuple(int.from_bytes(value[i:i + 2], "little") for i in range(0, 6, 2))
+        refs = tuple(int.from_bytes(value[i : i + 2], "little") for i in range(0, 6, 2))
         return f"{prefix}; ref1.5={refs[0]:#06x}, ref2.0={refs[1]:#06x}, ref2.5={refs[2]:#06x}"
     if record.tag == TLV_TAG_PERIPHERAL:
         descriptor = decode_peripheral_descriptor(record)
@@ -3825,7 +4156,9 @@ def _tlv_record_type_and_name(record: TlvRecord, tlv_types: dict[str, object]):
             "tlv_adc12_calibration",
         )
     if record.tag == TLV_TAG_REF_CAL and record.length == 0x06:
-        return tlv_types.get("msp430_tlv_ref_calibration", raw_type), "tlv_ref_calibration"
+        return tlv_types.get(
+            "msp430_tlv_ref_calibration", raw_type
+        ), "tlv_ref_calibration"
     if record.tag == TLV_TAG_PERIPHERAL:
         name = "tlv_peripheral_descriptor"
     else:
@@ -3899,7 +4232,9 @@ def _annotate_tlv_descriptor(
         f"computed={block.computed_crc:#06x} over "
         f"[{block.base + 4:#06x}, {block.end:#06x})"
     )
-    if _set_comment_if_empty(bv, block.base + 2, crc_comment, auto_defined=auto_defined):
+    if _set_comment_if_empty(
+        bv, block.base + 2, crc_comment, auto_defined=auto_defined
+    ):
         changed += 1
     for name, addr in (
         ("tlv_crc16", block.base + 2),
@@ -4118,7 +4453,9 @@ def _define_cinit_table_data_vars(
                     )
                 added = True
             except Exception as exc:
-                log_warn(f"Could not define C initializer record data at {start:#x}: {exc}")
+                log_warn(
+                    f"Could not define C initializer record data at {start:#x}: {exc}"
+                )
 
         if not _symbol_exists(bv, name, start):
             try:
@@ -4129,7 +4466,9 @@ def _define_cinit_table_data_vars(
                 )
                 added = True
             except Exception as exc:
-                log_warn(f"Could not define C initializer record symbol at {start:#x}: {exc}")
+                log_warn(
+                    f"Could not define C initializer record symbol at {start:#x}: {exc}"
+                )
 
         if _set_comment_if_empty(
             bv,
@@ -4283,7 +4622,9 @@ def report_cpux_fallbacks(bv: BinaryView) -> None:
         print("No CPUX fallback instructions found inside analyzed functions.")
         return
 
-    print(f"Found {len(hits)} possible CPUX fallback instruction(s) inside analyzed functions:")
+    print(
+        f"Found {len(hits)} possible CPUX fallback instruction(s) inside analyzed functions:"
+    )
     for addr, func_name, text, raw in hits:
         print(f"  {addr:#08x} {func_name}: {raw.hex()} {text}")
 
@@ -4336,14 +4677,20 @@ def diagnose_msp430f5438_view(bv: BinaryView) -> None:
     reset = _read_u16(bv, spec.reset_vector)
     view_type = _view_type_name(bv)
     regions = spec.regions
-    mapped_count = sum(1 for region in regions if _mapped_regions_present(bv, (region,)))
+    mapped_count = sum(
+        1 for region in regions if _mapped_regions_present(bv, (region,))
+    )
     erased_function_count = sum(
         1
         for func in getattr(bv, "functions", [])
         if _is_erased_flash_function_start(bv, getattr(func, "start", -1))
     )
-    print(f"view_type={view_type} arch={getattr(bv, 'arch', None)} platform={getattr(bv, 'platform', None)}")
-    print(f"raw_len={raw_len:#x} view_start={getattr(bv, 'start', 0):#x} view_end={getattr(bv, 'end', 0):#x}")
+    print(
+        f"view_type={view_type} arch={getattr(bv, 'arch', None)} platform={getattr(bv, 'platform', None)}"
+    )
+    print(
+        f"raw_len={raw_len:#x} view_start={getattr(bv, 'start', 0):#x} view_end={getattr(bv, 'end', 0):#x}"
+    )
     print(f"mapped_sections={mapped_count}/{len(regions)}")
     print(f"erased_flash_functions={erased_function_count}")
     cpux_fallbacks = _cpux_fallbacks_in_functions(bv)
@@ -4362,7 +4709,9 @@ def diagnose_msp430f5438_view(bv: BinaryView) -> None:
         )
     print(f"reset_vector={reset if reset is None else hex(reset)}")
     if reset is None:
-        print("Reset vector is unreadable. Re-run with the correct image_base for this dump.")
+        print(
+            "Reset vector is unreadable. Re-run with the correct image_base for this dump."
+        )
     elif not _is_probable_code_pointer(reset):
         print("Reset vector does not look like a valid low-flash/RAM code pointer.")
     else:
@@ -4617,13 +4966,17 @@ def apply_msp430f5438_full_image_memory_map(bv: BinaryView) -> None:
 def apply_msp430f5438a_main_flash_memory_map(bv: BinaryView) -> None:
     """Map an MSP430F5438A main-flash dump beginning at address 0x5c00."""
 
-    apply_msp430f5438_memory_map(bv, variant="MSP430F5438A", image_base=FLASH_START, arch_name="msp430x")
+    apply_msp430f5438_memory_map(
+        bv, variant="MSP430F5438A", image_base=FLASH_START, arch_name="msp430x"
+    )
 
 
 def apply_msp430f5438a_full_image_memory_map(bv: BinaryView) -> None:
     """Map a full-address-space MSP430F5438A image beginning at address zero."""
 
-    apply_msp430f5438_memory_map(bv, variant="MSP430F5438A", image_base=0, arch_name="msp430x")
+    apply_msp430f5438_memory_map(
+        bv, variant="MSP430F5438A", image_base=0, arch_name="msp430x"
+    )
 
 
 def rerun_msp430x_analysis(bv: BinaryView) -> None:
@@ -4635,7 +4988,9 @@ def rerun_msp430x_analysis(bv: BinaryView) -> None:
         return
 
     vector_functions = _refresh_msp430x_analysis(bv, arch_name="msp430x", verbose=True)
-    print(f"Re-ran MSP430X analysis and refreshed {vector_functions} vector target function(s).")
+    print(
+        f"Re-ran MSP430X analysis and refreshed {vector_functions} vector target function(s)."
+    )
     diagnose_msp430f5438_view(bv)
 
 
@@ -4752,6 +5107,58 @@ def _run_background_analysis_command(
     task = _Msp430xCommandTask(progress_text, action, bv)
     task.start()
     return task
+
+
+def _is_automatic_string_recovery_view(bv: BinaryView) -> bool:
+    """Return whether a completed view can receive MSP430X call-site recovery."""
+
+    if str(getattr(bv, "arch", "")).lower() != "msp430x":
+        return False
+    if _is_raw_binary_view(bv):
+        return False
+    if _is_msp430f5438_mapped_view(bv):
+        return True
+    if _view_type_name(bv) != "ELF":
+        return False
+    try:
+        if bool(bv.query_metadata(ELF_PREPARED_METADATA_KEY)):
+            return True
+    except Exception:
+        pass
+    # Binary Ninja deliberately omits auto metadata from saved databases.  A
+    # reopened executable ELF BNDB is still an owned MSP430X analysis view and
+    # should receive recovery improvements added by newer plugin versions.
+    return (
+        bool(getattr(bv, "has_database", False))
+        and bool(getattr(bv, "executable", False))
+        and not bool(getattr(bv, "relocatable", False))
+    )
+
+
+def _run_automatic_string_call_recovery(bv: BinaryView) -> None:
+    """Recover R12 strings after initial analysis on a safe Python thread."""
+
+    recovered_per_pass = _stabilize_direct_string_call_parameters(
+        bv,
+        verbose=False,
+    )
+    if any(recovered_per_pass):
+        log_info(
+            "Automatically recovered MSP430X R12 string call sites after "
+            f"initial analysis; recovery_passes={recovered_per_pass}"
+        )
+
+
+def _schedule_automatic_string_call_recovery(bv: BinaryView):
+    """Initial-analysis callback that defers recovery outside BN's worker."""
+
+    if not _is_automatic_string_recovery_view(bv):
+        return None
+    return _run_background_analysis_command(
+        bv,
+        progress_text="Recovering MSP430X R12 string call sites",
+        action=_run_automatic_string_call_recovery,
+    )
 
 
 def _background_command(action, progress_text: str):
@@ -4922,6 +5329,7 @@ def _prepare_msp430x_elf_view(bv: BinaryView) -> bool:
         requested_profile = Settings().get_string(ELF_DEVICE_PROFILE_SETTING, bv)
     except Exception:
         requested_profile = ELF_DEVICE_PROFILE_AUTO
+
     requested_profile = str(requested_profile).strip()
     requested_spec_name = DEVICE_SPEC_ALIASES.get(requested_profile.upper())
     spec = DEVICE_SPEC_BY_NAME.get(requested_spec_name) if requested_spec_name else None
@@ -4929,6 +5337,7 @@ def _prepare_msp430x_elf_view(bv: BinaryView) -> bool:
 
     if not isinstance(spec, DeviceSpec) and allow_auto_detection:
         spec = getattr(bv, "spec", None)
+
     if not isinstance(spec, DeviceSpec) and allow_auto_detection:
         try:
             variant = bv.query_metadata(DEVICE_VARIANT_METADATA_KEY)
@@ -4939,8 +5348,10 @@ def _prepare_msp430x_elf_view(bv: BinaryView) -> bool:
             spec = DEVICE_SPEC_BY_NAME.get(spec_name) if spec_name is not None else None
         else:
             spec = None
+
     if not isinstance(spec, DeviceSpec) and allow_auto_detection:
         spec = _detect_device_spec_from_mapped_tlv(bv)
+
     if not isinstance(spec, DeviceSpec):
         try:
             bv.store_metadata(ELF_PREPARED_METADATA_KEY, True, isAuto=True)
@@ -5016,6 +5427,20 @@ def _prepare_finalized_msp430x_elf(bv: BinaryView) -> None:
         log_warn(f"Could not prepare MSP430X ELF before analysis: {exc}")
 
 
+def _register_automatic_string_call_recovery() -> None:
+    """Register one process-wide post-initial-analysis recovery callback."""
+
+    if getattr(BinaryViewType, _AUTO_STRING_RECOVERY_MARKER, False):
+        return
+    try:
+        BinaryViewType.add_binaryview_initial_analysis_completion_event(
+            _schedule_automatic_string_call_recovery
+        )
+        setattr(BinaryViewType, _AUTO_STRING_RECOVERY_MARKER, True)
+    except Exception as exc:
+        log_warn(f"Could not register automatic MSP430X string recovery: {exc}")
+
+
 def _register_msp430x_elf_support() -> None:
     """Register process-wide ELF architecture selection and pre-analysis setup."""
 
@@ -5052,6 +5477,7 @@ def register_msp430f5438_binary_view() -> None:
 
     _try_load_local_msp430x_plugin()
     _register_msp430x_elf_support()
+    _register_automatic_string_call_recovery()
     if _binary_view_type_registered(MSP430F5438BinaryView.name):
         _register_msp430f5438_default_platform()
         return
@@ -5107,7 +5533,9 @@ def _binary_view_type_registered(name: str) -> bool:
         pass
 
     try:
-        return any(getattr(view_type, "name", None) == name for view_type in BinaryViewType)
+        return any(
+            getattr(view_type, "name", None) == name for view_type in BinaryViewType
+        )
     except Exception:
         return False
 

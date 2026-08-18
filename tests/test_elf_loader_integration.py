@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from binaryninja import (
     BinaryView,
@@ -169,6 +170,10 @@ class ElfLoaderIntegrationTests(unittest.TestCase):
             self.assert_symbol_at(view, "vector_reset", RESET_VECTOR)
             self.assert_symbol_at(view, "tlv_crc16", TLV_DESCRIPTOR_ADDRESS + 2)
             self.assert_symbol_at(view, "WDTCTL", 0x015C)
+            dmactl0 = view.get_data_var_at(0x0500)
+            self.assertIsNotNone(dmactl0)
+            self.assertEqual(dmactl0.type.width, 2)
+            self.assertTrue(dmactl0.type.volatile.value)
             self.assertTrue(
                 view.query_metadata(memory_map.ELF_PREPARED_METADATA_KEY)
             )
@@ -203,6 +208,7 @@ class ElfLoaderIntegrationTests(unittest.TestCase):
             with self.assertRaises(KeyError):
                 view.query_metadata(memory_map.DEVICE_VARIANT_METADATA_KEY)
             self.assertEqual(view.get_symbols_by_raw_name("WDTCTL"), [])
+            self.assertIsNone(view.get_data_var_at(0x0500))
             self.assertEqual(view.get_symbols_by_raw_name("vector_reset"), [])
             self.assertIsNone(view.get_data_var_at(TLV_DESCRIPTOR_ADDRESS))
         finally:
@@ -233,6 +239,10 @@ class ElfLoaderIntegrationTests(unittest.TestCase):
                 "MSP430F5438A",
             )
             self.assert_symbol_at(view, "WDTCTL", 0x015C)
+            dmactl0 = view.get_data_var_at(0x0500)
+            self.assertIsNotNone(dmactl0)
+            self.assertEqual(dmactl0.type.width, 2)
+            self.assertTrue(dmactl0.type.volatile.value)
         finally:
             view.file.close()
 
@@ -296,6 +306,36 @@ class ElfLoaderIntegrationTests(unittest.TestCase):
             self.assertEqual(reset_functions[0].name, "_start")
         finally:
             raw.file.close()
+
+    def test_prepared_elf_schedules_one_post_initial_string_recovery(self):
+        scheduled_string_recoveries = []
+
+        def capture_string_recovery(view, *, progress_text, action):
+            scheduled_string_recoveries.append((view, progress_text, action))
+
+        with mock.patch.object(
+            memory_map,
+            "_run_background_analysis_command",
+            side_effect=capture_string_recovery,
+        ):
+            raw, view = self._create_elf_view()
+            try:
+                view.update_analysis_and_wait()
+
+                self.assertEqual(len(scheduled_string_recoveries), 1)
+                recovery_view, progress_text, recovery_action = (
+                    scheduled_string_recoveries[0]
+                )
+                self.assertEqual(recovery_view, view)
+                self.assertIn("R12", progress_text)
+
+                # The captured action models the background task after the
+                # initial-analysis callback returns. Its analysis updates must
+                # not recursively schedule another initial-analysis recovery.
+                recovery_action(view)
+                self.assertEqual(len(scheduled_string_recoveries), 1)
+            finally:
+                raw.file.close()
 
     def test_relocatable_elf_selects_arch_without_absolute_device_annotations(self):
         image = bytearray(build_msp430_elf_firmware())

@@ -1228,6 +1228,18 @@ class MSP430XArchitecture(Architecture):
             [IntrinsicInput(Type.int(4, False), "addr"), IntrinsicInput(Type.int(4, False), "value")],
             [],
         ),
+        "mmio_read8": IntrinsicInfo(
+            [IntrinsicInput(Type.pointer_of_width(4, Type.void()), "address")],
+            [Type.int(1, False)],
+        ),
+        "mmio_read16": IntrinsicInfo(
+            [IntrinsicInput(Type.pointer_of_width(4, Type.void()), "address")],
+            [Type.int(2, False)],
+        ),
+        "mmio_read20": IntrinsicInfo(
+            [IntrinsicInput(Type.pointer_of_width(4, Type.void()), "address")],
+            [Type.int(4, False)],
+        ),
         "msbmaskw": IntrinsicInfo([IntrinsicInput(Type.int(2, False), "value")], [Type.int(2, False)]),
         "align2_20": IntrinsicInfo([IntrinsicInput(Type.int(4, False), "value")], [Type.int(4, False)]),
         "daddb": IntrinsicInfo(
@@ -1703,6 +1715,50 @@ class MSP430XArchitecture(Architecture):
             return il.reg(4, temp)
         return self._mask_expr(il, size, il.load(size, addr))
 
+    def _is_volatile_data_var(self, il, addr: int) -> bool:
+        """Check view-specific type evidence without assuming a device map."""
+
+        view = getattr(il, "view", None)
+        if view is None:
+            return False
+        try:
+            data_var = view.get_data_var_at(addr)
+        except Exception:
+            return False
+        if data_var is None:
+            return False
+
+        var_type = getattr(data_var, "type", None)
+        if var_type is None:
+            return False
+        try:
+            if bool(var_type.volatile):
+                return True
+        except Exception:
+            pass
+        try:
+            resolved = var_type.deref_named_type_reference(view)
+            return resolved is not None and bool(resolved.volatile)
+        except Exception:
+            return False
+
+    def _load_direct_memory(self, il, size: int, addr: int, temp_id: int):
+        if not self._is_volatile_data_var(il, addr):
+            return self._load_from_addr(il, size, il.const(4, addr), temp_id)
+
+        intrinsic = {1: "mmio_read8", 2: "mmio_read16", 4: "mmio_read20"}.get(size)
+        if intrinsic is None:
+            return self._load_from_addr(il, size, il.const(4, addr), temp_id)
+        temp = LLIL_TEMP(temp_id)
+        il.append(
+            il.intrinsic(
+                [temp],
+                intrinsic,
+                [il.const_pointer(4, addr)],
+            )
+        )
+        return il.reg(size, temp)
+
     def _store_to_addr(self, il, size: int, addr, value) -> None:
         value = self._mask_expr(il, size, value)
         if size == 4:
@@ -1717,7 +1773,9 @@ class MSP430XArchitecture(Architecture):
             return il.const(size, op.value & mask_for_size(size))
         if op.kind == "reg":
             return self._reg_value(il, op.reg, size)
-        if op.kind in ("mem", "indexed"):
+        if op.kind == "mem":
+            return self._load_direct_memory(il, size, op.addr, 37 + temp_base)
+        if op.kind == "indexed":
             return self._load_from_addr(il, size, self._addr_expr(il, op), 37 + temp_base)
         if op.kind == "indirect":
             if not op.autoinc:
