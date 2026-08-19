@@ -96,10 +96,14 @@ class AutomaticStringRecoveryTests(unittest.TestCase):
 
         dispatch.assert_not_called()
 
-    def test_background_action_uses_only_bounded_string_recovery(self):
+    def test_background_action_uses_only_bounded_post_analysis_recovery(self):
         view = object()
 
         with mock.patch.object(
+            memory_map,
+            "_apply_msp430_abi_helper_metadata",
+            return_value=0,
+        ) as helpers, mock.patch.object(
             memory_map,
             "_stabilize_direct_string_call_parameters",
             return_value=(3, 0),
@@ -109,6 +113,7 @@ class AutomaticStringRecoveryTests(unittest.TestCase):
         ) as full_refresh:
             memory_map._run_automatic_string_call_recovery(view)
 
+        helpers.assert_called_once_with(view, verbose=False)
         stabilize.assert_called_once()
         self.assertIs(stabilize.call_args.args[0], view)
         full_refresh.assert_not_called()

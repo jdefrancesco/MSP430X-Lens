@@ -86,6 +86,8 @@ sfrw(UCA0ICTL, UCA0ICTL_);
 /* UCAxIFG Control Bits */
 #define UCTXIFG             (0x0002)  /* USCI Transmit Interrupt Flag */
 #define UCRXIFG             (0x0001)  /* USCI Receive Interrupt Flag */
+#define UCA0IV_ 0x05DE
+sfrw(UCA0IV, UCA0IV_);
 
 #define DMACTL0_ 0x0500
 sfrb(DMACTL0_L, DMACTL0_);
@@ -94,6 +96,12 @@ sfrw(DMACTL0, DMACTL0_);
 
 #define DMA0SA_ 0x0512
 sfra(DMA0SA, DMA0SA_);
+#define DMA0DA_ 0x0516
+sfrl(DMA0DA, DMA0DA_);
+#define DMA1SA_ 0x0522
+sfr_a(DMA1SA);
+#define DMA1DA_ 0x0526
+sfr_l(DMA1DA);
 
 #define PAIN_ 0x0200
 const_sfrb(PAIN_L, PAIN_);
@@ -122,10 +130,16 @@ class HeaderSfrTests(unittest.TestCase):
         self.assertEqual(labels_by_name["DMACTL0_L"], 0x0500)
         self.assertEqual(labels_by_name["DMACTL0_H"], 0x0501)
         self.assertEqual(labels_by_name["DMA0SA"], 0x0512)
+        self.assertEqual(labels_by_name["DMA0DA"], 0x0516)
+        self.assertEqual(labels_by_name["DMA1SA"], 0x0522)
+        self.assertEqual(labels_by_name["DMA1DA"], 0x0526)
         self.assertEqual(labels_by_name["WDTCTL"], 0x015C)
         self.assertEqual(sfrs_by_name["DMACTL0_L"].width, 1)
         self.assertEqual(sfrs_by_name["DMACTL0"].width, 2)
         self.assertEqual(sfrs_by_name["DMA0SA"].width, 4)
+        self.assertEqual(sfrs_by_name["DMA0DA"].width, 4)
+        self.assertEqual(sfrs_by_name["DMA1SA"].width, 4)
+        self.assertEqual(sfrs_by_name["DMA1DA"].width, 4)
         self.assertFalse(sfrs_by_name["DMACTL0"].read_only)
         self.assertTrue(sfrs_by_name["PAIN"].read_only)
         self.assertIn(("WDTHOLD", 0x0080), sfrs_by_name["WDTCTL"].enum_members)
@@ -275,6 +289,42 @@ class HeaderSfrTests(unittest.TestCase):
             self.assertFalse(preserved.auto_discovered)
             self.assertEqual(str(preserved.type), str(custom_type))
             self.assertEqual(preserved.name, "custom_dma")
+        finally:
+            view.file.close()
+
+    def test_sfr_data_vars_replace_stale_header_aliases_and_default_data(self):
+        labels, sfrs = memory_map._parse_msp430_header_definitions(
+            [HEADER_TEXT]
+        )
+        view = BinaryView.new(b"\0" * 0x1000)
+        try:
+            view.define_user_data_var(0x05DC, Type.char(), "UCA0IE")
+            view.define_user_data_var(0x05DD, Type.char(), "UCA0IFG")
+            view.define_user_data_var(0x05DE, Type.char(), "UCA0IV")
+            view.define_user_data_var(0x05DF, Type.char(), "data_5df")
+
+            self.assertGreater(
+                memory_map._define_header_sfr_data_vars(
+                    view,
+                    sfrs,
+                    auto_defined=True,
+                    replaceable_names={name for name, _addr in labels},
+                ),
+                0,
+            )
+
+            uca0ictl = view.get_data_var_at(0x05DC)
+            self.assertIsNotNone(uca0ictl)
+            self.assertEqual(uca0ictl.address, 0x05DC)
+            self.assertEqual(uca0ictl.type.width, 2)
+            self.assertIn("UCA0ICTL_bits", str(uca0ictl.type))
+            self.assertEqual(view.get_data_var_at(0x05DD).address, 0x05DC)
+
+            uca0iv = view.get_data_var_at(0x05DE)
+            self.assertIsNotNone(uca0iv)
+            self.assertEqual(uca0iv.address, 0x05DE)
+            self.assertEqual(uca0iv.type.width, 2)
+            self.assertEqual(view.get_data_var_at(0x05DF).address, 0x05DE)
         finally:
             view.file.close()
 

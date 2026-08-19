@@ -173,6 +173,41 @@ class _HeaderSfrDefinition:
 
 
 @dataclass(frozen=True, slots=True)
+class _AbiHelperDefinition:
+    """One MSP430 EABI helper signature from the ABI document."""
+
+    canonical_name: str
+    return_type: str
+    parameters: tuple[tuple[str, str], ...]
+    description: str
+    aliases: tuple[str, ...] = ()
+    no_return: bool = False
+    special_two_64: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _RawHelperCallSite:
+    """One direct raw-firmware call to a possible runtime helper."""
+
+    caller_start: int
+    caller_name: str
+    call_addr: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RawHelperCandidate:
+    """One high-fan-in direct-call target worth manually inspecting."""
+
+    target: int
+    target_name: str
+    call_sites: tuple[_RawHelperCallSite, ...]
+
+    @property
+    def call_count(self) -> int:
+        return len(self.call_sites)
+
+
+@dataclass(frozen=True, slots=True)
 class _RoutineShape:
     """Conservative bounds and terminal-flow kind for one decoded routine."""
 
@@ -243,6 +278,14 @@ EXECUTABLE_SEGMENT_SCAN_MAX_BYTES = 0x200000
 ASCII_STRING_MIN_LEN = 8
 STRING_CALL_MAX_BYTES = 0x400
 STRING_CALL_RECOVERY_MAX_PASSES = 4
+RAW_HELPER_CANDIDATE_MIN_CALL_SITES = 2
+RAW_HELPER_CANDIDATE_MAX_RESULTS = 64
+RAW_HELPER_CANDIDATE_CALLERS_PER_LINE = 12
+RAW_FUNCTION_SYMBOL_PASTE_EXAMPLE = (
+    "# Paste one confirmed function mapping per line:\n"
+    "# 0x008c20 __MSP430_mpyi\n"
+    "# 0x008c20 journal_append\n"
+)
 AUTO_STRING_MIN_LENGTH_SETTING = "analysis.limits.minStringLength"
 ELF_DEVICE_PROFILE_SETTING = "msp430xLens.elfDeviceProfile"
 ELF_DEVICE_PROFILE_AUTO = "auto"
@@ -269,10 +312,16 @@ LOCAL_MSP430_HEADER_CANDIDATES = (
     "msp430f5438a.h",
     "msp430x54x.h",
 )
+LOCAL_MSP430_ROOT_HEADER_CANDIDATES = (
+    "msp430f5438_binja.h",
+)
 
 DEFINE_RE = re.compile(r"^\s*#define\s+([A-Za-z_][A-Za-z0-9_]*)\s+(.+?)\s*(?://.*)?$")
 SFR_RE = re.compile(
-    r"^\s*(const_)?(sfr[bwa])\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([^)]+?)\s*\)\s*;"
+    r"^\s*(const_)?(sfr[bwal])\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([^)]+?)\s*\)\s*;"
+)
+SFR_SINGLE_RE = re.compile(
+    r"^\s*(const_)?sfr_([bwal])\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*;"
 )
 HEADER_BITS_COMMENT_RE = re.compile(
     r"^\s*(?:/\*|//)\s*(?:Definitions\s+for\s+)?"
@@ -286,6 +335,416 @@ HEADER_EXPR_ALLOWED_RE = re.compile(r"^[A-Za-z0-9_()+\-|&~<>\s]+$")
 INTEGER_SUFFIX_RE = re.compile(
     r"\b(0x[0-9A-Fa-f]+|\d+)(?:[uUlL]+)\b"
 )
+DEFAULT_DATA_VAR_RE = re.compile(r"^data_[0-9A-Fa-f]+$")
+SYMBOL_IMPORT_ADDRESS_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:0[xX][0-9A-Fa-f]+|[0-9A-Fa-f]{4,8})(?![A-Za-z0-9_])"
+)
+SYMBOL_IMPORT_IDENTIFIER_RE = re.compile(r"\b_?[A-Za-z_][A-Za-z0-9_]*\b")
+RAW_FUNCTION_SYMBOL_IGNORED_IDENTIFIERS = frozenset(
+    {
+        "A",
+        "a",
+        "ABS",
+        "abs",
+        "B",
+        "b",
+        "BSS",
+        "bss",
+        "D",
+        "d",
+        "DATA",
+        "data",
+        "N",
+        "n",
+        "R",
+        "r",
+        "RODATA",
+        "rodata",
+        "T",
+        "t",
+        "TEXT",
+        "text",
+        "U",
+        "u",
+        "UND",
+        "und",
+        "V",
+        "v",
+        "W",
+        "w",
+        "weak",
+    }
+)
+RAW_FUNCTION_SYMBOL_RESERVED_IDENTIFIERS = frozenset(
+    {
+        "auto",
+        "break",
+        "case",
+        "char",
+        "const",
+        "continue",
+        "default",
+        "do",
+        "double",
+        "else",
+        "enum",
+        "extern",
+        "float",
+        "for",
+        "goto",
+        "if",
+        "inline",
+        "int",
+        "long",
+        "register",
+        "restrict",
+        "return",
+        "short",
+        "signed",
+        "sizeof",
+        "static",
+        "struct",
+        "switch",
+        "typedef",
+        "union",
+        "unsigned",
+        "void",
+        "volatile",
+        "while",
+    }
+)
+
+
+def _mspabi_helper(
+    suffix: str,
+    return_type: str,
+    parameters: Sequence[tuple[str, str]],
+    description: str,
+    *,
+    aliases: Sequence[str] = (),
+    no_return: bool = False,
+    special_two_64: bool = False,
+) -> _AbiHelperDefinition:
+    canonical_name = f"__mspabi_{suffix}"
+    return _AbiHelperDefinition(
+        canonical_name,
+        return_type,
+        tuple(parameters),
+        description,
+        tuple(dict.fromkeys((f"__MSP430_{suffix}", *aliases))),
+        no_return=no_return,
+        special_two_64=special_two_64,
+    )
+
+
+def _fixed_shift_helpers(
+    suffix: str,
+    return_type: str,
+    parameter_type: str,
+    description: str,
+) -> tuple[_AbiHelperDefinition, ...]:
+    return tuple(
+        _mspabi_helper(
+            f"{suffix}_{count}",
+            return_type,
+            (("x", parameter_type),),
+            f"{description} by {count} bit(s).",
+        )
+        for count in range(1, 16)
+    )
+
+
+def _build_msp430_abi_helper_definitions() -> tuple[_AbiHelperDefinition, ...]:
+    special_two_64_suffixes = {
+        "mpyll",
+        "divull",
+        "remull",
+        "divlli",
+        "remlli",
+        "srall",
+        "srlll",
+        "sllll",
+        "addd",
+        "subd",
+        "mpyd",
+        "divd",
+        "cmpd",
+    }
+
+    helpers: list[_AbiHelperDefinition] = []
+
+    def add(
+        suffix: str,
+        return_type: str,
+        parameters: Sequence[tuple[str, str]],
+        description: str,
+        *,
+        aliases: Sequence[str] = (),
+        no_return: bool = False,
+    ) -> None:
+        helpers.append(
+            _mspabi_helper(
+                suffix,
+                return_type,
+                parameters,
+                description,
+                aliases=aliases,
+                no_return=no_return,
+                special_two_64=suffix in special_two_64_suffixes,
+            )
+        )
+
+    def add_binary(
+        suffix: str,
+        return_type: str,
+        parameter_type: str,
+        description: str,
+        *,
+        aliases: Sequence[str] = (),
+    ) -> None:
+        add(
+            suffix,
+            return_type,
+            (("x", parameter_type), ("y", parameter_type)),
+            description,
+            aliases=aliases,
+        )
+
+    conversions = (
+        ("cvtdf", "float32", "float64", "Convert double-precision float to single-precision float"),
+        ("cvtfd", "float64", "float32", "Convert single-precision float to double-precision float"),
+        ("fixdi", "int16", "float64", "Convert double-precision float to int"),
+        ("fixdli", "int32", "float64", "Convert double-precision float to long int"),
+        ("fixdlli", "int64", "float64", "Convert double-precision float to long long int"),
+        ("fixdu", "uint16", "float64", "Convert double-precision float to unsigned int"),
+        ("fixdul", "uint32", "float64", "Convert double-precision float to unsigned long int"),
+        ("fixdull", "uint64", "float64", "Convert double-precision float to unsigned long long int"),
+        ("fixfi", "int16", "float32", "Convert single-precision float to int"),
+        ("fixfli", "int32", "float32", "Convert single-precision float to long int"),
+        ("fixflli", "int64", "float32", "Convert single-precision float to long long int"),
+        ("fixfu", "uint16", "float32", "Convert single-precision float to unsigned int"),
+        ("fixful", "uint32", "float32", "Convert single-precision float to unsigned long int"),
+        ("fixfull", "uint64", "float32", "Convert single-precision float to unsigned long long int"),
+        ("fltid", "float64", "int16", "Convert int to double-precision float"),
+        ("fltif", "float32", "int16", "Convert int to single-precision float"),
+        ("fltlid", "float64", "int32", "Convert long int to double-precision float"),
+        ("fltlif", "float32", "int32", "Convert long int to single-precision float"),
+        ("fltud", "float64", "uint16", "Convert unsigned int to double-precision float"),
+        ("fltuf", "float32", "uint16", "Convert unsigned int to single-precision float"),
+        ("fltuld", "float64", "uint32", "Convert unsigned long int to double-precision float"),
+        ("fltulf", "float32", "uint32", "Convert unsigned long int to single-precision float"),
+    )
+    for suffix, return_type, parameter_type, description in conversions:
+        add(suffix, return_type, (("x", parameter_type),), description)
+
+    add_binary("cmpd", "int16", "float64", "Double-precision comparison")
+    add_binary("cmpf", "int16", "float32", "Single-precision comparison")
+    for suffix, operator in (
+        ("eqd", "x == y"),
+        ("geqd", "x >= y"),
+        ("gtrd", "x > y"),
+        ("leqd", "x <= y"),
+        ("lssd", "x < y"),
+        ("neqd", "x != y"),
+    ):
+        add_binary(
+            suffix,
+            "int16",
+            "float64",
+            f"Reserved double-precision comparison: {operator}",
+        )
+
+    for suffix, return_type, parameter_type, description in (
+        ("addd", "float64", "float64", "Add double-precision to double-precision"),
+        ("addf", "float32", "float32", "Add single-precision to single-precision"),
+        ("divd", "float64", "float64", "Divide double-precision by double-precision"),
+        ("divf", "float32", "float32", "Divide single-precision by single-precision"),
+        ("mpyd", "float64", "float64", "Multiply double-precision by double-precision"),
+        ("mpyf", "float32", "float32", "Multiply single-precision by single-precision"),
+        ("subd", "float64", "float64", "Subtract double-precision from double-precision"),
+        ("subf", "float32", "float32", "Subtract single-precision from single-precision"),
+    ):
+        add_binary(suffix, return_type, parameter_type, description)
+    add("negd", "float64", (("x", "float64"),), "Negate double-precision")
+    add("negf", "float32", (("x", "float32"),), "Negate single-precision")
+
+    for suffix in ("mpyi", "mpyi_hw", "mpyi_f5hw"):
+        add_binary(suffix, "int16", "int16", "Multiply int by int")
+    for suffix in ("mpyl", "mpyl_hw", "mpyl_hw32", "mpyl_f5hw"):
+        add_binary(suffix, "int32", "int32", "Multiply long by long")
+    for suffix in ("mpyll", "mpyll_hw", "mpyll_hw32", "mpyll_f5hw"):
+        add_binary(suffix, "int64", "int64", "Multiply long long by long long")
+    for suffix in ("mpysl", "mpysl_hw", "mpysl_f5hw"):
+        add_binary(
+            suffix,
+            "int32",
+            "int16",
+            "Multiply int by int; result is long",
+        )
+    for suffix in ("mpysll", "mpysll_hw", "mpysll_hw32", "mpysll_f5hw"):
+        add_binary(
+            suffix,
+            "int64",
+            "int32",
+            "Multiply long by long; result is long long",
+        )
+    for suffix in ("mpyul", "mpyul_hw", "mpyul_f5hw"):
+        add_binary(
+            suffix,
+            "uint32",
+            "uint16",
+            "Multiply unsigned int by unsigned int; result is unsigned long",
+        )
+    for suffix in ("mpyull", "mpyull_hw", "mpyull_hw32", "mpyull_f5hw"):
+        add_binary(
+            suffix,
+            "uint64",
+            "uint32",
+            "Multiply unsigned long by unsigned long; result is unsigned long long",
+        )
+
+    add_binary("divi", "int16", "int16", "Divide int by int")
+    add_binary("divli", "int32", "int32", "Divide long by long")
+    add_binary("divlli", "int64", "int64", "Divide long long by long long")
+    add_binary("divu", "uint16", "uint16", "Divide unsigned int by unsigned int")
+    add_binary("divlu", "uint32", "uint32", "Divide unsigned long by unsigned long")
+    add_binary(
+        "divull",
+        "uint64",
+        "uint64",
+        "Divide unsigned long long by unsigned long long",
+        aliases=("__mspabi_divllu", "__MSP430_divllu"),
+    )
+    add_binary("remi", "int16", "int16", "Remainder of int divided by int")
+    add_binary("remli", "int32", "int32", "Remainder of long divided by long")
+    add_binary("remlli", "int64", "int64", "Remainder of long long divided by long long")
+    add_binary("remu", "uint16", "uint16", "Remainder of unsigned int divided by unsigned int")
+    add_binary("remul", "uint32", "uint32", "Remainder of unsigned long divided by unsigned long")
+    add_binary(
+        "remull",
+        "uint64",
+        "uint64",
+        "Remainder of unsigned long long divided by unsigned long long",
+    )
+
+    add(
+        "rlli",
+        "uint16",
+        (("x", "uint16"), ("n", "int16")),
+        "Rotate bits of an int left by n bits",
+    )
+    helpers.extend(_fixed_shift_helpers("rlli", "uint16", "uint16", "Rotate bits of an int left"))
+    add(
+        "rlll",
+        "uint32",
+        (("x", "uint32"), ("n", "int16")),
+        "Rotate bits of a long left by n bits",
+    )
+    add(
+        "slli",
+        "uint16",
+        (("x", "uint16"), ("n", "int16")),
+        "Logical left shift of an int by n bits",
+    )
+    helpers.extend(_fixed_shift_helpers("slli", "uint16", "uint16", "Logical left shift of an int"))
+    add(
+        "slll",
+        "uint32",
+        (("x", "uint32"), ("n", "int16")),
+        "Logical left shift of a long by n bits",
+    )
+    helpers.extend(_fixed_shift_helpers("slll", "uint32", "uint32", "Logical left shift of a long"))
+    add(
+        "sllll",
+        "uint64",
+        (("x", "uint64"), ("n", "int16")),
+        "Logical left shift of a long long by n bits",
+    )
+    add(
+        "srai",
+        "int16",
+        (("x", "int16"), ("n", "int16")),
+        "Arithmetic right shift of an int by n bits",
+    )
+    helpers.extend(_fixed_shift_helpers("srai", "int16", "int16", "Arithmetic right shift of an int"))
+    add(
+        "sral",
+        "int32",
+        (("x", "int32"), ("n", "int16")),
+        "Arithmetic right shift of a long by n bits",
+    )
+    helpers.extend(_fixed_shift_helpers("sral", "int32", "int32", "Arithmetic right shift of a long"))
+    add(
+        "srall",
+        "int64",
+        (("x", "int64"), ("n", "int16")),
+        "Arithmetic right shift of a long long by n bits",
+    )
+    add(
+        "srli",
+        "uint16",
+        (("x", "uint16"), ("n", "int16")),
+        "Logical right shift of an int by n bits",
+    )
+    helpers.extend(_fixed_shift_helpers("srli", "uint16", "uint16", "Logical right shift of an int"))
+    add(
+        "srll",
+        "uint32",
+        (("x", "uint32"), ("n", "int16")),
+        "Logical right shift of a long by n bits",
+    )
+    helpers.extend(_fixed_shift_helpers("srll", "uint32", "uint32", "Logical right shift of a long"))
+    add(
+        "srlll",
+        "uint64",
+        (("x", "uint64"), ("n", "int16")),
+        "Logical right shift of a long long by n bits",
+    )
+
+    for count in range(1, 8):
+        helpers.append(
+            _AbiHelperDefinition(
+                f"__mspabi_func_epilog_{count}",
+                "void",
+                (),
+                f"Pop callee-saved registers through epilog helper {count} and return",
+                aliases=(f"__MSP430_epilog_{count}", f"__mspabi_epilog_{count}"),
+            )
+        )
+
+    helpers.append(
+        _AbiHelperDefinition(
+            "_abort_msg",
+            "void",
+            (("string", "const_char_ptr"),),
+            "Report failed assertion and terminate",
+            no_return=True,
+        )
+    )
+
+    for suffix, parameter_type, description in (
+        ("isfinite", "float64", "True iff x is a representable value"),
+        ("isfinitef", "float32", "True iff x is a representable value"),
+        ("isinf", "float64", "True iff x represents infinity"),
+        ("isinff", "float32", "True iff x represents infinity"),
+        ("isnan", "float64", "True iff x represents not-a-number"),
+        ("isnanf", "float32", "True iff x represents not-a-number"),
+        ("isnormal", "float64", "True iff x is not denormalized"),
+        ("isnormalf", "float32", "True iff x is not denormalized"),
+        ("fpclassify", "float64", "Classify floating-point value"),
+        ("fpclassifyf", "float32", "Classify floating-point value"),
+    ):
+        add(suffix, "int32", (("x", parameter_type),), description)
+
+    return tuple(helpers)
+
+
+MSP430_ABI_HELPER_DEFINITIONS = _build_msp430_abi_helper_definitions()
+MSP430_ABI_HELPERS_BY_NAME = {
+    name: definition
+    for definition in MSP430_ABI_HELPER_DEFINITIONS
+    for name in (definition.canonical_name, *definition.aliases)
+}
 
 
 MAP_REGIONS: tuple[Region, ...] = (
@@ -1298,8 +1757,15 @@ def _parse_msp430_header_definitions(
             sfr_match = SFR_RE.match(line)
             if sfr_match:
                 const_prefix, kind, name, expr = sfr_match.groups()
-                width = {"sfrb": 1, "sfrw": 2, "sfra": 4}[kind]
+                width = {"sfrb": 1, "sfrw": 2, "sfra": 4, "sfrl": 4}[kind]
                 sfrs.append((bool(const_prefix), width, name, expr))
+                continue
+
+            single_sfr_match = SFR_SINGLE_RE.match(line)
+            if single_sfr_match:
+                const_prefix, kind, name = single_sfr_match.groups()
+                width = {"b": 1, "w": 2, "a": 4, "l": 4}[kind]
+                sfrs.append((bool(const_prefix), width, name, f"{name}_"))
 
     for _ in range(8):
         changed = False
@@ -1420,6 +1886,10 @@ def _default_msp430_header_paths() -> tuple[str, ...]:
     env_paths = os.environ.get(MSP430_HEADER_PATHS_ENV, "")
     if env_paths:
         paths.extend(path for path in env_paths.split(os.pathsep) if path)
+
+    repo_dir = _repo_dir()
+    for candidate in LOCAL_MSP430_ROOT_HEADER_CANDIDATES:
+        paths.append(os.path.join(repo_dir, candidate))
 
     inc_dir = os.path.join(_repo_dir(), "inc")
     for candidate in LOCAL_MSP430_HEADER_CANDIDATES:
@@ -1633,6 +2103,634 @@ def _define_symbols(
     return defined
 
 
+DEFAULT_FUNCTION_NAME_RE = re.compile(r"^(?:sub|func|j_sub)_[0-9A-Fa-f]+$")
+
+
+def _abi_helper_definition_for_name(name: str) -> Optional[_AbiHelperDefinition]:
+    return MSP430_ABI_HELPERS_BY_NAME.get(name)
+
+
+def _is_raw_function_import_name(name: str) -> bool:
+    return (
+        IDENTIFIER_RE.match(name) is not None
+        and name not in RAW_FUNCTION_SYMBOL_IGNORED_IDENTIFIERS
+        and name not in RAW_FUNCTION_SYMBOL_RESERVED_IDENTIFIERS
+    )
+
+
+def _parse_raw_msp430_function_symbols(text: str) -> tuple[SymbolDefinition, ...]:
+    """Extract manually confirmed raw function symbols from map-like text."""
+
+    symbols: list[SymbolDefinition] = []
+    seen: set[SymbolDefinition] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+
+        clean_line = re.sub(r"/\*.*?\*/", "", line)
+        clean_line = clean_line.split("//", 1)[0].split("#", 1)[0]
+        if "<" in clean_line or ">" in clean_line:
+            continue
+
+        addresses = SYMBOL_IMPORT_ADDRESS_RE.findall(clean_line)
+        if not addresses:
+            continue
+        try:
+            addr = int(addresses[0], 16)
+        except ValueError:
+            continue
+        if addr < 0 or addr > 0xFFFFF or addr & 1:
+            continue
+
+        names = [
+            token
+            for token in SYMBOL_IMPORT_IDENTIFIER_RE.findall(clean_line)
+            if _is_raw_function_import_name(token)
+        ]
+        if len(names) != 1:
+            continue
+
+        symbol = (names[0], addr)
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        symbols.append(symbol)
+
+    return tuple(symbols)
+
+
+def _looks_like_msp430_abi_helper_catalog(text: str) -> bool:
+    return any(
+        "|" in line and "__MSP430_" in line and "__mspabi_" in line
+        for line in text.splitlines()
+    )
+
+
+def _raw_function_name_is_replaceable(name: str) -> bool:
+    return not name or _is_default_function_name(name)
+
+
+def _import_raw_msp430_function_symbols(
+    bv: BinaryView,
+    symbols: Sequence[SymbolDefinition],
+    *,
+    auto_defined: bool = False,
+) -> int:
+    imported = 0
+    for name, addr in symbols:
+        if not _is_raw_function_import_name(name):
+            continue
+        if not _is_file_backed_byte(bv, addr):
+            log_warn(f"Skipping raw function symbol {name} at unbacked address {addr:#x}.")
+            continue
+
+        func = _raw_helper_function_at_target(bv, addr)
+        if func is None:
+            try:
+                func = bv.add_function(addr)
+            except Exception as exc:
+                log_warn(f"Could not create raw function {name} at {addr:#x}: {exc}")
+                continue
+        if func is None:
+            log_warn(f"Binary Ninja rejected raw function {name} at {addr:#x}.")
+            continue
+
+        current_name = str(getattr(func, "name", ""))
+        if current_name == name:
+            continue
+        if not _raw_function_name_is_replaceable(current_name):
+            log_warn(
+                f"Skipping raw function symbol {name} at {addr:#x}; "
+                f"existing name is {current_name}."
+            )
+            continue
+
+        try:
+            if auto_defined:
+                _define_symbol(
+                    bv,
+                    Symbol(SymbolType.FunctionSymbol, addr, name),
+                    auto_defined=True,
+                )
+            else:
+                func.name = name
+            imported += 1
+        except Exception as exc:
+            log_warn(f"Could not name raw function {name} at {addr:#x}: {exc}")
+    return imported
+
+
+def import_raw_msp430_function_symbols(
+    bv: BinaryView,
+    symbol_path: Optional[str] = None,
+    *,
+    text: Optional[str] = None,
+    auto_defined: bool = False,
+    verbose: bool = True,
+) -> int:
+    """Import manually confirmed raw MSP430 function symbols."""
+
+    if text is None:
+        if symbol_path is None:
+            raise ValueError("symbol_path or text is required")
+        if symbol_path.lower().endswith(".h"):
+            if verbose:
+                print(
+                    "No raw function symbols were imported. C headers provide "
+                    "SFR labels/types; use a map, nm output, or address/name "
+                    "text file for raw function symbols."
+                )
+            return 0
+        with open(symbol_path, "r", encoding="utf-8", errors="ignore") as handle:
+            text = handle.read()
+
+    symbols = _parse_raw_msp430_function_symbols(text)
+    imported = _import_raw_msp430_function_symbols(
+        bv,
+        symbols,
+        auto_defined=auto_defined,
+    )
+    if imported:
+        _update_analysis(bv)
+    annotated = _apply_msp430_abi_helper_metadata(bv, verbose=False)
+    if annotated:
+        _update_analysis(bv)
+
+    if verbose:
+        source = f" from {symbol_path}" if symbol_path else ""
+        if not symbols:
+            detail = (
+                " MSP430 ABI helper catalog rows are only a name reference; "
+                "paste confirmed address/name mappings such as "
+                "0x008c20 __MSP430_mpyi."
+                if _looks_like_msp430_abi_helper_catalog(text)
+                else " Paste address/name mappings such as "
+                "0x008c20 function_name."
+            )
+            print(
+                f"No raw MSP430 function symbols were imported{source}."
+                f"{detail} Annotated {annotated} ABI helper function(s)."
+            )
+        else:
+            print(
+                f"Imported {imported} raw MSP430 function symbol(s){source}; "
+                f"annotated {annotated} ABI helper function(s)."
+            )
+    return imported
+
+
+def prompt_import_raw_msp430_function_symbols(bv: BinaryView) -> None:
+    """Prompt for a raw function symbol file in the Binary Ninja UI."""
+
+    try:
+        from binaryninja.interaction import OpenFileNameField, get_form_input
+    except Exception as exc:
+        log_warn(f"Binary Ninja interaction APIs are unavailable: {exc}")
+        print(
+            "Call import_raw_msp430_function_symbols(bv, '/path/to/symbols.txt') "
+            "from the Python console instead."
+        )
+        return
+
+    path_field = OpenFileNameField("Raw MSP430 function symbol map/nm/CSV")
+    try:
+        if not get_form_input([path_field], "Import Raw MSP430 Function Symbols"):
+            return
+        path = str(getattr(path_field, "result", "") or "")
+    except Exception as exc:
+        log_warn(f"Could not read raw MSP430 function symbol import path: {exc}")
+        return
+    if not path:
+        return
+
+    try:
+        import_raw_msp430_function_symbols(bv, path)
+    except Exception as exc:
+        log_warn(f"Could not import raw MSP430 function symbols from {path}: {exc}")
+
+
+def prompt_paste_raw_msp430_function_symbols(bv: BinaryView) -> None:
+    """Prompt for pasted raw function symbols in the Binary Ninja UI."""
+
+    try:
+        from binaryninja.interaction import MultilineTextField, get_form_input
+    except Exception as exc:
+        log_warn(f"Binary Ninja interaction APIs are unavailable: {exc}")
+        print(
+            "Call import_raw_msp430_function_symbols("
+            "bv, text='0x8c20 function_name') from the Python console instead."
+        )
+        return
+
+    text_field = MultilineTextField(
+        "Raw MSP430 function symbols",
+        RAW_FUNCTION_SYMBOL_PASTE_EXAMPLE,
+    )
+    try:
+        if not get_form_input([text_field], "Paste Raw MSP430 Function Symbols"):
+            return
+        text = str(getattr(text_field, "result", "") or "")
+    except Exception as exc:
+        log_warn(f"Could not read pasted raw MSP430 function symbols: {exc}")
+        return
+    if not text.strip():
+        return
+
+    try:
+        import_raw_msp430_function_symbols(bv, text=text)
+    except Exception as exc:
+        log_warn(f"Could not import pasted raw MSP430 function symbols: {exc}")
+
+
+def _parse_msp430_abi_helper_symbols(text: str) -> tuple[SymbolDefinition, ...]:
+    """Extract recognized MSP430 EABI helper function symbols from text."""
+
+    symbols: list[SymbolDefinition] = []
+    seen: set[SymbolDefinition] = set()
+    for line in text.splitlines():
+        clean_line = re.sub(r"/\*.*?\*/", "", line)
+        clean_line = clean_line.split("//", 1)[0].split("#", 1)[0]
+        if not clean_line.strip():
+            continue
+
+        addresses = SYMBOL_IMPORT_ADDRESS_RE.findall(clean_line)
+        if not addresses:
+            continue
+
+        canonical_names = []
+        for token in SYMBOL_IMPORT_IDENTIFIER_RE.findall(clean_line):
+            definition = _abi_helper_definition_for_name(token)
+            if definition is not None:
+                canonical_names.append(definition.canonical_name)
+        canonical_names = sorted(set(canonical_names))
+        if len(canonical_names) != 1:
+            continue
+
+        address_text = addresses[0]
+        try:
+            addr = int(address_text, 16)
+        except ValueError:
+            continue
+        if addr < 0 or addr > 0xFFFFF or addr & 1:
+            continue
+
+        symbol = (canonical_names[0], addr)
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        symbols.append(symbol)
+
+    return tuple(symbols)
+
+
+def _import_msp430_abi_helper_symbols(
+    bv: BinaryView,
+    symbols: Sequence[SymbolDefinition],
+    *,
+    auto_defined: bool = False,
+) -> int:
+    imported = 0
+    for name, addr in symbols:
+        if _abi_helper_definition_for_name(name) is None:
+            continue
+        try:
+            if bv.get_function_at(addr) is None:
+                bv.add_function(addr)
+        except Exception as exc:
+            log_warn(
+                f"Could not create function for MSP430 EABI helper "
+                f"{name} at {addr:#x}: {exc}"
+            )
+
+        if _symbol_exists(bv, name, addr):
+            continue
+        try:
+            _define_symbol(
+                bv,
+                Symbol(SymbolType.FunctionSymbol, addr, name),
+                auto_defined=auto_defined,
+            )
+            imported += 1
+        except Exception as exc:
+            log_warn(
+                f"Could not define MSP430 EABI helper "
+                f"{name} at {addr:#x}: {exc}"
+            )
+    return imported
+
+
+def import_msp430_abi_helper_symbols(
+    bv: BinaryView,
+    symbol_path: Optional[str] = None,
+    *,
+    text: Optional[str] = None,
+    auto_defined: bool = False,
+    verbose: bool = True,
+) -> int:
+    """Import recognized MSP430 EABI helper symbols from a map, nm, or CSV file."""
+
+    if text is None:
+        if symbol_path is None:
+            raise ValueError("symbol_path or text is required")
+        with open(symbol_path, "r", encoding="utf-8", errors="ignore") as handle:
+            text = handle.read()
+
+    symbols = _parse_msp430_abi_helper_symbols(text)
+    imported = _import_msp430_abi_helper_symbols(
+        bv,
+        symbols,
+        auto_defined=auto_defined,
+    )
+    if imported:
+        _update_analysis(bv)
+    annotated = _apply_msp430_abi_helper_metadata(bv, verbose=False)
+    if annotated:
+        _update_analysis(bv)
+
+    if verbose:
+        source = f" from {symbol_path}" if symbol_path else ""
+        if not symbols and symbol_path and symbol_path.lower().endswith(".h"):
+            print(
+                "No MSP430 EABI helper symbols were imported. C headers provide "
+                "SFR labels/types, but helper import needs helper addresses from "
+                "a linker map, nm output, or address/name text file. Use "
+                "Apply MSP430 header labels for this header instead."
+            )
+        else:
+            print(
+                f"Imported {imported} MSP430 EABI helper symbol(s){source}; "
+                f"annotated {annotated} helper function(s)."
+            )
+    return imported
+
+
+def prompt_import_msp430_abi_helper_symbols(bv: BinaryView) -> None:
+    """Prompt for a helper symbol file in the Binary Ninja UI."""
+
+    try:
+        from binaryninja.interaction import OpenFileNameField, get_form_input
+    except Exception as exc:
+        log_warn(f"Binary Ninja interaction APIs are unavailable: {exc}")
+        print(
+            "Call import_msp430_abi_helper_symbols(bv, '/path/to/symbols.map') "
+            "from the Python console instead."
+        )
+        return
+
+    path_field = OpenFileNameField("MSP430 ABI helper symbol map/nm/CSV")
+    try:
+        if not get_form_input([path_field], "Import MSP430 ABI Helper Symbols"):
+            return
+        path = str(getattr(path_field, "result", "") or "")
+    except Exception as exc:
+        log_warn(f"Could not read MSP430 ABI helper symbol import path: {exc}")
+        return
+    if not path:
+        return
+
+    try:
+        import_msp430_abi_helper_symbols(bv, path)
+    except Exception as exc:
+        log_warn(f"Could not import MSP430 ABI helper symbols from {path}: {exc}")
+
+
+def _abi_helper_signature(definition: _AbiHelperDefinition) -> str:
+    parameters = ", ".join(
+        f"{parameter_type} {parameter_name}"
+        for parameter_name, parameter_type in definition.parameters
+    )
+    return (
+        f"{definition.return_type} {definition.canonical_name}"
+        f"({parameters if parameters else 'void'})"
+    )
+
+
+def _format_msp430_abi_helper_catalog() -> str:
+    lines = [
+        "MSP430 ABI helper name catalog",
+        "Paste either the PDF alias or canonical name; recognized helpers are "
+        "normalized to canonical __mspabi_* names.",
+        "",
+        "PDF alias | Canonical name | Signature | Description",
+    ]
+    for definition in sorted(
+        MSP430_ABI_HELPER_DEFINITIONS,
+        key=lambda item: item.canonical_name,
+    ):
+        aliases = ", ".join(definition.aliases) if definition.aliases else "-"
+        lines.append(
+            f"{aliases} | {definition.canonical_name} | "
+            f"{_abi_helper_signature(definition)} | {definition.description}"
+        )
+    return "\n".join(lines)
+
+
+def report_msp430_abi_helper_names(_bv: Optional[BinaryView] = None) -> None:
+    """Print the MSP430 ABI helper aliases accepted by symbol import commands."""
+
+    print(_format_msp430_abi_helper_catalog())
+
+
+def _abi_helper_type_from_name(arch, type_name: str):
+    if type_name == "void":
+        return Type.void()
+    if type_name == "int16":
+        return Type.int(2, True, "int16_t")
+    if type_name == "uint16":
+        return Type.int(2, False, "uint16_t")
+    if type_name == "int32":
+        return Type.int(4, True, "int32_t")
+    if type_name == "uint32":
+        return Type.int(4, False, "uint32_t")
+    if type_name == "int64":
+        return Type.int(8, True, "int64_t")
+    if type_name == "uint64":
+        return Type.int(8, False, "uint64_t")
+    if type_name == "float32":
+        return Type.float(4)
+    if type_name == "float64":
+        return Type.float(8)
+    if type_name == "const_char_ptr":
+        char_type = Type.char().mutable_copy()
+        char_type.const = True
+        return Type.pointer(arch, char_type.immutable_copy())
+    return None
+
+
+def _abi_helper_function_type(func, definition: _AbiHelperDefinition):
+    if definition.special_two_64:
+        # The MSP430 EABI passes these helpers' first 64-bit argument in
+        # R8::R11 and the second in R12::R15. The current MSP430X register
+        # model exposes 20-bit registers as four-byte Binary Ninja registers,
+        # so forcing a normal two-int64 prototype would assign the wrong
+        # registers. Name and comment these helpers, but do not lie about args.
+        return None
+
+    arch = getattr(func, "arch", None)
+    if arch is None:
+        return None
+    return_type = _abi_helper_type_from_name(arch, definition.return_type)
+    if return_type is None:
+        return None
+    parameters = []
+    for parameter_name, parameter_type_name in definition.parameters:
+        parameter_type = _abi_helper_type_from_name(arch, parameter_type_name)
+        if parameter_type is None:
+            return None
+        parameters.append(FunctionParameter(parameter_type, parameter_name))
+
+    calling_convention = getattr(func, "calling_convention", None)
+    if calling_convention is None:
+        calling_convention = getattr(
+            getattr(func, "platform", None),
+            "default_calling_convention",
+            None,
+        )
+    helper_type = Type.function(
+        return_type,
+        parameters,
+        calling_convention=calling_convention,
+    ).mutable_copy()
+    if definition.no_return:
+        helper_type.can_return = False
+    return helper_type
+
+
+def _abi_helper_names_at_function(bv: BinaryView, func) -> set[str]:
+    names = {str(getattr(func, "name", ""))}
+    getter = getattr(bv, "get_symbols", None)
+    if getter is not None:
+        try:
+            for symbol in getter(func.start, 1):
+                if getattr(symbol, "address", None) == func.start:
+                    names.add(_symbol_raw_name(symbol))
+        except Exception:
+            pass
+    return {name for name in names if name}
+
+
+def _is_default_function_name(name: str) -> bool:
+    return DEFAULT_FUNCTION_NAME_RE.match(name) is not None
+
+
+def _set_abi_helper_comment_if_empty(
+    bv: BinaryView,
+    addr: int,
+    definition: _AbiHelperDefinition,
+) -> bool:
+    comment = (
+        f"MSP430 EABI helper: {_abi_helper_signature(definition)}. "
+        f"{definition.description}."
+    )
+    if definition.special_two_64:
+        comment += (
+            " Special convention: first 64-bit argument is in R8::R11, "
+            "second is in R12::R15."
+        )
+    return _set_comment_if_empty(bv, addr, comment, auto_defined=True)
+
+
+def _apply_msp430_abi_helper_metadata(
+    bv: BinaryView,
+    *,
+    verbose: bool = False,
+) -> int:
+    """Apply names/types to functions already identified as MSP430 EABI helpers."""
+
+    updated = 0
+    for func in list(getattr(bv, "functions", [])):
+        if str(getattr(func, "arch", "")) not in ("msp430x", "msp430"):
+            continue
+
+        evidence_names = _abi_helper_names_at_function(bv, func)
+        definition = next(
+            (
+                helper
+                for name in sorted(evidence_names)
+                if (helper := _abi_helper_definition_for_name(name)) is not None
+            ),
+            None,
+        )
+        if definition is None:
+            continue
+
+        touched = False
+        current_name = str(getattr(func, "name", ""))
+        if current_name != definition.canonical_name:
+            if current_name in MSP430_ABI_HELPERS_BY_NAME:
+                try:
+                    func.name = definition.canonical_name
+                    touched = True
+                except Exception as exc:
+                    log_warn(
+                        f"Could not rename MSP430 EABI helper {current_name} "
+                        f"at {func.start:#x}: {exc}"
+                    )
+            elif _is_default_function_name(current_name) and not _symbol_exists(
+                bv, definition.canonical_name, func.start
+            ):
+                try:
+                    _define_symbol(
+                        bv,
+                        Symbol(
+                            SymbolType.FunctionSymbol,
+                            func.start,
+                            definition.canonical_name,
+                        ),
+                        auto_defined=True,
+                    )
+                    touched = True
+                except Exception as exc:
+                    log_warn(
+                        f"Could not define MSP430 EABI helper symbol "
+                        f"{definition.canonical_name} at {func.start:#x}: {exc}"
+                    )
+
+        if _set_abi_helper_comment_if_empty(bv, func.start, definition):
+            touched = True
+
+        if definition.no_return:
+            setter = getattr(func, "set_auto_can_return", None)
+            if setter is not None:
+                try:
+                    setter(False)
+                    touched = True
+                except Exception:
+                    pass
+
+        if not bool(getattr(func, "has_user_type", False)):
+            helper_type = _abi_helper_function_type(func, definition)
+            if helper_type is not None:
+                setter = getattr(func, "apply_auto_discovered_type", None)
+                try:
+                    if setter is not None:
+                        setter(helper_type)
+                    elif hasattr(func, "set_auto_type"):
+                        func.set_auto_type(helper_type)
+                    else:
+                        func.type = helper_type
+                    touched = True
+                except Exception as exc:
+                    log_warn(
+                        f"Could not set MSP430 EABI helper type "
+                        f"{definition.canonical_name} at {func.start:#x}: {exc}"
+                    )
+
+        if touched:
+            marker = getattr(func, "mark_updates_required", None)
+            if marker is not None:
+                try:
+                    marker(FunctionUpdateType.IncrementalAutoFunctionUpdate)
+                except Exception:
+                    pass
+            updated += 1
+
+    if verbose and updated:
+        print(f"Annotated {updated} MSP430 EABI helper function(s).")
+    return updated
+
+
 def _canonical_header_sfr_definitions(
     definitions: Sequence[_HeaderSfrDefinition],
 ) -> tuple[_HeaderSfrDefinition, ...]:
@@ -1734,11 +2832,30 @@ def _sfr_data_var_matches(
     )
 
 
+def _is_replaceable_header_sfr_data_var(data_var, header_names: set[str]) -> bool:
+    if bool(getattr(data_var, "auto_discovered", False)):
+        return True
+
+    name = str(getattr(data_var, "name", ""))
+    return name in header_names or DEFAULT_DATA_VAR_RE.match(name) is not None
+
+
+def _undefine_replaceable_data_var(bv: BinaryView, data_var) -> None:
+    addr = data_var.address
+    if not bool(getattr(data_var, "auto_discovered", False)):
+        undefine_user = getattr(bv, "undefine_user_data_var", None)
+        if undefine_user is not None:
+            undefine_user(addr)
+            return
+    bv.undefine_data_var(addr, blacklist=False)
+
+
 def _define_header_sfr_data_vars(
     bv: BinaryView,
     definitions: Sequence[_HeaderSfrDefinition],
     *,
     auto_defined: bool = False,
+    replaceable_names: Optional[set[str]] = None,
 ) -> int:
     """Define conservative volatile MMIO variables without replacing user data."""
 
@@ -1746,6 +2863,10 @@ def _define_header_sfr_data_vars(
         existing_data_vars = list(getattr(bv, "data_vars", {}).values())
     except Exception:
         existing_data_vars = []
+
+    header_names = {definition.name for definition in definitions}
+    if replaceable_names:
+        header_names.update(replaceable_names)
 
     defined = 0
     for definition in _canonical_header_sfr_definitions(definitions):
@@ -1762,13 +2883,16 @@ def _define_header_sfr_data_vars(
             for data_var in overlaps
         ):
             continue
-        if any(not bool(getattr(data_var, "auto_discovered", False)) for data_var in overlaps):
+        if any(
+            not _is_replaceable_header_sfr_data_var(data_var, header_names)
+            for data_var in overlaps
+        ):
             continue
 
         removed_all = True
         for data_var in overlaps:
             try:
-                bv.undefine_data_var(data_var.address, blacklist=False)
+                _undefine_replaceable_data_var(bv, data_var)
                 existing_data_vars.remove(data_var)
             except Exception as exc:
                 removed_all = False
@@ -1817,6 +2941,7 @@ def apply_msp430_header_labels(
         bv,
         sfr_definitions,
         auto_defined=auto_defined,
+        replaceable_names={name for name, _addr in labels},
     )
     if verbose:
         if labels:
@@ -3457,6 +4582,146 @@ def _function_at_call_target(bv: BinaryView, caller, addr: int):
         if len(candidates) == 1:
             return candidates[0]
     return None
+
+
+def _raw_helper_function_at_target(bv: BinaryView, addr: int):
+    getter = getattr(bv, "get_function_at", None)
+    if getter is None:
+        return None
+    try:
+        return getter(addr)
+    except Exception:
+        return None
+
+
+def _raw_helper_target_name(bv: BinaryView, addr: int) -> str:
+    func = _raw_helper_function_at_target(bv, addr)
+    if func is None:
+        return f"sub_{addr:x}"
+    return str(getattr(func, "name", f"sub_{addr:x}"))
+
+
+def _raw_helper_target_is_unlabeled(bv: BinaryView, addr: int) -> bool:
+    func = _raw_helper_function_at_target(bv, addr)
+    if func is None:
+        return True
+    name = str(getattr(func, "name", ""))
+    if _abi_helper_definition_for_name(name) is not None:
+        return False
+    return _is_default_function_name(name)
+
+
+def _raw_msp430_helper_candidates(
+    bv: BinaryView,
+    *,
+    min_call_sites: int = RAW_HELPER_CANDIDATE_MIN_CALL_SITES,
+    max_results: int = RAW_HELPER_CANDIDATE_MAX_RESULTS,
+) -> tuple[_RawHelperCandidate, ...]:
+    """Find repeated direct-call targets in stripped raw firmware.
+
+    This deliberately reports candidates only. A high fan-in target can be a
+    local utility routine rather than an ABI helper, so naming remains manual.
+    """
+
+    decoder, _branch_edges = _msp430x_decode_api()
+    if decoder is None:
+        return ()
+
+    min_call_sites = max(1, int(min_call_sites))
+    call_sites_by_target: dict[int, list[_RawHelperCallSite]] = {}
+    seen_call_sites: set[tuple[int, int, int]] = set()
+    for caller in list(getattr(bv, "functions", [])):
+        if str(getattr(caller, "arch", "")) not in ("msp430x", "msp430"):
+            continue
+        try:
+            call_sites = list(caller.call_sites)
+        except Exception:
+            continue
+
+        caller_start = int(getattr(caller, "start", 0))
+        caller_name = str(getattr(caller, "name", f"sub_{caller_start:x}"))
+        for call_site in call_sites:
+            call_addr = getattr(call_site, "address", None)
+            if call_addr is None:
+                continue
+            call_addr = int(call_addr)
+            target = _direct_msp430_call_target(bv, call_addr, decoder)
+            if target is None or target == caller_start:
+                continue
+            if not _is_file_backed_byte(bv, target):
+                continue
+
+            key = (target, caller_start, call_addr)
+            if key in seen_call_sites:
+                continue
+            seen_call_sites.add(key)
+            call_sites_by_target.setdefault(target, []).append(
+                _RawHelperCallSite(caller_start, caller_name, call_addr)
+            )
+
+    candidates = []
+    for target, call_sites in call_sites_by_target.items():
+        call_sites = sorted(call_sites, key=lambda site: (site.call_addr, site.caller_start))
+        if len(call_sites) < min_call_sites:
+            continue
+        if not _raw_helper_target_is_unlabeled(bv, target):
+            continue
+        candidates.append(
+            _RawHelperCandidate(
+                target,
+                _raw_helper_target_name(bv, target),
+                tuple(call_sites),
+            )
+        )
+
+    return tuple(
+        sorted(candidates, key=lambda candidate: (-candidate.call_count, candidate.target))[
+            :max_results
+        ]
+    )
+
+
+def report_raw_msp430_helper_candidates(
+    bv: BinaryView,
+    *,
+    min_call_sites: int = RAW_HELPER_CANDIDATE_MIN_CALL_SITES,
+    max_results: int = RAW_HELPER_CANDIDATE_MAX_RESULTS,
+) -> None:
+    """Print repeated raw direct-call targets for manual helper identification."""
+
+    candidates = _raw_msp430_helper_candidates(
+        bv,
+        min_call_sites=min_call_sites,
+        max_results=max_results,
+    )
+    if not candidates:
+        print(
+            "No raw MSP430 helper candidates found. Try running MSP430X analysis "
+            "first, or lower the call-count threshold from the Python console."
+        )
+        return
+
+    print(
+        f"Found {len(candidates)} raw MSP430 helper candidate direct-call "
+        f"target(s) with at least {min_call_sites} call site(s). Inspect each "
+        "target before importing a helper name. Use the MSP430 ABI helper name "
+        "catalog for valid __MSP430_* suffixes."
+    )
+    for candidate in candidates:
+        shown_callers = candidate.call_sites[:RAW_HELPER_CANDIDATE_CALLERS_PER_LINE]
+        callers = ", ".join(
+            f"{site.call_addr:#08x} {site.caller_name}"
+            for site in shown_callers
+        )
+        hidden = candidate.call_count - len(shown_callers)
+        hidden_suffix = f", ... +{hidden} more" if hidden > 0 else ""
+        print(
+            f"  {candidate.target:#08x} {candidate.target_name} "
+            f"calls={candidate.call_count} callers={callers}{hidden_suffix}"
+        )
+        print(
+            f"    template: {candidate.target:#08x} __MSP430_<helper_name>"
+        )
 
 
 def _register_parameter_names(func) -> set[str]:
@@ -5109,6 +6374,9 @@ def _refresh_msp430x_analysis(
     _seed_address_jump_table_indirect_branches(bv, verbose=verbose)
 
     _update_analysis(bv)
+    abi_helper_functions = _apply_msp430_abi_helper_metadata(bv, verbose=verbose)
+    if abi_helper_functions:
+        _update_analysis(bv)
     string_call_recovery_passes = _stabilize_direct_string_call_parameters(
         bv,
         verbose=verbose,
@@ -5128,6 +6396,7 @@ def _refresh_msp430x_analysis(
     log_info(
         "Refreshed MSP430X analysis "
         f"variant={spec.name}, vector_functions={vector_functions}, "
+        f"abi_helper_functions={abi_helper_functions}, "
         f"string_call_recovery_passes={string_call_recovery_passes}"
     )
     return vector_functions
@@ -5240,6 +6509,9 @@ def apply_msp430f5438_memory_map(
     _seed_address_jump_table_indirect_branches(bv, verbose=verbose)
 
     _update_analysis(bv)
+    abi_helper_functions = _apply_msp430_abi_helper_metadata(bv, verbose=verbose)
+    if abi_helper_functions:
+        _update_analysis(bv)
     string_call_recovery_passes = _stabilize_direct_string_call_parameters(
         bv,
         verbose=verbose,
@@ -5261,6 +6533,7 @@ def apply_msp430f5438_memory_map(
         f"variant={variant}, raw_len={raw_len:#x}, image_base={effective_image_base:#x}, "
         f"flash={spec.flash_start:#x}-{spec.flash_end:#x}, ram={spec.ram_start:#x}-{spec.ram_end:#x}, "
         f"vector_functions={vector_functions}, "
+        f"abi_helper_functions={abi_helper_functions}, "
         f"string_call_recovery_passes={string_call_recovery_passes}"
     )
 
@@ -5456,16 +6729,20 @@ def _is_automatic_string_recovery_view(bv: BinaryView) -> bool:
 
 
 def _run_automatic_string_call_recovery(bv: BinaryView) -> None:
-    """Recover R12 strings after initial analysis on a safe Python thread."""
+    """Apply post-initial MSP430X recovery on a safe Python thread."""
 
+    abi_helper_functions = _apply_msp430_abi_helper_metadata(bv, verbose=False)
+    if abi_helper_functions:
+        _update_analysis(bv)
     recovered_per_pass = _stabilize_direct_string_call_parameters(
         bv,
         verbose=False,
     )
-    if any(recovered_per_pass):
+    if abi_helper_functions or any(recovered_per_pass):
         log_info(
-            "Automatically recovered MSP430X R12 string call sites after "
-            f"initial analysis; recovery_passes={recovered_per_pass}"
+            "Automatically applied MSP430X post-analysis recovery; "
+            f"abi_helper_functions={abi_helper_functions}, "
+            f"string_recovery_passes={recovered_per_pass}"
         )
 
 
@@ -5906,6 +7183,26 @@ try:
         report_cpux_fallbacks,
     )
     PluginCommand.register(
+        "MSP430F5438\\Report raw helper candidates",
+        "Print repeated direct-call targets that may be raw MSP430 runtime helper functions.",
+        report_raw_msp430_helper_candidates,
+    )
+    PluginCommand.register(
+        "MSP430F5438\\Report MSP430 ABI helper names",
+        "Print the MSP430 ABI helper names accepted by raw symbol import commands.",
+        report_msp430_abi_helper_names,
+    )
+    PluginCommand.register(
+        "MSP430F5438\\Import raw function symbols",
+        "Import manually confirmed raw MSP430 function names from a map, nm output, or address/name file.",
+        prompt_import_raw_msp430_function_symbols,
+    )
+    PluginCommand.register(
+        "MSP430F5438\\Paste raw function symbols",
+        "Paste manually confirmed raw MSP430 function names as address/name lines.",
+        prompt_paste_raw_msp430_function_symbols,
+    )
+    PluginCommand.register(
         "MSP430F5438\\Report TLV device descriptors and CRC16",
         "Print factory device descriptors, calibration records, peripheral IDs, and stored TLV CRC16 validity.",
         report_msp430_tlv,
@@ -5922,6 +7219,11 @@ try:
         "MSP430F5438\\Apply MSP430 header labels",
         "Apply SFR, peripheral, vector, TLV, and board-alias labels parsed from MSP430 headers.",
         apply_msp430_header_labels,
+    )
+    PluginCommand.register(
+        "MSP430F5438\\Import MSP430 ABI helper symbols",
+        "Import recognized __mspabi helper names from a linker map, nm output, or simple address/name CSV.",
+        prompt_import_msp430_abi_helper_symbols,
     )
     PluginCommand.register(
         "MSP430F5438A\\Apply memory map (auto base)",
@@ -5954,6 +7256,31 @@ try:
             rerun_msp430f5438a_analysis,
             "Refreshing MSP430X analysis with MSP430F5438A profile",
         ),
+    )
+    PluginCommand.register(
+        "MSP430F5438A\\Report raw helper candidates",
+        "Print repeated direct-call targets that may be raw MSP430 runtime helper functions.",
+        report_raw_msp430_helper_candidates,
+    )
+    PluginCommand.register(
+        "MSP430F5438A\\Report MSP430 ABI helper names",
+        "Print the MSP430 ABI helper names accepted by raw symbol import commands.",
+        report_msp430_abi_helper_names,
+    )
+    PluginCommand.register(
+        "MSP430F5438A\\Import raw function symbols",
+        "Import manually confirmed raw MSP430 function names from a map, nm output, or address/name file.",
+        prompt_import_raw_msp430_function_symbols,
+    )
+    PluginCommand.register(
+        "MSP430F5438A\\Paste raw function symbols",
+        "Paste manually confirmed raw MSP430 function names as address/name lines.",
+        prompt_paste_raw_msp430_function_symbols,
+    )
+    PluginCommand.register(
+        "MSP430F5438A\\Import MSP430 ABI helper symbols",
+        "Import recognized __mspabi helper names from a linker map, nm output, or simple address/name CSV.",
+        prompt_import_msp430_abi_helper_symbols,
     )
 except Exception:
     pass

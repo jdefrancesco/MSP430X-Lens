@@ -201,6 +201,15 @@ automatic pass, including older databases that predate the recovery feature.
 when refreshing an older already-open view. Long map/re-run menu commands use
 the same background-task path so analysis never blocks the UI thread.
 
+Named MSP430 EABI helper functions from the ABI document are normalized and
+annotated after analysis. Imported or user-supplied helper aliases such as
+`__MSP430_mpyi` are renamed to canonical `__mspabi_*` names, ordinary helper
+prototypes are applied when the function has no user type, and special
+two-64-bit helpers are commented with their R8::R11/R12::R15 calling convention
+instead of forcing an inaccurate normal prototype. This pass needs existing
+name evidence from symbols or function names; stripped helper implementations
+are not guessed from behavior alone.
+
 To keep random firmware bytes out of Binary Ninja's Strings sidebar, the mapped
 raw and ELF loaders raise the inherited `analysis.limits.minStringLength`
 setting from four to eight before initial analysis. Explicit User, Project, and
@@ -217,10 +226,13 @@ function prototypes.
 
 MSP430 header labels are applied automatically during mapped-view creation and
 analysis refresh. The parser reads headers under `inc/`, plus any paths listed
-in `MSP430_HEADER_PATHS` separated by your shell path separator. It recognizes
-TI-style `sfrb`/`sfrw`/`sfra` register definitions, module base labels, vector
-labels, TLV labels, and simple aliases such as board/HAL names that point at a
-known register label. SFR declarations also become width-correct volatile data
+in `MSP430_HEADER_PATHS` separated by your shell path separator. A repository
+root `msp430f5438_binja.h` amalgamation is picked up automatically when present.
+The parser recognizes TI-style `sfrb`/`sfrw`/`sfra`/`sfrl` register definitions,
+the single-argument `sfr_b`/`sfr_w`/`sfr_a`/`sfr_l` forms when a matching
+`NAME_` address macro exists, module base labels, vector labels, TLV labels,
+and simple aliases such as board/HAL names that point at a known register
+label. SFR declarations also become width-correct volatile data
 variables. When the headers document register bit names or exact register
 presets, those SFR variables use registered enum types such as
 `WDTCTL_bits`, making MMIO writes expose values like `WDTPW`, `WDTHOLD`, and
@@ -230,6 +242,27 @@ wildcard register families such as `TAxCTL` and byte aliases such as
 variables lift as side-effecting `mmio_read8`/`mmio_read16`/`mmio_read20`
 operations so an unused hardware read remains visible in Pseudo C; ordinary RAM
 and flash reads retain normal load semantics.
+
+ABI helper function names require an address-to-name source, not only a C
+header. Use `Tools -> MSP430F5438 -> Import raw function symbols` with a linker
+map or `nm` output. For quick manual naming, use
+`Tools -> MSP430F5438 -> Paste raw function symbols` and paste address/name
+lines such as `0x8c20 journal_append`. Run
+`Tools -> MSP430F5438 -> Report MSP430 ABI helper names` to print the accepted
+helper names from the MSP430 ABI catalog; PDF-style aliases such as
+`__MSP430_mpyi` are accepted and normalized to canonical `__mspabi_*` names.
+Existing meaningful function names are preserved; only default-named raw
+functions are renamed. If an imported name is a recognized MSP430 EABI helper,
+the helper metadata from the catalog is applied automatically. The narrower
+`Import MSP430 ABI helper symbols` command remains available when the input file
+should be restricted to ABI helper names only.
+
+For stripped raw binaries with no symbol table, use
+`Tools -> MSP430F5438 -> Report raw helper candidates`. It prints repeated
+direct-call targets that are still default-named, along with caller addresses
+and an editable import-template line. Inspect the target body and callers,
+replace `__MSP430_<helper_name>` with a confirmed name, and then paste that
+edited address/name list with `Paste raw function symbols`.
 
 When bytes at `0x1a00-0x1aff` are present, the mapped-raw and ELF loaders read
 the factory device descriptors before their first analysis pass. A CRC-valid

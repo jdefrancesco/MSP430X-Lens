@@ -165,6 +165,28 @@ changes made after the automatic pass. Reopening an executable MSP430X ELF
 BNDB should schedule the same recovery even though Binary Ninja does not save
 the plugin's auto preparation marker in databases.
 
+When external symbols identify MSP430 EABI helpers, use
+`Tools -> MSP430F5438 -> Import raw function symbols` for a linker map or `nm`
+output. For one-off manual entries, use
+`Tools -> MSP430F5438 -> Paste raw function symbols` with address/name lines
+such as `0x8c20 __MSP430_mpyi`. Use
+`Tools -> MSP430F5438 -> Report MSP430 ABI helper names` to print the accepted
+PDF aliases and canonical names. Then run
+`Tools -> MSP430F5438 -> Re-run MSP430X analysis` and confirm aliases such as
+`__MSP430_mpyi` are normalized to `__mspabi_mpyi`, ordinary helper prototypes
+are present only when the function has no user type, and special two-64-bit
+helpers such as `__mspabi_mpyll` receive an R8::R11/R12::R15 comment instead of
+an ordinary forced prototype. Also confirm generic names such as
+`0x8c20 journal_append` rename only default-named functions and do not replace
+an existing meaningful function name.
+
+For stripped raw binaries without helper symbols, run
+`Tools -> MSP430F5438 -> Report raw helper candidates`. Confirm the output
+lists only repeated direct-call targets that still have default names, includes
+representative caller call-site addresses, and prints editable
+`0xADDR __MSP430_<helper_name>` template lines for manual confirmation before
+pasting helper or generic function names with `Paste raw function symbols`.
+
 For an already-open mapped or ELF file, run
 `Tools -> MSP430F5438 -> Re-run MSP430X analysis` and check the log for:
 
