@@ -25,7 +25,8 @@ prototype recovery. A second base-zero lower-64-KiB fixture verifies F5438A
 device-ID selection, typed factory TLV records, peripheral discovery,
 CRC-16/CCITT-FALSE validation, and annotation idempotence. A third mapped-raw
 fixture backs flash above `0xffff` and verifies 20-bit `CALLA` discovery while
-rejecting unreferenced high-bank bytes that merely resemble a function.
+recovering one referenced address-word target and rejecting unreferenced
+high-bank bytes that merely resemble a function.
 
 The ELF factory-path integration test constructs a dependency-free ELF32
 `EM_MSP430` executable and verifies that `msp430x`, string filtering, vectors,
@@ -66,9 +67,9 @@ Verify the loader and registration:
 2. Confirm the architecture/platform is `msp430x`.
 3. Confirm the `Tools -> MSP430F5438` commands are present.
 4. Run `Tools -> MSP430F5438 -> Diagnose active view`.
-5. Let initial analysis and the automatic `Recovering MSP430X R12 string call
-   sites` background task finish. Do not run a manual analysis command for this
-   smoke test.
+5. Let initial analysis and the automatic `Recovering MSP430X indirect targets
+   and R12 string call sites` background task finish. Do not run a manual
+   analysis command for this smoke test.
 6. Confirm `0x5c00` is the reset-handler function.
 7. Confirm `0x6000` is recovered as a function even though nothing references
    it.
@@ -127,6 +128,10 @@ For `build/high-bank-raw.bin`, also verify:
 4. The unreferenced bytes at `0x11400` look like a valid
    `push/nop/pop/ret` routine but remain data. This confirms mapped-raw linear
    sweep is disabled and high-bank code requires reference/symbol evidence.
+5. The wrapper at `0x7000` contains `CALLA &0x11500` followed by `RET`. The
+   four-byte address-word slot at `0x11500` resolves to a function at `0x11600`,
+   and the call has that full 20-bit indirect target without losing its
+   returning fallthrough.
 
 The synthetic descriptor order and peripheral payload follow the device
 descriptor table in TI's

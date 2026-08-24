@@ -790,7 +790,10 @@ def decode_indexed_bra_jump_table(words: List[int], word: int, addr: int) -> Opt
     targets = []
     index = table_word_offset
     while index + 1 < len(words):
-        target = words[index] | ((words[index + 1] & 0xF) << 16)
+        high_word = words[index + 1]
+        if high_word & ~0xF:
+            break
+        target = words[index] | ((high_word & 0xF) << 16)
         if not is_probable_switch_target(target):
             break
         targets.append(target)

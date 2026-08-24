@@ -155,6 +155,8 @@ AddressSpan = tuple[int, int]
 SymbolDefinition = tuple[str, int]
 VectorDefinition = tuple[int, str, str]
 AddressJumpTable = tuple[int, int, tuple[int, ...]]
+AddressWordControlReference = tuple[int, int, str]
+ResolvedAddressWordTarget = tuple[int, int, str, int]
 CinitRecordInfo = tuple[int, int, int]
 CinitRecord = tuple[int, int, int, int]
 CinitCandidate = tuple[int, int, tuple[CinitRecord, ...]]
@@ -4206,9 +4208,10 @@ def _address_jump_table_entries(data: bytes, table_offset: int) -> tuple[int, ..
     cursor = table_offset
     data_len = len(data)
     while len(targets) < ADDRESS_JUMP_TABLE_MAX_ENTRIES and cursor + 4 <= data_len:
-        target = _u16_from_le(data, cursor) | (
-            (_u16_from_le(data, cursor + 2) & 0xF) << 16
-        )
+        high_word = _u16_from_le(data, cursor + 2)
+        if high_word & ~0xF:
+            break
+        target = _u16_from_le(data, cursor) | ((high_word & 0xF) << 16)
         if not _is_probable_flash_jump_target(target):
             break
         targets.append(target)
@@ -4743,6 +4746,397 @@ def _msp430x_decode_api():
         except ImportError:
             continue
     return None, None
+
+
+def _decode_address_word(data: bytes) -> Optional[int]:
+    """Decode one MSP430X 20-bit address stored as two little-endian words.
+
+    MSP430X address-word memory operands use a 16-bit low word followed by a
+    word whose low nibble holds bits 19:16.  Reject the reserved upper twelve
+    bits instead of silently treating arbitrary 32-bit data as a code pointer.
+    """
+
+    if len(data) < 4:
+        return None
+    low_word = _u16_from_le(data, 0)
+    high_word = _u16_from_le(data, 2)
+    if high_word & ~0xF:
+        return None
+    return low_word | ((high_word & 0xF) << 16)
+
+
+def _read_backed_address_word(bv: BinaryView, slot_addr: int) -> Optional[int]:
+    """Read an aligned address word only when all four bytes are file-backed."""
+
+    if slot_addr & 1:
+        return None
+    if not all(_is_file_backed_byte(bv, slot_addr + offset) for offset in range(4)):
+        return None
+    try:
+        data = bytes(bv.read(slot_addr, 4))
+    except Exception:
+        return None
+    if len(data) != 4:
+        return None
+    return _decode_address_word(data)
+
+
+def _read_contiguous_backed_bytes(
+    bv: BinaryView,
+    addr: int,
+    max_length: int,
+) -> bytes:
+    """Read the contiguous file-backed prefix beginning at ``addr``."""
+
+    length = 0
+    while length < max_length and _is_file_backed_byte(bv, addr + length):
+        length += 1
+    if length == 0:
+        return b""
+    try:
+        data = bytes(bv.read(addr, length))
+    except Exception:
+        return b""
+    return data if len(data) == length else b""
+
+
+def _backed_decoded_instruction_length(
+    bv: BinaryView,
+    addr: int,
+) -> Optional[int]:
+    """Return one valid decoded instruction length using only backed bytes."""
+
+    decoder, _branch_edges = _msp430x_decode_api()
+    if decoder is None:
+        return None
+
+    data = _read_contiguous_backed_bytes(bv, addr, 64)
+    if len(data) < 2:
+        return None
+
+    try:
+        ins = decoder(data, addr)
+    except Exception:
+        return None
+    if ins is None:
+        return None
+    if getattr(ins, "fmt", None) in ("bad", "cpux"):
+        return None
+    if getattr(ins, "mnemonic", None) in (None, "???", "cpux"):
+        return None
+    for operand_name in ("src", "dst"):
+        operand = getattr(ins, operand_name, None)
+        if operand is not None and getattr(operand, "kind", None) == "bad":
+            return None
+    try:
+        length = int(ins.length)
+    except (TypeError, ValueError):
+        return None
+    if length < 2 or length > len(data):
+        return None
+    return length
+
+
+def _is_recoverable_address_word_target(
+    bv: BinaryView,
+    target: int,
+    spec: DeviceSpec,
+    *,
+    excluded_spans: Sequence[AddressSpan] = (),
+) -> bool:
+    """Validate the minimum static evidence required to invent a function."""
+
+    if target & 1:
+        return False
+    if not (spec.flash_start <= target and target + 1 <= spec.flash_end):
+        return False
+    if not all(_is_file_backed_byte(bv, target + offset) for offset in range(2)):
+        return False
+
+    segment_getter = getattr(bv, "get_segment_at", None)
+    if segment_getter is None:
+        return False
+    try:
+        segment = segment_getter(target)
+    except Exception:
+        return False
+    if segment is None or not bool(getattr(segment, "executable", False)):
+        return False
+
+    try:
+        first_word_data = bytes(bv.read(target, 2))
+    except Exception:
+        return False
+    if len(first_word_data) != 2:
+        return False
+    if _u16_from_le(first_word_data, 0) in (0x0000, 0xFFFF):
+        return False
+
+    instruction_length = _backed_decoded_instruction_length(bv, target)
+    if instruction_length is None:
+        return False
+    target_end = target + instruction_length
+    if target_end - 1 > spec.flash_end:
+        return False
+    if target < spec.vector_end + 1 and spec.vector_start < target_end:
+        return False
+    if any(target < end and start < target_end for start, end in excluded_spans):
+        return False
+
+    # A reference is strong control-flow evidence, but an existing data
+    # classification is stronger contrary evidence and must win.
+    if any(
+        target < end and start < target_end
+        for start, end in _data_variable_spans(bv)
+    ):
+        return False
+    return True
+
+
+def _recover_referenced_address_word_targets(
+    bv: BinaryView,
+    references: Iterable[AddressWordControlReference],
+    *,
+    spec: Optional[DeviceSpec] = None,
+) -> tuple[ResolvedAddressWordTarget, ...]:
+    """Resolve only explicit CALLA/BRA references to single address-word slots.
+
+    This intentionally does not scan adjacent words or infer tables.  If one
+    analyzed instruction is associated with conflicting slots, all candidates
+    for that instruction are rejected as ambiguous.
+    """
+
+    if spec is None:
+        spec = _selected_address_word_recovery_spec(bv)
+    if spec is None:
+        return ()
+
+    slots_by_source: dict[tuple[int, str], set[int]] = {}
+    for reference in references:
+        try:
+            source_addr, slot_addr, control_kind = reference
+            source_addr = int(source_addr)
+            slot_addr = int(slot_addr)
+            control_kind = str(control_kind)
+        except (TypeError, ValueError):
+            continue
+        if control_kind not in ("call", "branch"):
+            continue
+        slots_by_source.setdefault((source_addr, control_kind), set()).add(slot_addr)
+
+    referenced_slot_spans = tuple(
+        (slot_addr, slot_addr + 4)
+        for slots in slots_by_source.values()
+        for slot_addr in slots
+    )
+    resolved = []
+    for (source_addr, control_kind), slots in sorted(slots_by_source.items()):
+        if len(slots) != 1:
+            continue
+        slot_addr = next(iter(slots))
+        # Runtime RAM function pointers are mutable and their file image is not
+        # proof of the value at the call site.  This first recovery slice is
+        # deliberately limited to immutable, mapped flash slots.
+        if not (
+            spec.flash_start <= slot_addr
+            and slot_addr + 3 <= spec.flash_end
+        ):
+            continue
+        target = _read_backed_address_word(bv, slot_addr)
+        if target is None or not _is_recoverable_address_word_target(
+            bv,
+            target,
+            spec,
+            excluded_spans=referenced_slot_spans,
+        ):
+            continue
+        resolved.append((source_addr, slot_addr, control_kind, target))
+    return tuple(resolved)
+
+
+def _selected_address_word_recovery_spec(bv: BinaryView) -> Optional[DeviceSpec]:
+    """Return an explicitly selected profile without defaulting a generic ELF."""
+
+    spec = getattr(bv, "spec", None)
+    if isinstance(spec, DeviceSpec):
+        return spec
+    try:
+        variant = bv.query_metadata(DEVICE_VARIANT_METADATA_KEY)
+    except Exception:
+        variant = None
+    if isinstance(variant, str):
+        spec_name = DEVICE_SPEC_ALIASES.get(variant.upper())
+        if spec_name is not None:
+            return DEVICE_SPEC_BY_NAME[spec_name]
+    if _is_msp430f5438_mapped_view(bv):
+        return _device_spec_for_view(bv)
+    return None
+
+
+def _function_instruction_addresses(func) -> tuple[int, ...]:
+    """Return deduplicated addresses from Binary Ninja's analyzed instruction list."""
+
+    addresses = set()
+    try:
+        instructions = func.instructions
+    except Exception:
+        return ()
+    try:
+        for _tokens, addr in instructions:
+            addresses.add(int(addr))
+    except Exception:
+        return ()
+    return tuple(sorted(addresses))
+
+
+def _referenced_address_word_control_sites(
+    bv: BinaryView,
+) -> tuple[AddressWordControlReference, ...]:
+    """Find analyzed absolute/symbolic memory CALLA and BRA instructions."""
+
+    decoder, _branch_edges = _msp430x_decode_api()
+    if decoder is None:
+        return ()
+
+    references = set()
+    for func in getattr(bv, "functions", ()):
+        if str(getattr(func, "arch", "")) != "msp430x":
+            continue
+        for source_addr in _function_instruction_addresses(func):
+            try:
+                data = _read_contiguous_backed_bytes(bv, source_addr, 16)
+                ins = decoder(data, source_addr)
+            except Exception:
+                continue
+            if ins is None or getattr(ins, "src", None) is None:
+                continue
+            src = ins.src
+            if getattr(src, "kind", None) != "mem":
+                continue
+            slot_addr = getattr(src, "addr", None)
+            if not isinstance(slot_addr, int):
+                continue
+            if ins.fmt == "single" and ins.mnemonic == "calla":
+                references.add((source_addr, slot_addr, "call"))
+                continue
+            is_address_branch = (
+                ins.fmt == "double"
+                and ins.size == 4
+                and getattr(ins, "dst", None) is not None
+                and ins.dst.kind == "reg"
+                and ins.dst.reg == 0
+                and (
+                    ins.mnemonic == "mova"
+                    or (ins.ext is not None and ins.mnemonic == "mov")
+                )
+            )
+            if is_address_branch:
+                references.add((source_addr, slot_addr, "branch"))
+    return tuple(sorted(references))
+
+
+def _define_referenced_address_word_data(
+    bv: BinaryView,
+    slot_addr: int,
+    target: int,
+) -> bool:
+    """Mark one proven address-word slot as auto data without replacing users."""
+
+    slot_end = slot_addr + 4
+    if any(
+        slot_addr < end and start < slot_end
+        for start, end in _data_variable_spans(bv)
+    ):
+        return False
+    _set_comment_if_empty(
+        bv,
+        slot_addr,
+        f"MSP430X address-word control target: {target:#x}",
+        auto_defined=True,
+    )
+    if _has_data_var_at(bv, slot_addr):
+        return False
+    name = f"address_word_{slot_addr:05x}"
+    try:
+        if hasattr(bv, "define_data_var"):
+            bv.define_data_var(slot_addr, _uint32_type(), name)
+        else:
+            _define_symbol(
+                bv,
+                Symbol(SymbolType.DataSymbol, slot_addr, name),
+                auto_defined=True,
+            )
+        return True
+    except Exception as exc:
+        log_warn(f"Could not define address-word data at {slot_addr:#x}: {exc}")
+        return False
+
+
+def _seed_referenced_address_word_targets(
+    bv: BinaryView,
+    *,
+    spec: Optional[DeviceSpec] = None,
+    verbose: bool = False,
+) -> tuple[int, int, int]:
+    """Create proven indirect targets and attach their BN indirect edges.
+
+    Returns ``(functions_created, branch_sets_applied, slots_defined)``.
+    """
+
+    if spec is None:
+        spec = _selected_address_word_recovery_spec(bv)
+    if spec is None:
+        return (0, 0, 0)
+    references = _referenced_address_word_control_sites(bv)
+    if not references:
+        return (0, 0, 0)
+    resolved = _recover_referenced_address_word_targets(
+        bv,
+        references,
+        spec=spec,
+    )
+    if not resolved:
+        return (0, 0, 0)
+
+    arch = getattr(bv, "arch", None)
+    add_function = getattr(bv, "add_function", None)
+    functions_created = 0
+    branch_sets_applied = 0
+    slots_defined = 0
+    for source_addr, slot_addr, _control_kind, target in resolved:
+        if _define_referenced_address_word_data(bv, slot_addr, target):
+            slots_defined += 1
+        if not _has_function_at(bv, target) and add_function is not None:
+            try:
+                added = add_function(target)
+                if added is not None or _has_function_at(bv, target):
+                    functions_created += 1
+            except Exception as exc:
+                log_warn(
+                    f"Could not add address-word target function at {target:#x}: {exc}"
+                )
+
+        for func in _functions_containing_addr(bv, source_addr):
+            setter = getattr(func, "set_auto_indirect_branches", None)
+            source_arch = getattr(func, "arch", arch)
+            if setter is None or source_arch is None:
+                continue
+            try:
+                setter(source_addr, [(source_arch, target)])
+                branch_sets_applied += 1
+            except Exception as exc:
+                log_warn(
+                    f"Could not seed address-word control edge at {source_addr:#x}: {exc}"
+                )
+            break
+
+    if verbose and any((functions_created, branch_sets_applied, slots_defined)):
+        print(
+            "Recovered referenced MSP430X address words: "
+            f"functions={functions_created}, branch_sets={branch_sets_applied}, "
+            f"slots={slots_defined}."
+        )
+    return functions_created, branch_sets_applied, slots_defined
 
 
 _FORMAT_ARGUMENT_RE = re.compile(
@@ -6668,6 +7062,13 @@ def _refresh_msp430x_analysis(
     _seed_address_jump_table_indirect_branches(bv, verbose=verbose)
 
     _update_analysis(bv)
+    address_word_recovery = _seed_referenced_address_word_targets(
+        bv,
+        spec=spec,
+        verbose=verbose,
+    )
+    if any(address_word_recovery):
+        _update_analysis(bv)
     abi_helper_functions = _apply_msp430_abi_helper_metadata(bv, verbose=verbose)
     if abi_helper_functions:
         _update_analysis(bv)
@@ -6690,6 +7091,7 @@ def _refresh_msp430x_analysis(
     log_info(
         "Refreshed MSP430X analysis "
         f"variant={spec.name}, vector_functions={vector_functions}, "
+        f"address_word_recovery={address_word_recovery}, "
         f"abi_helper_functions={abi_helper_functions}, "
         f"string_call_recovery_passes={string_call_recovery_passes}"
     )
@@ -6957,16 +7359,21 @@ def _is_automatic_string_recovery_view(bv: BinaryView) -> bool:
 def _run_automatic_string_call_recovery(bv: BinaryView) -> None:
     """Apply post-initial MSP430X recovery on a safe Python thread."""
 
+    address_word_recovery = _seed_referenced_address_word_targets(
+        bv,
+        verbose=False,
+    )
     abi_helper_functions = _apply_msp430_abi_helper_metadata(bv, verbose=False)
-    if abi_helper_functions:
+    if any(address_word_recovery) or abi_helper_functions:
         _update_analysis(bv)
     recovered_per_pass = _stabilize_direct_string_call_parameters(
         bv,
         verbose=False,
     )
-    if abi_helper_functions or any(recovered_per_pass):
+    if any(address_word_recovery) or abi_helper_functions or any(recovered_per_pass):
         log_info(
             "Automatically applied MSP430X post-analysis recovery; "
+            f"address_word_recovery={address_word_recovery}, "
             f"abi_helper_functions={abi_helper_functions}, "
             f"string_recovery_passes={recovered_per_pass}"
         )
@@ -6979,7 +7386,7 @@ def _schedule_automatic_string_call_recovery(bv: BinaryView):
         return None
     return _run_background_analysis_command(
         bv,
-        progress_text="Recovering MSP430X R12 string call sites",
+        progress_text="Recovering MSP430X indirect targets and R12 string call sites",
         action=_run_automatic_string_call_recovery,
     )
 

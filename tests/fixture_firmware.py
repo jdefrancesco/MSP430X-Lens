@@ -20,6 +20,7 @@ PACKED_ISR_ADDRESS = 0x6100
 INDIRECT_CALL_WRAPPER_ADDRESS = 0x6D00
 INDIRECT_CALL_TARGET_ADDRESS = 0x7DE0
 INDIRECT_CALL_POINTER_ADDRESS = 0xE000
+HIGH_BANK_INDIRECT_CALLA_WRAPPER_ADDRESS = 0x7000
 STRING_CALL_ARGUMENT_ADDRESS = 0x6A00
 STRING_CALLER_ADDRESS = 0x6E00
 STRING_CALL_TARGET_ADDRESS = 0x6E40
@@ -29,6 +30,8 @@ HIGH_BANK_FUNCTION_ADDRESS = 0x11000
 HIGH_BANK_STRING_ADDRESS = 0x11200
 HIGH_BANK_LOOKUP_TABLE_ADDRESS = 0x11300
 HIGH_BANK_PROLOGUE_DATA_ADDRESS = 0x11400
+HIGH_BANK_INDIRECT_CALLA_POINTER_ADDRESS = 0x11500
+HIGH_BANK_INDIRECT_CALLA_TARGET_ADDRESS = 0x11600
 HIGH_BANK_BACKED_ERASED_ADDRESS = 0x11100
 HIGH_BANK_BACKED_END = 0x11800
 HIGH_BANK_UNBACKED_ADDRESS = 0x12000
@@ -65,10 +68,28 @@ RESET_FUNCTION = bytes.fromhex(
 # must use RETA because CALLA reserves two words for its return address.
 HIGH_BANK_CALLA = bytes.fromhex("b1 13 00 10")
 HIGH_BANK_CALLA_ADDRESS = RESET_HANDLER + len(RESET_FUNCTION) - 2
+HIGH_BANK_INDIRECT_CALLA_WRAPPER_CALL = bytes.fromhex("b0 12 00 70")
 HIGH_BANK_RESET_FUNCTION = (
-    RESET_FUNCTION[:-2] + HIGH_BANK_CALLA + RESET_FUNCTION[-2:]
+    RESET_FUNCTION[:-2]
+    + HIGH_BANK_CALLA
+    + HIGH_BANK_INDIRECT_CALLA_WRAPPER_CALL
+    + RESET_FUNCTION[-2:]
 )
 HIGH_BANK_FUNCTION = bytes.fromhex("03 43 10 01")
+
+# CALLA &0x11500; RET. The absolute CALLA operand names a file-backed
+# address-word slot, whose low word and following high-nibble word resolve to
+# the otherwise-unreferenced 0x11600 callee. The wrapper itself stays in the
+# lower bank so a normal direct CALL can make it a known analysis root.
+HIGH_BANK_INDIRECT_CALLA = bytes.fromhex("81 13 00 15")
+HIGH_BANK_INDIRECT_CALLA_ADDRESS = HIGH_BANK_INDIRECT_CALLA_WRAPPER_ADDRESS
+HIGH_BANK_INDIRECT_CALLA_WRAPPER = (
+    HIGH_BANK_INDIRECT_CALLA + bytes.fromhex("30 41")
+)
+HIGH_BANK_INDIRECT_CALLA_POINTER = bytes.fromhex("00 16 01 00")
+HIGH_BANK_INDIRECT_CALLA_TARGET = bytes.fromhex(
+    "04 12 03 43 34 41 10 01"
+)
 
 # An unreferenced high-bank data island deliberately passes both the sparse
 # entry-signature check and the bounded routine CFG validator: push r4; nop;
@@ -223,10 +244,22 @@ def build_high_bank_raw_firmware() -> bytes:
         image[offset:offset + len(data)] = data
 
     place(RESET_HANDLER, HIGH_BANK_RESET_FUNCTION)
+    place(
+        HIGH_BANK_INDIRECT_CALLA_WRAPPER_ADDRESS,
+        HIGH_BANK_INDIRECT_CALLA_WRAPPER,
+    )
     place(HIGH_BANK_FUNCTION_ADDRESS, HIGH_BANK_FUNCTION)
     place(HIGH_BANK_STRING_ADDRESS, HIGH_BANK_STRING)
     place(HIGH_BANK_LOOKUP_TABLE_ADDRESS, HIGH_BANK_LOOKUP_TABLE)
     place(HIGH_BANK_PROLOGUE_DATA_ADDRESS, HIGH_BANK_PROLOGUE_DATA)
+    place(
+        HIGH_BANK_INDIRECT_CALLA_POINTER_ADDRESS,
+        HIGH_BANK_INDIRECT_CALLA_POINTER,
+    )
+    place(
+        HIGH_BANK_INDIRECT_CALLA_TARGET_ADDRESS,
+        HIGH_BANK_INDIRECT_CALLA_TARGET,
+    )
     return bytes(image)
 
 
@@ -558,6 +591,11 @@ def main(argv: list[str] | None = None) -> int:
             f"Expected direct CALLA target: {HIGH_BANK_FUNCTION_ADDRESS:#x}; "
             f"high-bank data: {HIGH_BANK_STRING_ADDRESS:#x}, "
             f"{HIGH_BANK_LOOKUP_TABLE_ADDRESS:#x}"
+        )
+        print(
+            "Expected address-word CALLA recovery: "
+            f"{HIGH_BANK_INDIRECT_CALLA_POINTER_ADDRESS:#x} -> "
+            f"{HIGH_BANK_INDIRECT_CALLA_TARGET_ADDRESS:#x}"
         )
     print(f"Expected reset function: {RESET_HANDLER:#x}")
     print(f"Expected recovered sparse function: {SPARSE_FUNCTION_ADDRESS:#x}")

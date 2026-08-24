@@ -8,6 +8,8 @@ core features include:
 - `MSP430X` ISA support; lifting the MSP430/MSP430X CPUX forms for better analysis (duh)..
 - Ability to map raw firmware MSP430F5438/F5438A images. TI-TXT/ELF firmware is supported if available.
 - Vector-table seeding, Flash/RAM/Peripheral sections, and typed TI SFR labels.
+- Conservative 20-bit indirect `CALLA`/`BRA` target recovery from referenced
+  flash address-word slots.
 - Typed factory TLV calibration/device records with stored CRC16 validation.
 - Collapsing and simplifying the decompilation output without all the
 artifacts that Ghidra generally leaves.
@@ -187,6 +189,16 @@ decodes as plausible MSP430 code. Within the F5438/F5438A flash banks above
 imported symbol, or an existing function anchor. Generic executable ranges
 outside the selected device profile retain bounded sparse-island recovery.
 
+After initial analysis identifies a memory-indirect `CALLA` or address-width
+`BRA`, MSP430X Lens follows only that instruction's explicit flash slot. A
+well-formed address word (low 16-bit word followed by a reserved-zero high
+word containing address bits 19:16) can seed one fully backed, executable
+20-bit target and one Binary Ninja indirect edge. The slot is marked as auto
+data, while malformed, mutable-RAM, unbacked, erased, non-executable, and
+already-classified-data targets are rejected. This runs in the same automatic
+post-analysis background task as R12 string recovery and during manual
+`Re-run MSP430X analysis`; it does not scan unrelated pointer-shaped data.
+
 Printable, null-terminated ASCII runs in flash are defined as data during
 mapped-view creation. Re-running analysis also removes stale functions that
 start inside those strings or in short zero padding next to them, which prevents
@@ -319,6 +331,11 @@ More details, including the guarded `make dev-link` setup, are in
 The automatic raw-firmware memory map targets MSP430F5438/F5438A devices. The
 `msp430x` architecture can still be selected for other MSP430X firmware, but
 device-specific sections and peripheral symbols must be supplied separately.
+
+Indirect target recovery currently handles explicit absolute or symbolic
+flash address-word operands. Register-derived and indexed runtime function
+pointers remain visible as indirect control flow but are not guessed from
+nearby data.
 
 The implementation status and deliberately conservative CPUX fallbacks are
 tracked in [docs/CPUX_SIDE_EFFECT_AUDIT.md](docs/CPUX_SIDE_EFFECT_AUDIT.md).

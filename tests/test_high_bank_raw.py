@@ -11,6 +11,14 @@ from tests.fixture_firmware import (
     HIGH_BANK_CALLA_ADDRESS,
     HIGH_BANK_FUNCTION,
     HIGH_BANK_FUNCTION_ADDRESS,
+    HIGH_BANK_INDIRECT_CALLA,
+    HIGH_BANK_INDIRECT_CALLA_ADDRESS,
+    HIGH_BANK_INDIRECT_CALLA_POINTER,
+    HIGH_BANK_INDIRECT_CALLA_POINTER_ADDRESS,
+    HIGH_BANK_INDIRECT_CALLA_TARGET,
+    HIGH_BANK_INDIRECT_CALLA_TARGET_ADDRESS,
+    HIGH_BANK_INDIRECT_CALLA_WRAPPER,
+    HIGH_BANK_INDIRECT_CALLA_WRAPPER_ADDRESS,
     HIGH_BANK_LOOKUP_TABLE,
     HIGH_BANK_LOOKUP_TABLE_ADDRESS,
     HIGH_BANK_PROLOGUE_DATA,
@@ -41,10 +49,47 @@ class HighBankRawTests(unittest.TestCase):
                 cls.raw.file.close()
                 raise AssertionError("raw loader did not create the high-bank view")
             cls.view.update_analysis_and_wait()
+            cls.address_word_recovery = (
+                memory_map._seed_referenced_address_word_targets(
+                    cls.view,
+                    verbose=False,
+                )
+            )
+            cls.view.update_analysis_and_wait()
 
     @classmethod
     def tearDownClass(cls):
         cls.raw.file.close()
+
+    def test_address_word_recovery_is_idempotent(self):
+        target = HIGH_BANK_INDIRECT_CALLA_TARGET_ADDRESS
+        functions_before = tuple(self.view.get_functions_at(target))
+        data_var_before = self.view.get_data_var_at(
+            HIGH_BANK_INDIRECT_CALLA_POINTER_ADDRESS
+        )
+
+        recovered_again = memory_map._seed_referenced_address_word_targets(
+            self.view,
+            verbose=False,
+        )
+
+        self.assertEqual(recovered_again, (0, 1, 0))
+        self.assertEqual(tuple(self.view.get_functions_at(target)), functions_before)
+        self.assertIsNotNone(data_var_before)
+        self.assertIsNotNone(
+            self.view.get_data_var_at(HIGH_BANK_INDIRECT_CALLA_POINTER_ADDRESS)
+        )
+        wrapper = self.view.get_function_at(
+            HIGH_BANK_INDIRECT_CALLA_WRAPPER_ADDRESS
+        )
+        target_edges = [
+            branch.dest_addr
+            for branch in wrapper.get_indirect_branches_at(
+                HIGH_BANK_INDIRECT_CALLA_ADDRESS
+            )
+            if branch.dest_addr == target
+        ]
+        self.assertEqual(target_edges, [target])
 
     def test_direct_calla_seeds_the_full_twenty_bit_target(self):
         self.assertEqual(
@@ -79,6 +124,102 @@ class HighBankRawTests(unittest.TestCase):
         )
         references = tuple(self.view.get_code_refs(HIGH_BANK_FUNCTION_ADDRESS))
         self.assertIn(HIGH_BANK_CALLA_ADDRESS, {reference.address for reference in references})
+
+    def test_indirect_calla_seeds_full_twenty_bit_target_and_keeps_fallthrough(self):
+        self.assertEqual(self.address_word_recovery, (1, 1, 1))
+        self.assertEqual(
+            bytes(
+                self.view.read(
+                    HIGH_BANK_INDIRECT_CALLA_WRAPPER_ADDRESS,
+                    len(HIGH_BANK_INDIRECT_CALLA_WRAPPER),
+                )
+            ),
+            HIGH_BANK_INDIRECT_CALLA_WRAPPER,
+        )
+        call_bytes = bytes(
+            self.view.read(
+                HIGH_BANK_INDIRECT_CALLA_ADDRESS,
+                len(HIGH_BANK_INDIRECT_CALLA),
+            )
+        )
+        self.assertEqual(call_bytes, HIGH_BANK_INDIRECT_CALLA)
+        decoded = architecture.decode(
+            call_bytes,
+            HIGH_BANK_INDIRECT_CALLA_ADDRESS,
+        )
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded.mnemonic, "calla")
+        self.assertEqual(decoded.src.kind, "mem")
+        self.assertEqual(
+            decoded.src.addr,
+            HIGH_BANK_INDIRECT_CALLA_POINTER_ADDRESS,
+        )
+        self.assertEqual(
+            architecture.decoded_branch_edges(
+                decoded,
+                HIGH_BANK_INDIRECT_CALLA_ADDRESS,
+            ),
+            (("call", None),),
+        )
+
+        pointer = bytes(
+            self.view.read(
+                HIGH_BANK_INDIRECT_CALLA_POINTER_ADDRESS,
+                len(HIGH_BANK_INDIRECT_CALLA_POINTER),
+            )
+        )
+        self.assertEqual(pointer, HIGH_BANK_INDIRECT_CALLA_POINTER)
+        self.assertTrue(
+            all(
+                memory_map._is_file_backed_byte(self.view, address)
+                for address in range(
+                    HIGH_BANK_INDIRECT_CALLA_POINTER_ADDRESS,
+                    HIGH_BANK_INDIRECT_CALLA_POINTER_ADDRESS + len(pointer),
+                )
+            )
+        )
+        target = int.from_bytes(pointer[:2], "little") | (
+            (int.from_bytes(pointer[2:], "little") & 0xF) << 16
+        )
+        self.assertEqual(target, HIGH_BANK_INDIRECT_CALLA_TARGET_ADDRESS)
+        self.assertGreater(target, 0xFFFF)
+        self.assertEqual(
+            bytes(
+                self.view.read(
+                    target,
+                    len(HIGH_BANK_INDIRECT_CALLA_TARGET),
+                )
+            ),
+            HIGH_BANK_INDIRECT_CALLA_TARGET,
+        )
+
+        wrapper = self.view.get_function_at(
+            HIGH_BANK_INDIRECT_CALLA_WRAPPER_ADDRESS
+        )
+        self.assertIsNotNone(wrapper)
+        call_ils = wrapper.get_low_level_ils_at(
+            HIGH_BANK_INDIRECT_CALLA_ADDRESS
+        )
+        ret_il = wrapper.get_low_level_il_at(
+            HIGH_BANK_INDIRECT_CALLA_ADDRESS + len(HIGH_BANK_INDIRECT_CALLA)
+        )
+        self.assertIn(
+            LowLevelILOperation.LLIL_CALL_STACK_ADJUST,
+            {instruction.operation for instruction in call_ils},
+        )
+        self.assertIsNotNone(ret_il)
+        self.assertEqual(ret_il.operation, LowLevelILOperation.LLIL_RET)
+        self.assertTrue(wrapper.can_return.value)
+
+        self.assertIsNotNone(self.view.get_function_at(target))
+        self.assertIsNone(self.view.get_function_at(target & 0xFFFF))
+        indirect_targets = {
+            branch.dest_addr
+            for branch in wrapper.get_indirect_branches_at(
+                HIGH_BANK_INDIRECT_CALLA_ADDRESS
+            )
+        }
+        self.assertIn(target, indirect_targets)
 
     def test_erased_and_unbacked_high_bank_ranges_are_not_executable(self):
         erased = self.view.get_segment_at(HIGH_BANK_BACKED_ERASED_ADDRESS)
