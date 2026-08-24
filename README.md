@@ -83,6 +83,12 @@ The mapped view creates segments, sections, header labels, interrupt vectors,
 and entry points before Binary Ninja's first analysis pass. Avoid opening as
 plain `Raw`, analyzing, and then retrofitting the map.
 
+For a partial or relocated raw dump, use `Open With Options` and set `Image
+Base` to the address represented by the first file byte. The value is editable;
+it is not limited to `0` or `0x5c00`. `MSP430 Device Profile` can be left on
+`Auto` (CRC-valid factory TLV detection with an F5438 fallback) or set explicitly
+to `MSP430F5438`/`MSP430F5438A` before analysis begins.
+
 ELF executables open through Binary Ninja's normal `ELF` view. The plugin
 selects the `msp430x` platform before initial analysis while preserving the
 ELF's segments, sections, permissions, symbols, and existing function types.
@@ -123,7 +129,9 @@ Useful commands include:
 
 If you accidentally run an `Apply memory map` command on an already mapped
 `MSP430F5438 Raw Firmware (MSP430X)` view, the plugin refreshes
-architecture/vector analysis without rebuilding segments.
+architecture/vector analysis without rebuilding segments. On ELF and other
+loader-owned views, the command likewise preserves the existing segments,
+sections, permissions, bytes, symbols, and analyst-authored function types.
 
 ## UI Smoke Test
 
@@ -151,14 +159,17 @@ missing lifter coverage from lookup tables or strings that merely look like
 opcodes when viewed as linear bytes.
 
 On the `MSP430F5438` tab in `Open With Options`, the read-only `Platform` load
-option should show `msp430x`. If it still shows `thumb2`, restart Binary Ninja
-after reinstalling the plugin so stale registrations are gone.
+option should show `msp430x`; `Image Base` and `MSP430 Device Profile` are the
+editable bare-metal choices. If the platform still shows `thumb2`, restart
+Binary Ninja after reinstalling the plugin so stale registrations are gone.
 
 The interrupt vector table is forced into 64 separate two-byte `uint16_t` data
 entries, with each populated target still seeded as a reset/ISR function.
 Image-base autodetection scores candidate vector tables, so a 64 KiB
 low-address image with vectors at file offset `0xff80` opens at base `0`, while
-a main-flash slice still opens at base `0x5c00`.
+a main-flash slice still opens at base `0x5c00`. Dumps beginning elsewhere,
+such as a `0x6000` slice, must use their explicit first address in Open With
+Options.
 
 Long erased flash spans (`0xff`) are marked as non-executable data when the
 mapped view is created. If analysis has already produced many tiny functions in
@@ -169,8 +180,12 @@ analysis.
 Small backed code islands between those erased spans are also seeded as
 functions when they have a conservative MSP430 prologue-and-return shape. This
 is done during initial mapped-raw loading and by `Re-run MSP430X analysis` for
-existing mapped or ELF views, including executable segments outside the
-F5438-specific flash range.
+existing mapped or ELF views. Automatic Binary Ninja linear sweep is disabled
+for mapped raw firmware because high-address lookup/compressed data too often
+decodes as plausible MSP430 code. Within the F5438/F5438A flash banks above
+`0xffff`, functions therefore need stronger evidence: a `CALLA`/branch,
+imported symbol, or an existing function anchor. Generic executable ranges
+outside the selected device profile retain bounded sparse-island recovery.
 
 Printable, null-terminated ASCII runs in flash are defined as data during
 mapped-view creation. Re-running analysis also removes stale functions that
@@ -294,8 +309,8 @@ Run all Binary Ninja-backed unit and loader-integration tests:
 make test
 ```
 
-Generate deterministic main-flash and full-address-space images for visual
-testing with `make fixture`.
+Generate deterministic low-flash, full-address-space, high-bank, and ELF images
+for visual testing with `make fixture`.
 More details, including the guarded `make dev-link` setup, are in
 [docs/TESTING.md](docs/TESTING.md).
 

@@ -25,6 +25,13 @@ STRING_CALLER_ADDRESS = 0x6E00
 STRING_CALL_TARGET_ADDRESS = 0x6E40
 MMIO_READ_FUNCTION_ADDRESS = 0x6F00
 ERASED_GAP_ADDRESS = 0x6050
+HIGH_BANK_FUNCTION_ADDRESS = 0x11000
+HIGH_BANK_STRING_ADDRESS = 0x11200
+HIGH_BANK_LOOKUP_TABLE_ADDRESS = 0x11300
+HIGH_BANK_PROLOGUE_DATA_ADDRESS = 0x11400
+HIGH_BANK_BACKED_ERASED_ADDRESS = 0x11100
+HIGH_BANK_BACKED_END = 0x11800
+HIGH_BANK_UNBACKED_ADDRESS = 0x12000
 SHORT_JUNK_STRING_ADDRESS = 0x6800
 EXACT_MIN_STRING_ADDRESS = 0x6820
 LONG_STRING_ADDRESS = 0x6840
@@ -39,6 +46,8 @@ SHORT_JUNK_STRING = b"BDI6@\x00"
 EXACT_MIN_STRING = b"MSP430X!\x00"
 LONG_STRING = b"cmd_enter_bootloader: request/response descriptor 11\x00"
 STRING_CALL_ARGUMENT = b"module=startup state=%u result=%u\x00"
+HIGH_BANK_STRING = b"high-bank diagnostics remain data, not code\x00"
+HIGH_BANK_LOOKUP_TABLE = bytes(range(0x20))
 
 # A small, ordinary leaf function for the ELF entry point.  Keeping this
 # independent of the raw fixture's call graph makes the ELF factory-path test
@@ -50,6 +59,22 @@ ELF_RESET_FUNCTION = bytes.fromhex("03 43 30 41")
 RESET_FUNCTION = bytes.fromhex(
     "b0 12 e0 7d b0 12 00 6d b0 12 00 6e b0 12 00 6f 30 41"
 )
+
+# CALLA #0x11000 proves that the mapped-raw path preserves a direct 20-bit
+# callee rather than truncating it to the lower 64 KiB. The high-bank callee
+# must use RETA because CALLA reserves two words for its return address.
+HIGH_BANK_CALLA = bytes.fromhex("b1 13 00 10")
+HIGH_BANK_CALLA_ADDRESS = RESET_HANDLER + len(RESET_FUNCTION) - 2
+HIGH_BANK_RESET_FUNCTION = (
+    RESET_FUNCTION[:-2] + HIGH_BANK_CALLA + RESET_FUNCTION[-2:]
+)
+HIGH_BANK_FUNCTION = bytes.fromhex("03 43 10 01")
+
+# An unreferenced high-bank data island deliberately passes both the sparse
+# entry-signature check and the bounded routine CFG validator: push r4; nop;
+# pop r4; ret.  A plausible decode alone is not sufficient evidence to invent
+# a function above the legacy 64-KiB address space.
+HIGH_BANK_PROLOGUE_DATA = bytes.fromhex("04 12 03 43 34 41 30 41")
 
 # push r4; mov r14,r4; mov r12,0(r13); add #2,r13; sub #1,r4;
 # jne $-8; pop r4; ret -- representative of the missed code in the screenshot.
@@ -183,6 +208,25 @@ def build_base_zero_low64k_firmware() -> bytes:
         TLV_DESCRIPTOR
     )
     image[MAIN_FLASH_START:MAIN_FLASH_END + 1] = build_sparse_raw_firmware()
+    return bytes(image)
+
+
+def build_high_bank_raw_firmware() -> bytes:
+    """Return a main-flash dump with backed code and data above 64 KiB."""
+
+    image = bytearray(b"\xff" * (HIGH_BANK_BACKED_END - MAIN_FLASH_START))
+    low_flash = build_sparse_raw_firmware()
+    image[:len(low_flash)] = low_flash
+
+    def place(address: int, data: bytes) -> None:
+        offset = address - MAIN_FLASH_START
+        image[offset:offset + len(data)] = data
+
+    place(RESET_HANDLER, HIGH_BANK_RESET_FUNCTION)
+    place(HIGH_BANK_FUNCTION_ADDRESS, HIGH_BANK_FUNCTION)
+    place(HIGH_BANK_STRING_ADDRESS, HIGH_BANK_STRING)
+    place(HIGH_BANK_LOOKUP_TABLE_ADDRESS, HIGH_BANK_LOOKUP_TABLE)
+    place(HIGH_BANK_PROLOGUE_DATA_ADDRESS, HIGH_BANK_PROLOGUE_DATA)
     return bytes(image)
 
 
@@ -454,13 +498,20 @@ def main(argv: list[str] | None = None) -> int:
     low64k_image = not elf_image and bool(args and args[0] == "--low64k")
     if low64k_image:
         args = args[1:]
+    high_bank_image = not elf_image and bool(args and args[0] == "--high-bank")
+    if high_bank_image:
+        args = args[1:]
     default_name = (
         "build/msp430x-lens-fixture.elf"
         if elf_image
         else (
             "build/base-zero-low64k-tlv.bin"
             if low64k_image
-            else "build/sparse-code-islands.bin"
+            else (
+                "build/high-bank-raw.bin"
+                if high_bank_image
+                else "build/sparse-code-islands.bin"
+            )
         )
     )
     output = Path(args[0] if args else default_name)
@@ -470,7 +521,11 @@ def main(argv: list[str] | None = None) -> int:
         else (
             build_base_zero_low64k_firmware()
             if low64k_image
-            else build_sparse_raw_firmware()
+            else (
+                build_high_bank_raw_firmware()
+                if high_bank_image
+                else build_sparse_raw_firmware()
+            )
         )
     )
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -497,6 +552,12 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"Expected TLV descriptors: {TLV_DESCRIPTOR_ADDRESS:#x} "
             f"(stored CRC16 {TLV_STORED_CRC:#06x})"
+        )
+    if high_bank_image:
+        print(
+            f"Expected direct CALLA target: {HIGH_BANK_FUNCTION_ADDRESS:#x}; "
+            f"high-bank data: {HIGH_BANK_STRING_ADDRESS:#x}, "
+            f"{HIGH_BANK_LOOKUP_TABLE_ADDRESS:#x}"
         )
     print(f"Expected reset function: {RESET_HANDLER:#x}")
     print(f"Expected recovered sparse function: {SPARSE_FUNCTION_ADDRESS:#x}")

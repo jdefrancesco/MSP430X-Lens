@@ -287,9 +287,12 @@ RAW_FUNCTION_SYMBOL_PASTE_EXAMPLE = (
     "# 0x008c20 journal_append\n"
 )
 AUTO_STRING_MIN_LENGTH_SETTING = "analysis.limits.minStringLength"
+LINEAR_SWEEP_AUTORUN_SETTING = "analysis.linearSweep.autorun"
 ELF_DEVICE_PROFILE_SETTING = "msp430xLens.elfDeviceProfile"
 ELF_DEVICE_PROFILE_AUTO = "auto"
 ELF_DEVICE_PROFILE_NONE = "none"
+RAW_DEVICE_PROFILE_SETTING = "msp430xLens.rawDeviceProfile"
+RAW_DEVICE_PROFILE_AUTO = "Auto"
 ASCII_STRING_PADDING_MAX_LEN = 4
 ASCII_STRING_CLUSTER_MAX_GAP = 0x80
 BYTE_LOOKUP_TABLE_MIN_LEN = 16
@@ -1155,6 +1158,33 @@ def _file_backing(
     return data_start - image_base, data_end - data_start
 
 
+def _region_file_backing(
+    start: int,
+    length: int,
+    raw_len: int,
+    image_base: Optional[int],
+) -> tuple[int, int, int]:
+    """Return the virtual start, file offset, and size of one backed overlap.
+
+    Unlike :func:`_file_backing`, this represents a raw image whose first byte
+    starts in the middle of a device region.  Keeping the virtual start makes
+    it possible to map an unbacked prefix, a file-backed middle, and an
+    unbacked suffix without shifting the input bytes down to the region base.
+    """
+
+    if raw_len <= 0:
+        return start, 0, 0
+
+    if image_base is None:
+        image_base = 0 if raw_len >= DEVICE_END else FLASH_START
+
+    backed_start = max(start, image_base)
+    backed_end = min(start + length, image_base + raw_len)
+    if backed_start >= backed_end:
+        return start, 0, 0
+    return backed_start, backed_start - image_base, backed_end - backed_start
+
+
 def _read_file_bytes(bv: BinaryView, data_offset: int, data_length: int) -> bytes:
     if data_length <= 0:
         return b""
@@ -1351,6 +1381,14 @@ def _add_region_chunk(
     add_section(name, start, length, semantics)
 
 
+def _unbacked_region_layout(region: Region) -> tuple[SegmentFlag, SectionSemantics]:
+    """Remove execute permission from file-absent portions of code regions."""
+
+    if region.flags & SegmentFlag.SegmentExecutable:
+        return READ_ONLY_DATA, SectionSemantics.ReadOnlyDataSectionSemantics
+    return region.flags, region.semantics
+
+
 def _add_region(
     bv: BinaryView,
     region: Region,
@@ -1361,25 +1399,49 @@ def _add_region(
 ) -> None:
     """Map one device region, separating backed code from erased flash."""
 
-    data_offset, data_length = _file_backing(
+    backed_start, data_offset, data_length = _region_file_backing(
         region.start,
         region.length,
         raw_len,
         image_base,
     )
 
+    if data_length > 0:
+        prefix_length = backed_start - region.start
+        suffix_start = backed_start + data_length
+        suffix_length = region.end + 1 - suffix_start
+        chunk_index = 0
+
+        if prefix_length > 0:
+            prefix_flags, prefix_semantics = _unbacked_region_layout(region)
+            _add_region_chunk(
+                bv,
+                f"{region.name}.unbacked_{chunk_index}",
+                region.start,
+                prefix_length,
+                0,
+                0,
+                prefix_flags,
+                prefix_semantics,
+                auto_defined=auto_defined,
+            )
+            chunk_index += 1
+
     if region.kind == "flash" and data_length > 0:
         data = _read_file_bytes(bv, data_offset, data_length)
         erased_spans = _erased_spans(data) if data else ()
-        if erased_spans or data_length < region.length:
+        prefix_length = backed_start - region.start
+        suffix_start = backed_start + data_length
+        suffix_length = region.end + 1 - suffix_start
+        if erased_spans or prefix_length or suffix_length:
             cursor = 0
-            chunk_index = 0
+            chunk_index = 1 if prefix_length else 0
             for erased_start, erased_end in erased_spans:
                 if cursor < erased_start:
                     _add_region_chunk(
                         bv,
                         f"{region.name}.code_{chunk_index}",
-                        region.start + cursor,
+                        backed_start + cursor,
                         erased_start - cursor,
                         data_offset + cursor,
                         erased_start - cursor,
@@ -1391,7 +1453,7 @@ def _add_region(
                 _add_region_chunk(
                     bv,
                     f"{region.name}.erased_{chunk_index}",
-                    region.start + erased_start,
+                    backed_start + erased_start,
                     erased_end - erased_start,
                     data_offset + erased_start,
                     erased_end - erased_start,
@@ -1406,7 +1468,7 @@ def _add_region(
                 _add_region_chunk(
                     bv,
                     f"{region.name}.code_{chunk_index}",
-                    region.start + cursor,
+                    backed_start + cursor,
                     data_length - cursor,
                     data_offset + cursor,
                     data_length - cursor,
@@ -1416,12 +1478,12 @@ def _add_region(
                 )
                 chunk_index += 1
 
-            if data_length < region.length:
+            if suffix_length > 0:
                 _add_region_chunk(
                     bv,
                     f"{region.name}.unbacked_{chunk_index}",
-                    region.start + data_length,
-                    region.length - data_length,
+                    suffix_start,
+                    suffix_length,
                     0,
                     0,
                     READ_ONLY_DATA,
@@ -1430,13 +1492,45 @@ def _add_region(
                 )
             return
 
-    flags = (
-        READ_ONLY_DATA if region.kind == "flash" and data_length == 0 else region.flags
-    )
-    semantics = (
-        SectionSemantics.ReadOnlyDataSectionSemantics
-        if flags == READ_ONLY_DATA
-        else region.semantics
+    if data_length > 0 and (backed_start != region.start or data_length < region.length):
+        # Non-flash regions can also be partially present in a sliced dump.
+        # Preserve their original permissions while ensuring file bytes land
+        # at their true virtual addresses.
+        prefix_length = backed_start - region.start
+        suffix_start = backed_start + data_length
+        suffix_length = region.end + 1 - suffix_start
+        chunk_index = 1 if prefix_length else 0
+        _add_region_chunk(
+            bv,
+            f"{region.name}.backed_{chunk_index}",
+            backed_start,
+            data_length,
+            data_offset,
+            data_length,
+            region.flags,
+            region.semantics,
+            auto_defined=auto_defined,
+        )
+        chunk_index += 1
+        if suffix_length > 0:
+            suffix_flags, suffix_semantics = _unbacked_region_layout(region)
+            _add_region_chunk(
+                bv,
+                f"{region.name}.unbacked_{chunk_index}",
+                suffix_start,
+                suffix_length,
+                0,
+                0,
+                suffix_flags,
+                suffix_semantics,
+                auto_defined=auto_defined,
+            )
+        return
+
+    flags, semantics = (
+        _unbacked_region_layout(region)
+        if data_length == 0
+        else (region.flags, region.semantics)
     )
     _add_region_chunk(
         bv,
@@ -3114,6 +3208,102 @@ def _set_load_setting_value(load_settings: Settings, key: str, value) -> None:
         log_warn(f"Could not set load setting {key}: {exc}")
 
 
+def _set_load_setting_enum(
+    load_settings: Settings,
+    key: str,
+    *,
+    title: str,
+    description: str,
+    default: str,
+    values: Sequence[str],
+    value_descriptions: Sequence[str],
+) -> None:
+    """Register one editable enum in a BinaryView's Open With Options UI."""
+
+    if not load_settings.contains(key):
+        group = key.split(".", 1)[0]
+        properties = {
+            "title": title,
+            "description": description,
+            "type": "string",
+            "default": default,
+            "enum": list(values),
+            "enumDescriptions": list(value_descriptions),
+        }
+        try:
+            load_settings.register_group(group, "MSP430X Lens")
+            load_settings.register_setting(key, json.dumps(properties))
+        except Exception as exc:
+            log_warn(f"Could not register load setting {key}: {exc}")
+            return
+    try:
+        load_settings.update_property(
+            key,
+            json.dumps(
+                {
+                    "default": default,
+                    "readOnly": False,
+                    "enum": list(values),
+                    "enumDescriptions": list(value_descriptions),
+                }
+            ),
+        )
+    except Exception as exc:
+        log_warn(f"Could not update load setting {key}: {exc}")
+
+
+def _load_settings_from_parent(bv: BinaryView) -> Optional[Settings]:
+    """Return the load-option snapshot attached to this custom view's input."""
+
+    for owner in (getattr(bv, "raw", None), bv):
+        getter = getattr(owner, "get_load_settings", None)
+        if getter is None:
+            continue
+        try:
+            settings = getter(MSP430F5438BinaryView.name)
+        except Exception:
+            settings = None
+        if settings is not None:
+            return settings
+    return None
+
+
+def _raw_load_image_base(bv: BinaryView, raw_len: int) -> int:
+    """Read the user's raw base choice, falling back to vector detection."""
+
+    settings = _load_settings_from_parent(bv)
+    if settings is not None and settings.contains("loader.imageBase"):
+        try:
+            return int(settings.get_integer("loader.imageBase"))
+        except Exception as exc:
+            log_warn(f"Could not read raw loader image base: {exc}")
+    raw = getattr(bv, "raw", bv)
+    return _detect_image_base(raw, raw_len)
+
+
+def _raw_load_device_spec(
+    bv: BinaryView,
+    image_base: int,
+) -> DeviceSpec:
+    """Resolve an explicit raw device profile before trying factory TLV data."""
+
+    settings = _load_settings_from_parent(bv)
+    requested = RAW_DEVICE_PROFILE_AUTO
+    if settings is not None and settings.contains(RAW_DEVICE_PROFILE_SETTING):
+        try:
+            requested = settings.get_string(RAW_DEVICE_PROFILE_SETTING)
+        except Exception as exc:
+            log_warn(f"Could not read raw loader device profile: {exc}")
+
+    spec_name = DEVICE_SPEC_ALIASES.get(str(requested).strip().upper())
+    if spec_name is not None:
+        return DEVICE_SPEC_BY_NAME[spec_name]
+
+    raw = getattr(bv, "raw", bv)
+    detected = _detect_device_spec_from_tlv(raw, image_base)
+    return detected if detected is not None else DEFAULT_DEVICE_SPEC
+
+
 def _configure_auto_string_minimum(bv: BinaryView) -> int:
     """Raise BN's inherited string minimum before the first analysis pass."""
 
@@ -3147,6 +3337,30 @@ def _configure_auto_string_minimum(bv: BinaryView) -> int:
         log_warn("Binary Ninja rejected the MSP430 firmware automatic-string minimum.")
         return current
     return ASCII_STRING_MIN_LEN
+
+
+def _disable_raw_linear_sweep(bv: BinaryView) -> bool:
+    """Disable BN's broad function sweep before mapped-raw initial analysis.
+
+    MSP430X data decodes too readily as instructions, especially in the large
+    banks above 0xffff. Vector targets, recursive control flow, imported
+    symbols, and the plugin's bounded sparse-island pass provide safer roots.
+    """
+
+    settings = Settings()
+    try:
+        changed = settings.set_bool(
+            LINEAR_SWEEP_AUTORUN_SETTING,
+            False,
+            bv,
+            SettingsScope.SettingsResourceScope,
+        )
+    except Exception as exc:
+        log_warn(f"Could not disable raw-firmware linear sweep: {exc}")
+        return False
+    if not changed:
+        log_warn("Binary Ninja rejected the mapped-raw linear-sweep setting.")
+    return bool(changed)
 
 
 def _configure_elf_auto_string_minimum(bv: BinaryView) -> int:
@@ -3265,6 +3479,50 @@ def _is_file_backed_byte(bv: BinaryView, addr: int) -> bool:
         return segment.start <= addr < segment.start + data_length
     except Exception:
         return False
+
+
+def _file_backed_spans(
+    bv: BinaryView,
+    start: int,
+    end: int,
+) -> tuple[AddressSpan, ...]:
+    """Return file-backed virtual ranges without including segment zero-fill."""
+
+    spans = []
+    for segment in getattr(bv, "segments", ()):
+        segment_start = getattr(segment, "start", None)
+        segment_end = getattr(segment, "end", None)
+        if segment_start is None or segment_end is None:
+            continue
+        try:
+            backed_length = max(0, int(getattr(segment, "data_length", 0)))
+        except (TypeError, ValueError):
+            continue
+        backed_end = min(segment_end, segment_start + backed_length)
+        overlap_start = max(start, segment_start)
+        overlap_end = min(end, backed_end)
+        if overlap_start < overlap_end:
+            spans.append((overlap_start, overlap_end))
+    return tuple(_merge_spans(spans))
+
+
+def _flash_backed_chunks(bv: BinaryView) -> tuple[tuple[int, bytes], ...]:
+    """Read only backed flash islands for data/code classification passes."""
+
+    spec = _device_spec_for_view(bv)
+    chunks = []
+    for start, end in _file_backed_spans(
+        bv,
+        spec.flash_start,
+        spec.flash_end + 1,
+    ):
+        try:
+            data = bytes(bv.read(start, end - start))
+        except Exception:
+            continue
+        if len(data) == end - start:
+            chunks.append((start, data))
+    return tuple(chunks)
 
 
 def _detect_device_spec_from_mapped_tlv(bv: BinaryView) -> Optional[DeviceSpec]:
@@ -4152,19 +4410,23 @@ def _is_vector_handler_function(func) -> bool:
 
 
 def _flash_ascii_string_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
-    try:
-        data = bytes(bv.read(FLASH_START, FLASH_SIZE))
-    except Exception:
-        return ()
-    return _ascii_string_spans(data, FLASH_START)
+    return tuple(
+        _merge_spans(
+            span
+            for base, data in _flash_backed_chunks(bv)
+            for span in _ascii_string_spans(data, base)
+        )
+    )
 
 
 def _flash_ascii_string_padding_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
-    try:
-        data = bytes(bv.read(FLASH_START, FLASH_SIZE))
-    except Exception:
-        return ()
-    return _ascii_string_padding_spans(data, FLASH_START)
+    return tuple(
+        _merge_spans(
+            span
+            for base, data in _flash_backed_chunks(bv)
+            for span in _ascii_string_padding_spans(data, base)
+        )
+    )
 
 
 def _flash_ascii_string_related_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
@@ -4174,51 +4436,61 @@ def _flash_ascii_string_related_spans(bv: BinaryView) -> tuple[AddressSpan, ...]
 
 
 def _flash_ascii_string_cluster_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
-    try:
-        data = bytes(bv.read(FLASH_START, FLASH_SIZE))
-    except Exception:
-        return ()
-    return _ascii_string_cluster_spans(data, FLASH_START)
+    return tuple(
+        _merge_spans(
+            span
+            for base, data in _flash_backed_chunks(bv)
+            for span in _ascii_string_cluster_spans(data, base)
+        )
+    )
 
 
 def _flash_ascii_string_gap_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
-    try:
-        data = bytes(bv.read(FLASH_START, FLASH_SIZE))
-    except Exception:
-        return ()
-    return _ascii_string_gap_spans(data, FLASH_START)
+    return tuple(
+        _merge_spans(
+            span
+            for base, data in _flash_backed_chunks(bv)
+            for span in _ascii_string_gap_spans(data, base)
+        )
+    )
 
 
 def _flash_numeric_lookup_table_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
-    try:
-        data = bytes(bv.read(FLASH_START, FLASH_SIZE))
-    except Exception:
-        return ()
-    return _numeric_lookup_table_spans(data, FLASH_START)
+    return tuple(
+        _merge_spans(
+            span
+            for base, data in _flash_backed_chunks(bv)
+            for span in _numeric_lookup_table_spans(data, base)
+        )
+    )
 
 
 def _flash_address_jump_table_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
-    try:
-        data = bytes(bv.read(FLASH_START, FLASH_SIZE))
-    except Exception:
-        return ()
-    return _address_jump_table_spans(data, FLASH_START)
+    return tuple(
+        _merge_spans(
+            span
+            for base, data in _flash_backed_chunks(bv)
+            for span in _address_jump_table_spans(data, base)
+        )
+    )
 
 
 def _flash_address_jump_tables(bv: BinaryView) -> tuple[AddressJumpTable, ...]:
-    try:
-        data = bytes(bv.read(FLASH_START, FLASH_SIZE))
-    except Exception:
-        return ()
-    return _address_jump_tables(data, FLASH_START)
+    return tuple(
+        table
+        for base, data in _flash_backed_chunks(bv)
+        for table in _address_jump_tables(data, base)
+    )
 
 
 def _flash_cinit_table_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
-    try:
-        data = bytes(bv.read(FLASH_START, FLASH_SIZE))
-    except Exception:
-        return ()
-    spans = _cinit_table_spans(data, FLASH_START)
+    spans = tuple(
+        _merge_spans(
+            span
+            for base, data in _flash_backed_chunks(bv)
+            for span in _cinit_table_spans(data, base)
+        )
+    )
     vector_handlers = [
         getattr(func, "start", None)
         for func in getattr(bv, "functions", [])
@@ -4237,16 +4509,13 @@ def _flash_cinit_table_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
 
 
 def _flash_cinit_table_records(bv: BinaryView) -> tuple[CinitRecord, ...]:
-    try:
-        data = bytes(bv.read(FLASH_START, FLASH_SIZE))
-    except Exception:
-        return ()
     spans = _flash_cinit_table_spans(bv)
     if not spans:
         return ()
     return tuple(
         record
-        for record in _cinit_table_records(data, FLASH_START)
+        for base, data in _flash_backed_chunks(bv)
+        for record in _cinit_table_records(data, base)
         if _addr_in_spans(record[0], spans)
     )
 
@@ -5330,6 +5599,7 @@ def _seed_sparse_code_island_functions(bv: BinaryView, verbose: bool = False) ->
     if decoder is None or branch_edges is None:
         return 0
 
+    spec = _device_spec_for_view(bv)
     known_data_spans = _merge_spans(
         (
             *_flash_ascii_string_cluster_spans(bv),
@@ -5418,9 +5688,21 @@ def _seed_sparse_code_island_functions(bv: BinaryView, verbose: bool = False) ->
             if data_start < island_end and island_start < data_end < island_end
         )
         for partition_start in sorted(partition_starts):
+            # The 16-bit vector table provides natural roots below 0x10000.
+            # Inside this device's extended flash banks, random lookup or
+            # compressed data has enough room to mimic even a fully bounded
+            # prologue/return routine. Require stronger evidence there:
+            # CALLA/branch discovery, an imported symbol, or an already-known
+            # function. Those starts are in ``anchors`` and can still seed
+            # packed successors below. Generic executable ranges outside the
+            # selected device profile retain the architecture-wide heuristic.
+            if spec.vector_end < partition_start <= spec.flash_end:
+                continue
             offset = partition_start - island_start
             routine = decode_at(partition_start)
-            if routine is None or not _looks_like_msp430_function_entry(data[offset:]):
+            if routine is None:
+                continue
+            if not _looks_like_msp430_function_entry(data[offset:]):
                 continue
             if not ensure_function(partition_start, "sparse code-island"):
                 continue
@@ -6352,23 +6634,35 @@ def _refresh_msp430x_analysis(
             bv,
             verbose,
             spec=spec,
+            auto_defined=True,
             create_functions=getattr(bv, "platform", None) is not None,
         )
-    _define_symbols(bv, spec.symbols)
-    apply_msp430_header_labels(bv, verbose=verbose)
-    _annotate_tlv_descriptor(bv, spec=spec, verbose=verbose)
+    _define_symbols(bv, spec.symbols, auto_defined=True)
+    apply_msp430_header_labels(bv, auto_defined=True, verbose=verbose)
+    _annotate_tlv_descriptor(
+        bv,
+        spec=spec,
+        auto_defined=True,
+        verbose=verbose,
+    )
     _remove_boundary_symbols_at_function_starts(bv, verbose, spec.symbols)
     _cleanup_erased_flash_functions(bv, verbose)
     _cleanup_ascii_string_functions(bv, verbose)
     _cleanup_numeric_lookup_table_functions(bv, verbose)
     _cleanup_address_jump_table_functions(bv, verbose)
     _cleanup_cinit_table_functions(bv, verbose)
-    _define_ascii_string_data_vars(bv, verbose=verbose)
-    _define_ascii_string_padding_data_vars(bv, verbose=verbose)
-    _define_ascii_string_gap_data_vars(bv, verbose=verbose)
-    _define_numeric_lookup_table_data_vars(bv, verbose=verbose)
-    _define_address_jump_table_data_vars(bv, verbose=verbose)
-    _define_cinit_table_data_vars(bv, verbose=verbose)
+    _define_ascii_string_data_vars(bv, auto_defined=True, verbose=verbose)
+    _define_ascii_string_padding_data_vars(
+        bv, auto_defined=True, verbose=verbose
+    )
+    _define_ascii_string_gap_data_vars(bv, auto_defined=True, verbose=verbose)
+    _define_numeric_lookup_table_data_vars(
+        bv, auto_defined=True, verbose=verbose
+    )
+    _define_address_jump_table_data_vars(
+        bv, auto_defined=True, verbose=verbose
+    )
+    _define_cinit_table_data_vars(bv, auto_defined=True, verbose=verbose)
     _seed_sparse_code_island_functions(bv, verbose=verbose)
     _seed_address_jump_table_target_functions(bv, verbose=verbose)
     _seed_address_jump_table_indirect_branches(bv, verbose=verbose)
@@ -6405,7 +6699,7 @@ def _refresh_msp430x_analysis(
 def apply_msp430f5438_memory_map(
     bv: BinaryView,
     *,
-    variant: str = DEVICE_VARIANT,
+    variant: Optional[str] = None,
     image_base: Optional[int] = None,
     arch_name: Optional[str] = None,
     remove_flat_raw_segment: bool = True,
@@ -6415,13 +6709,12 @@ def apply_msp430f5438_memory_map(
     verbose: bool = True,
 ) -> None:
     """
-    Apply MSP430F5438/F5438A segments and sections to the active BinaryView.
+    Refresh an MSP430F5438/F5438A view without replacing loader-owned layout.
 
-    image_base:
-        None      -> auto-detect full address-space image vs main-flash dump.
-        0x005c00  -> first file byte maps to main flash start.
-        0x000000  -> first file byte maps to address zero.
-        any addr  -> first file byte maps to that virtual address.
+    ``image_base`` and ``remove_flat_raw_segment`` remain accepted for scripts
+    written against older releases, but an active loader-owned layout is never
+    rebuilt. Select the base in the mapped raw view's Open With Options dialog
+    so it is applied before initial analysis.
 
     arch_name:
         Optional Binary Ninja architecture name. If omitted, this tries msp430x
@@ -6433,108 +6726,31 @@ def apply_msp430f5438_memory_map(
         _emit_raw_view_guidance()
         return
 
-    spec = _spec_for_variant(variant)
-    _set_view_device_spec(bv, spec)
-    raw_len = _raw_length(bv)
-    effective_image_base = _detect_image_base(bv, raw_len)
-    if image_base is not None:
-        effective_image_base = image_base
-
-    regions = spec.regions
-    if _is_msp430f5438_mapped_view(bv) and _mapped_regions_present(bv, regions):
-        if verbose:
+    spec = _device_spec_for_view(bv) if variant is None else _spec_for_variant(variant)
+    if verbose:
+        layout_kind = (
+            "mapped raw"
+            if _is_msp430f5438_mapped_view(bv)
+            else _view_type_name(bv)
+        )
+        print(
+            f"Preserving the {layout_kind} loader layout and refreshing "
+            f"{spec.name} analysis annotations."
+        )
+        if image_base is not None and not _is_msp430f5438_mapped_view(bv):
             print(
-                f"{spec.name} mapped view already has its memory map; "
-                "refreshing architecture, vector functions, and analysis without rebuilding segments."
+                "image_base only affects raw loading. Reopen the firmware with "
+                "the MSP430F5438 mapped view to change its base before analysis."
             )
-        _refresh_msp430x_analysis(
-            bv,
-            variant=variant,
-            arch_name=arch_name or "msp430x",
-            add_reset_entry=add_reset_entry,
-            enable_linear_sweep=enable_linear_sweep,
-            cleanup_peripheral_functions=cleanup_peripheral_functions,
-            verbose=verbose,
-        )
-        return
 
-    arch = _configure_architecture(bv, arch_name, verbose, set_platform=True)
-    _remove_previous_map(bv, ALL_KNOWN_MAP_REGIONS)
-    if remove_flat_raw_segment:
-        _remove_flat_raw_segment(bv, raw_len, effective_image_base)
-
-    try:
-        bv.begin_bulk_add_segments()
-    except Exception:
-        pass
-
-    try:
-        for region in regions:
-            _add_region(bv, region, raw_len, effective_image_base)
-    finally:
-        try:
-            bv.end_bulk_add_segments()
-        except Exception:
-            pass
-
-    _enable_analysis_options(bv, enable_linear_sweep)
-    if cleanup_peripheral_functions:
-        _cleanup_peripheral_functions(bv, verbose)
-
-    vector_functions = 0
-    if add_reset_entry:
-        vector_functions = _seed_interrupt_vectors(
-            bv,
-            verbose,
-            spec=spec,
-            create_functions=getattr(bv, "platform", None) is not None,
-        )
-    _define_symbols(bv, spec.symbols)
-    apply_msp430_header_labels(bv, verbose=verbose)
-    _annotate_tlv_descriptor(bv, spec=spec, verbose=verbose)
-    _remove_boundary_symbols_at_function_starts(bv, verbose, spec.symbols)
-    _cleanup_erased_flash_functions(bv, verbose)
-    _cleanup_ascii_string_functions(bv, verbose)
-    _cleanup_numeric_lookup_table_functions(bv, verbose)
-    _cleanup_address_jump_table_functions(bv, verbose)
-    _cleanup_cinit_table_functions(bv, verbose)
-    _define_ascii_string_data_vars(bv, verbose=verbose)
-    _define_ascii_string_padding_data_vars(bv, verbose=verbose)
-    _define_ascii_string_gap_data_vars(bv, verbose=verbose)
-    _define_numeric_lookup_table_data_vars(bv, verbose=verbose)
-    _define_address_jump_table_data_vars(bv, verbose=verbose)
-    _define_cinit_table_data_vars(bv, verbose=verbose)
-    _seed_sparse_code_island_functions(bv, verbose=verbose)
-    _seed_address_jump_table_target_functions(bv, verbose=verbose)
-    _seed_address_jump_table_indirect_branches(bv, verbose=verbose)
-
-    _update_analysis(bv)
-    abi_helper_functions = _apply_msp430_abi_helper_metadata(bv, verbose=verbose)
-    if abi_helper_functions:
-        _update_analysis(bv)
-    string_call_recovery_passes = _stabilize_direct_string_call_parameters(
+    _refresh_msp430x_analysis(
         bv,
+        variant=spec.name,
+        arch_name=arch_name or "msp430x",
+        add_reset_entry=add_reset_entry,
+        enable_linear_sweep=enable_linear_sweep,
+        cleanup_peripheral_functions=cleanup_peripheral_functions,
         verbose=verbose,
-    )
-
-    if verbose and arch is None:
-        print(
-            "Map is applied, but BN has no MSP430/MSP430X architecture loaded. "
-            "You will get sections/symbols, not real disassembly/decompilation."
-        )
-    if verbose and vector_functions == 0:
-        print(
-            "No vector target functions were created. If this is a raw dump, "
-            "try image_base=0x5c00 for main flash or image_base=0 for a full image."
-        )
-
-    log_info(
-        f"Applied {spec.name} memory map "
-        f"variant={variant}, raw_len={raw_len:#x}, image_base={effective_image_base:#x}, "
-        f"flash={spec.flash_start:#x}-{spec.flash_end:#x}, ram={spec.ram_start:#x}-{spec.ram_end:#x}, "
-        f"vector_functions={vector_functions}, "
-        f"abi_helper_functions={abi_helper_functions}, "
-        f"string_call_recovery_passes={string_call_recovery_passes}"
     )
 
 
@@ -6547,13 +6763,23 @@ def apply_msp430f5438a_memory_map(bv: BinaryView) -> None:
 def apply_msp430f5438_main_flash_memory_map(bv: BinaryView) -> None:
     """Map an MSP430F5438 main-flash dump beginning at address 0x5c00."""
 
-    apply_msp430f5438_memory_map(bv, image_base=FLASH_START, arch_name="msp430x")
+    apply_msp430f5438_memory_map(
+        bv,
+        variant="MSP430F5438",
+        image_base=FLASH_START,
+        arch_name="msp430x",
+    )
 
 
 def apply_msp430f5438_full_image_memory_map(bv: BinaryView) -> None:
     """Map a full-address-space MSP430F5438 image beginning at address zero."""
 
-    apply_msp430f5438_memory_map(bv, image_base=0, arch_name="msp430x")
+    apply_msp430f5438_memory_map(
+        bv,
+        variant="MSP430F5438",
+        image_base=0,
+        arch_name="msp430x",
+    )
 
 
 def apply_msp430f5438a_main_flash_memory_map(bv: BinaryView) -> None:
@@ -6796,7 +7022,7 @@ class MSP430F5438BinaryView(BinaryView):
 
     @classmethod
     def get_load_settings_for_data(cls, data):
-        """Build read-only platform and image-base defaults for candidate data."""
+        """Build editable bare-metal mapping choices for candidate data."""
 
         raw_len = _raw_length(data)
         image_base = _detect_image_base(data, raw_len)
@@ -6805,22 +7031,53 @@ class MSP430F5438BinaryView(BinaryView):
         load_settings = Settings("msp430f5438_load_settings")
         load_settings.set_resource_id(cls.name)
         _set_load_setting_default(load_settings, "loader.platform", platform_name)
-        _set_load_setting_default(load_settings, "loader.imageBase", image_base)
+        _set_load_setting_default(
+            load_settings,
+            "loader.imageBase",
+            image_base,
+            read_only=False,
+        )
         _set_load_setting_default(load_settings, "loader.entryPointOffset", 0)
+        _set_load_setting_enum(
+            load_settings,
+            RAW_DEVICE_PROFILE_SETTING,
+            title="MSP430 Device Profile",
+            description=(
+                "Choose the memory map applied before initial analysis. Auto uses "
+                "a CRC-valid factory TLV descriptor when present and otherwise "
+                "defaults to MSP430F5438."
+            ),
+            default=RAW_DEVICE_PROFILE_AUTO,
+            values=(
+                RAW_DEVICE_PROFILE_AUTO,
+                "MSP430F5438",
+                "MSP430F5438A",
+            ),
+            value_descriptions=(
+                "Auto-detect from factory TLV",
+                "MSP430F5438",
+                "MSP430F5438A",
+            ),
+        )
         _set_load_setting_value(load_settings, "loader.platform", platform_name)
         _set_load_setting_value(load_settings, "loader.imageBase", image_base)
         _set_load_setting_value(load_settings, "loader.entryPointOffset", 0)
+        _set_load_setting_value(
+            load_settings,
+            RAW_DEVICE_PROFILE_SETTING,
+            RAW_DEVICE_PROFILE_AUTO,
+        )
         return load_settings
 
     def init(self):
         """Create device segments, seed symbols/vectors, and select the entry point."""
 
         raw_len = _raw_length(self.raw)
-        image_base = _detect_image_base(self.raw, raw_len)
-        detected_spec = _detect_device_spec_from_tlv(self.raw, image_base)
-        if detected_spec is not None:
-            self.spec = detected_spec
+        image_base = _raw_load_image_base(self, raw_len)
+        self.spec = _raw_load_device_spec(self, image_base)
         spec = self.spec
+        if spec.flash_start <= image_base <= spec.flash_end:
+            self._entry_point = image_base
         _set_view_device_spec(self, spec)
         regions = spec.regions
         if getattr(self, "parse_only", False):
@@ -6830,6 +7087,7 @@ class MSP430F5438BinaryView(BinaryView):
             return True
 
         _configure_auto_string_minimum(self)
+        _disable_raw_linear_sweep(self)
 
         self.begin_bulk_add_segments()
         try:

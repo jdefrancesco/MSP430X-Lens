@@ -23,7 +23,9 @@ that constructs a raw MSP430F5438 main-flash image, creates the registered
 handler, executable mapping, recovered sparse function, and R12 string-call
 prototype recovery. A second base-zero lower-64-KiB fixture verifies F5438A
 device-ID selection, typed factory TLV records, peripheral discovery,
-CRC-16/CCITT-FALSE validation, and annotation idempotence.
+CRC-16/CCITT-FALSE validation, and annotation idempotence. A third mapped-raw
+fixture backs flash above `0xffff` and verifies 20-bit `CALLA` discovery while
+rejecting unreferenced high-bank bytes that merely resemble a function.
 
 The ELF factory-path integration test constructs a dependency-free ELF32
 `EM_MSP430` executable and verifies that `msp430x`, string filtering, vectors,
@@ -50,8 +52,8 @@ load-order-dependent fashion; restart Binary Ninja after enabling or disabling
 either copy.
 
 `make fixture` creates `build/sparse-code-islands.bin`,
-`build/base-zero-low64k-tlv.bin`, and `build/msp430x-lens-fixture.elf`. Open the
-two raw images using:
+`build/base-zero-low64k-tlv.bin`, `build/high-bank-raw.bin`, and
+`build/msp430x-lens-fixture.elf`. Open the three raw images using:
 
 ```text
 MSP430F5438 Raw Firmware (MSP430X)
@@ -94,6 +96,13 @@ Verify the loader and registration:
     navigable symbols without overlapping data variables.
 16. Spot-check reset/vector and other MSP430 header labels.
 
+For a real raw slice whose first byte does not represent address `0` or
+`0x5c00`, choose the same mapped view in `Open With Options` and enter the
+exact first address in the editable `Image Base` field. Select
+`MSP430F5438A` in `MSP430 Device Profile` when that revision is known but its
+TLV block is absent. Both choices must be reflected before initial analysis;
+an ordinary reanalysis cannot repair bytes that were mapped at the wrong base.
+
 For the synthetic `build/base-zero-low64k-tlv.bin`, also verify:
 
 1. The mapped view selects the `MSP430F5438A` device profile from ID bytes
@@ -106,6 +115,18 @@ For the synthetic `build/base-zero-low64k-tlv.bin`, also verify:
 4. Confirm the report lists `CRC16` and `CRC16_RB` at peripheral base `0x150`.
 5. Run `Diagnose active view` and confirm it reports
    `tlv=valid device=MSP430F5438A records=4 crc16=valid`.
+
+For `build/high-bank-raw.bin`, also verify:
+
+1. The direct `CALLA` in the reset path resolves to a function at `0x11000`,
+   not a truncated low-64-KiB address.
+2. The erased backed range near `0x11100` and the unbacked range at `0x12000`
+   are non-executable.
+3. The string at `0x11200` and lookup table at `0x11300` are data, not
+   functions.
+4. The unreferenced bytes at `0x11400` look like a valid
+   `push/nop/pop/ret` routine but remain data. This confirms mapped-raw linear
+   sweep is disabled and high-bank code requires reference/symbol evidence.
 
 The synthetic descriptor order and peripheral payload follow the device
 descriptor table in TI's
@@ -132,7 +153,7 @@ set `MSP430 ELF Device Profile` in Open With Options (or Binary Ninja Settings)
 before opening the ELF. `Auto` does not infer a device from flash bounds alone:
 multiple MSP430 variants share the F5438 memory size and address range.
 
-For the two `.bin` fixtures only: if `Open With Options` predicts ARM/Thumb,
+For the three `.bin` fixtures only: if `Open With Options` predicts ARM/Thumb,
 close the view and reopen it with the exact MSP430F5438 raw view type. Do not
 open the `.elf` fixture with the raw view; it must remain on the normal `ELF`
 loader path.
@@ -204,5 +225,7 @@ at least one image with real backed contents above `0x10000`. Confirm that:
 - direct calls and recovered functions use their full 20-bit addresses; and
 - strings or lookup tables in high banks are not seeded as functions.
 
-The bundled deterministic fixture covers main flash through `0xffff`; high-bank
-mapping remains a separate manual check until a high-bank fixture is added.
+The bundled `build/high-bank-raw.bin` fixture automates these checks through
+`0x117ff`. Continue to repeat them on representative production firmware,
+especially when a device stores compressed, encrypted, or lookup data in an
+otherwise executable flash bank.
