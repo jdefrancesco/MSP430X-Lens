@@ -10,7 +10,8 @@ core features include:
 - Vector-table seeding, Flash/RAM/Peripheral sections, and typed TI SFR labels.
 - Conservative 20-bit indirect `CALLA`/`BRA` target recovery from referenced
   flash address-word slots.
-- Read-only F5438/F5438A reporting for bounded function candidates missed by
+- Conservative automatic recovery for coherent clusters of bounded high-bank
+  `RETA` routines, plus read-only reporting for isolated candidates missed by
   recursive analysis, without enabling linear sweep.
 - Typed factory TLV calibration/device records with stored CRC16 validation.
 - Collapsing and simplifying the decompilation output without all the
@@ -86,6 +87,10 @@ MSP430F5438 Raw Firmware (MSP430X)
 The mapped view creates segments, sections, header labels, interrupt vectors,
 and entry points before Binary Ninja's first analysis pass. Avoid opening as
 plain `Raw`, analyzing, and then retrofitting the map.
+
+Within flash, `.backed_N` sections identify non-erased bytes present in the
+input file; the neutral name does not claim that those bytes are instructions.
+Long erased runs use `.erased_N`, while absent portions use `.unbacked_N`.
 
 For a partial or relocated raw dump, use `Open With Options` and set `Image
 Base` to the address represented by the first file byte. The value is editable;
@@ -188,18 +193,23 @@ is done during initial mapped-raw loading and by `Re-run MSP430X analysis` for
 existing mapped or ELF views. Automatic Binary Ninja linear sweep is disabled
 for mapped raw firmware because high-address lookup/compressed data too often
 decodes as plausible MSP430 code. Within the F5438/F5438A flash banks above
-`0xffff`, functions therefore need stronger evidence: a `CALLA`/branch,
-imported symbol, or an existing function anchor. Generic executable ranges
+`0xffff`, an isolated routine therefore needs a `CALLA`/branch, imported symbol,
+or an existing function anchor. The loader can also recover a coherent local
+cluster when at least three nearby erased-boundary islands independently have a
+compiler entry, a fully bounded CFG, and a `RETA` exit. Isolated shapes and all
+`RET`/`RETI` matches remain manual candidates. Generic executable ranges
 outside the selected device profile retain bounded sparse-island recovery.
 
 To review backed F5438/F5438A flash that recursive analysis does not reach,
 use `Tools -> MSP430F5438 -> Report unreferenced function candidates` (or the
 F5438A equivalent). This read-only scan reports bounded routine shapes outside
 analyzed code and known strings, initializer records, lookup/jump tables,
-vectors, and data variables; it never enables linear sweep or creates
-functions. Evidence tiers are review hints, not proof. Inspect each candidate,
-replace `<confirmed_function_name>` in only the rows you accept, and submit
-those edited address/name lines separately with `Paste raw function symbols`.
+vectors, and data variables; the report itself never enables linear sweep or
+creates functions. Coherent strong clusters accepted during automatic recovery
+will already be absent from this missed-function report. Evidence tiers for the
+remaining rows are review hints, not proof. Inspect each candidate, replace
+`<confirmed_function_name>` in only the rows you accept, and submit those edited
+address/name lines separately with `Paste raw function symbols`.
 If linear sweep has already populated the view, reopen the original image
 before running the report so those speculative functions do not mask candidates.
 
@@ -217,7 +227,9 @@ Printable, null-terminated ASCII runs in flash are defined as data during
 mapped-view creation. Re-running analysis also removes stale functions that
 start inside those strings or in short zero padding next to them, which prevents
 string tables from decompiling into noisy carry/flag-heavy pseudocode or tiny
-`bra @pc` functions.
+`bra @pc` functions. Packed pools keep adjacent NUL-terminated strings as
+individual character arrays instead of coalescing the entire pool into one
+outer variable that hides interior strings.
 
 Binary Ninja can also hide a valid string load when an untyped callee is
 auto-inferred with no parameters or with false R4-R10 inputs from its

@@ -296,6 +296,9 @@ RAW_HELPER_CANDIDATE_MIN_CALL_SITES = 2
 RAW_HELPER_CANDIDATE_MAX_RESULTS = 64
 RAW_HELPER_CANDIDATE_CALLERS_PER_LINE = 12
 RAW_ORPHAN_CANDIDATE_MAX_RESULTS = 64
+RAW_ORPHAN_AUTO_SEED_MAX_CANDIDATES = 4096
+RAW_ORPHAN_AUTO_CLUSTER_MIN_FUNCTIONS = 3
+RAW_ORPHAN_AUTO_CLUSTER_MAX_START_GAP = 0x200
 RAW_FUNCTION_SYMBOL_PASTE_EXAMPLE = (
     "# Paste one confirmed function mapping per line:\n"
     "# 0x008c20 __MSP430_mpyi\n"
@@ -1412,7 +1415,7 @@ def _add_region(
     *,
     auto_defined: bool = False,
 ) -> None:
-    """Map one device region, separating backed code from erased flash."""
+    """Map one device region, separating file-backed from erased flash."""
 
     backed_start, data_offset, data_length = _region_file_backing(
         region.start,
@@ -1455,7 +1458,10 @@ def _add_region(
                 if cursor < erased_start:
                     _add_region_chunk(
                         bv,
-                        f"{region.name}.code_{chunk_index}",
+                        # Backing and execute permission do not prove that a
+                        # chunk contains code; it may instead hold tables,
+                        # strings, calibration records, or packed resources.
+                        f"{region.name}.backed_{chunk_index}",
                         backed_start + cursor,
                         erased_start - cursor,
                         data_offset + cursor,
@@ -1482,7 +1488,7 @@ def _add_region(
             if cursor < data_length:
                 _add_region_chunk(
                     bv,
-                    f"{region.name}.code_{chunk_index}",
+                    f"{region.name}.backed_{chunk_index}",
                     backed_start + cursor,
                     data_length - cursor,
                     data_offset + cursor,
@@ -4431,11 +4437,17 @@ def _is_vector_handler_function(func) -> bool:
 
 
 def _flash_ascii_string_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
+    # Preserve adjacent NUL-terminated strings as separate data variables.
+    # ``_merge_spans`` intentionally coalesces touching half-open intervals,
+    # which is useful for code exclusion but would turn a packed string pool
+    # into one large character array and hide every string after the first.
     return tuple(
-        _merge_spans(
-            span
-            for base, data in _flash_backed_chunks(bv)
-            for span in _ascii_string_spans(data, base)
+        sorted(
+            {
+                span
+                for base, data in _flash_backed_chunks(bv)
+                for span in _ascii_string_spans(data, base)
+            }
         )
     )
 
@@ -6433,6 +6445,201 @@ def _raw_orphan_function_candidates(
     return tuple(selected)
 
 
+def _strong_raw_orphan_candidate_clusters(
+    candidates: Sequence[_RawOrphanFunctionCandidate],
+    *,
+    minimum_functions: int = RAW_ORPHAN_AUTO_CLUSTER_MIN_FUNCTIONS,
+    maximum_start_gap: int = RAW_ORPHAN_AUTO_CLUSTER_MAX_START_GAP,
+) -> tuple[tuple[_RawOrphanFunctionCandidate, ...], ...]:
+    """Group nearby strong candidates without treating one decode as proof.
+
+    High-bank compiler modules commonly contain several erased-padding-delimited
+    routines.  Requiring a local run of independently bounded RETA routines is
+    substantially stronger evidence than promoting an isolated prologue-shaped
+    byte sequence from compressed or calibration data.
+    """
+
+    try:
+        minimum_functions = int(minimum_functions)
+        maximum_start_gap = int(maximum_start_gap)
+    except (TypeError, ValueError):
+        return ()
+    if minimum_functions <= 0 or maximum_start_gap < 0:
+        return ()
+
+    strong = sorted(
+        (candidate for candidate in candidates if candidate.confidence == "strong"),
+        key=lambda candidate: candidate.address,
+    )
+    clusters = []
+    current = []
+    for candidate in strong:
+        if (
+            current
+            and candidate.address - current[-1].address > maximum_start_gap
+        ):
+            if len(current) >= minimum_functions:
+                clusters.append(tuple(current))
+            current = []
+        current.append(candidate)
+    if len(current) >= minimum_functions:
+        clusters.append(tuple(current))
+    return tuple(clusters)
+
+
+def _strong_raw_orphan_boundary_candidates(
+    bv: BinaryView,
+    spec: DeviceSpec,
+) -> tuple[_RawOrphanFunctionCandidate, ...]:
+    """Validate only high-bank starts separated by erased flash.
+
+    The interactive report deliberately checks every aligned address and can
+    take tens of seconds on a large image.  Automatic recovery needs neither
+    that breadth nor its weak findings: a ``strong`` candidate must already
+    begin at a backed-island boundary, so inspect those boundaries directly.
+    Existing functions are retained as cluster anchors but are never counted
+    as newly created functions.
+    """
+
+    decoder, branch_edges = _msp430x_decode_api()
+    if decoder is None or branch_edges is None:
+        return ()
+
+    data_spans = tuple(
+        _merge_spans(
+            (
+                *_data_variable_spans(bv),
+                (spec.vector_start, spec.vector_end + 1),
+            )
+        )
+    )
+    function_spans = _analyzed_function_code_spans(bv)
+    candidates = []
+    for island_start, island_end in _executable_backed_islands(bv):
+        address = max(island_start, spec.flash_start)
+        if (
+            address != island_start
+            or address <= spec.vector_end
+            or address > spec.flash_end
+            or address & 1
+            or island_end - address < 8
+            or _addr_in_spans(address, data_spans)
+            or (
+                _addr_in_spans(address, function_spans)
+                and not _has_function_at(bv, address)
+            )
+        ):
+            continue
+
+        window_end = _code_window_end(address, island_end, data_spans)
+        if window_end - address < 8:
+            continue
+        try:
+            data = bytes(
+                bv.read(
+                    address,
+                    min(window_end - address, SPARSE_CODE_ISLAND_RETURN_SCAN_BYTES),
+                )
+            )
+        except Exception:
+            continue
+        if len(data) < 8 or not _looks_like_msp430_function_entry(data):
+            continue
+
+        shape = _decode_msp430_routine(
+            data,
+            address,
+            decoder=decoder,
+            branch_edges=branch_edges,
+        )
+        if shape is None:
+            continue
+        confidence, reasons = _raw_orphan_candidate_confidence(
+            address,
+            shape,
+            spec,
+            boundary_evidence=True,
+        )
+        if confidence != "strong":
+            continue
+        candidate_end = address + shape.length
+        if any(
+            address < data_end and data_start < candidate_end
+            for data_start, data_end in data_spans
+        ):
+            continue
+        candidates.append(
+            _RawOrphanFunctionCandidate(
+                address=address,
+                length=shape.length,
+                termination_kind=shape.termination_kind,
+                instruction_count=shape.instruction_count,
+                confidence=confidence,
+                reasons=reasons,
+            )
+        )
+    return tuple(candidates)
+
+
+def _seed_strong_raw_orphan_function_clusters(
+    bv: BinaryView,
+    verbose: bool = False,
+    *,
+    spec: Optional[DeviceSpec] = None,
+) -> int:
+    """Seed only clustered, high-confidence F5438 high-bank routines.
+
+    This is deliberately narrower than linear sweep and narrower than the
+    read-only candidate report.  Standalone strong candidates and every
+    ``review``/``ambiguous`` candidate remain analyst-confirmed findings.
+    """
+
+    add_function = getattr(bv, "add_function", None)
+    if add_function is None or getattr(bv, "platform", None) is None:
+        return 0
+    if spec is None:
+        spec = _selected_device_spec_read_only(bv)
+    if spec is None:
+        return 0
+
+    candidates = _strong_raw_orphan_boundary_candidates(bv, spec)
+    if len(candidates) > RAW_ORPHAN_AUTO_SEED_MAX_CANDIDATES:
+        log_warn(
+            "Skipped automatic clustered high-bank recovery because "
+            f"{len(candidates)} strong boundaries exceed the safety limit of "
+            f"{RAW_ORPHAN_AUTO_SEED_MAX_CANDIDATES}."
+        )
+        return 0
+    clusters = _strong_raw_orphan_candidate_clusters(candidates)
+    created = 0
+    for cluster in clusters:
+        for candidate in cluster:
+            if _has_function_at(bv, candidate.address):
+                continue
+            try:
+                added = add_function(candidate.address)
+            except Exception as exc:
+                log_warn(
+                    "Could not add clustered high-bank function at "
+                    f"{candidate.address:#x}: {exc}"
+                )
+                continue
+            if added is None and not _has_function_at(bv, candidate.address):
+                log_warn(
+                    "Binary Ninja rejected clustered high-bank function at "
+                    f"{candidate.address:#x}."
+                )
+                continue
+            created += 1
+
+    if verbose and created:
+        print(
+            f"Seeded {created} clustered high-confidence MSP430X high-bank "
+            "function(s)."
+        )
+    return created
+
+
 def report_raw_orphan_function_candidates(
     bv: BinaryView,
     *,
@@ -7408,6 +7615,11 @@ def _refresh_msp430x_analysis(
     )
     _define_cinit_table_data_vars(bv, auto_defined=True, verbose=verbose)
     _seed_sparse_code_island_functions(bv, verbose=verbose)
+    clustered_high_bank_functions = _seed_strong_raw_orphan_function_clusters(
+        bv,
+        verbose=verbose,
+        spec=spec,
+    )
     _seed_address_jump_table_target_functions(bv, verbose=verbose)
     _seed_address_jump_table_indirect_branches(bv, verbose=verbose)
 
@@ -7441,6 +7653,7 @@ def _refresh_msp430x_analysis(
     log_info(
         "Refreshed MSP430X analysis "
         f"variant={spec.name}, vector_functions={vector_functions}, "
+        f"clustered_high_bank_functions={clustered_high_bank_functions}, "
         f"address_word_recovery={address_word_recovery}, "
         f"abi_helper_functions={abi_helper_functions}, "
         f"string_call_recovery_passes={string_call_recovery_passes}"
@@ -7709,20 +7922,34 @@ def _is_automatic_string_recovery_view(bv: BinaryView) -> bool:
 def _run_automatic_string_call_recovery(bv: BinaryView) -> None:
     """Apply post-initial MSP430X recovery on a safe Python thread."""
 
+    orphan_cluster_functions = _seed_strong_raw_orphan_function_clusters(
+        bv,
+        verbose=False,
+    )
     address_word_recovery = _seed_referenced_address_word_targets(
         bv,
         verbose=False,
     )
     abi_helper_functions = _apply_msp430_abi_helper_metadata(bv, verbose=False)
-    if any(address_word_recovery) or abi_helper_functions:
+    if (
+        orphan_cluster_functions
+        or any(address_word_recovery)
+        or abi_helper_functions
+    ):
         _update_analysis(bv)
     recovered_per_pass = _stabilize_direct_string_call_parameters(
         bv,
         verbose=False,
     )
-    if any(address_word_recovery) or abi_helper_functions or any(recovered_per_pass):
+    if (
+        orphan_cluster_functions
+        or any(address_word_recovery)
+        or abi_helper_functions
+        or any(recovered_per_pass)
+    ):
         log_info(
             "Automatically applied MSP430X post-analysis recovery; "
+            f"clustered_high_bank_functions={orphan_cluster_functions}, "
             f"address_word_recovery={address_word_recovery}, "
             f"abi_helper_functions={abi_helper_functions}, "
             f"string_recovery_passes={recovered_per_pass}"
@@ -7736,7 +7963,10 @@ def _schedule_automatic_string_call_recovery(bv: BinaryView):
         return None
     return _run_background_analysis_command(
         bv,
-        progress_text="Recovering MSP430X indirect targets and R12 string call sites",
+        progress_text=(
+            "Recovering MSP430X high-bank functions, indirect targets, "
+            "and R12 string call sites"
+        ),
         action=_run_automatic_string_call_recovery,
     )
 
@@ -7891,6 +8121,11 @@ class MSP430F5438BinaryView(BinaryView):
         _define_address_jump_table_data_vars(self, auto_defined=True, verbose=False)
         _define_cinit_table_data_vars(self, auto_defined=True, verbose=False)
         _seed_sparse_code_island_functions(self, verbose=False)
+        clustered_high_bank_functions = _seed_strong_raw_orphan_function_clusters(
+            self,
+            verbose=False,
+            spec=spec,
+        )
         _seed_address_jump_table_target_functions(self, verbose=False)
         _seed_address_jump_table_indirect_branches(self, verbose=False)
         reset = _read_u16(self, spec.reset_vector)
@@ -7900,7 +8135,8 @@ class MSP430F5438BinaryView(BinaryView):
         log_info(
             f"Loaded {spec.name} mapped firmware view "
             f"raw_len={raw_len:#x}, image_base={image_base:#x}, "
-            f"entry={self._entry_point:#x}, vector_functions={vector_functions}"
+            f"entry={self._entry_point:#x}, vector_functions={vector_functions}, "
+            f"clustered_high_bank_functions={clustered_high_bank_functions}"
         )
         return True
 
@@ -8009,6 +8245,11 @@ def _prepare_msp430x_elf_view(bv: BinaryView) -> bool:
     _define_address_jump_table_data_vars(bv, auto_defined=True, verbose=False)
     _define_cinit_table_data_vars(bv, auto_defined=True, verbose=False)
     _seed_sparse_code_island_functions(bv, verbose=False)
+    clustered_high_bank_functions = _seed_strong_raw_orphan_function_clusters(
+        bv,
+        verbose=False,
+        spec=spec,
+    )
     _seed_address_jump_table_target_functions(bv, verbose=False)
     _seed_address_jump_table_indirect_branches(bv, verbose=False)
 
@@ -8018,7 +8259,8 @@ def _prepare_msp430x_elf_view(bv: BinaryView) -> bool:
         log_warn(f"Could not record MSP430X ELF preparation state: {exc}")
     log_info(
         f"Prepared {spec.name} ELF for MSP430X analysis before initial analysis "
-        f"(vector_functions={vector_functions})"
+        f"(vector_functions={vector_functions}, "
+        f"clustered_high_bank_functions={clustered_high_bank_functions})"
     )
     return True
 

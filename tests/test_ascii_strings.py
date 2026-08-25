@@ -31,6 +31,59 @@ class FakeSettings:
 
 
 class AsciiStringTests(unittest.TestCase):
+    def test_adjacent_aegis_strings_remain_separate_data_variables(self):
+        base = 0x3091F
+        command = b"get_version\x00"
+        description = b"cmd get_version: request/response descriptor 15\x00"
+        data = command + description
+        description_start = base + len(command)
+        expected = (
+            (base, description_start),
+            (description_start, base + len(data)),
+        )
+
+        with patch.object(
+            memory_map,
+            "_flash_backed_chunks",
+            return_value=((base, data),),
+        ):
+            self.assertEqual(memory_map._flash_ascii_string_spans(object()), expected)
+
+            class MockView:
+                data_vars = {}
+
+                def __init__(self):
+                    self.definitions = []
+
+                def get_data_var_at(self, _address):
+                    return None
+
+                def define_data_var(self, address, data_type, name):
+                    self.definitions.append(
+                        (address, getattr(data_type, "width", None), name)
+                    )
+
+            view = MockView()
+            self.assertEqual(
+                memory_map._define_ascii_string_data_vars(
+                    view,
+                    auto_defined=True,
+                ),
+                2,
+            )
+
+        self.assertEqual(
+            view.definitions,
+            [
+                (base, len(command), f"str_{base:05x}"),
+                (
+                    description_start,
+                    len(description),
+                    f"str_{description_start:05x}",
+                ),
+            ],
+        )
+
     def test_default_threshold_rejects_short_printable_noise(self):
         base = 0x6800
 

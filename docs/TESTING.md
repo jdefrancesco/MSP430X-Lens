@@ -26,7 +26,12 @@ device-ID selection, typed factory TLV records, peripheral discovery,
 CRC-16/CCITT-FALSE validation, and annotation idempotence. A third mapped-raw
 fixture backs flash above `0xffff` and verifies 20-bit `CALLA` discovery while
 recovering one referenced address-word target and rejecting unreferenced
-high-bank bytes that merely resemble a function.
+high-bank bytes that merely resemble a function. Exact bytes reduced from a
+larger F5438A image additionally verify that three nearby erased-boundary
+`RETA` routines are recovered as a cluster, while a standalone `RETA`, legacy
+`RET`, and accidental calibration-table `RETI` remain unseeded. A packed
+command-name/descriptor pair from the same image verifies that touching
+NUL-terminated strings remain separate data variables.
 
 The ELF factory-path integration test constructs a dependency-free ELF32
 `EM_MSP430` executable and verifies that `msp430x`, string filtering, vectors,
@@ -67,9 +72,9 @@ Verify the loader and registration:
 2. Confirm the architecture/platform is `msp430x`.
 3. Confirm the `Tools -> MSP430F5438` commands are present.
 4. Run `Tools -> MSP430F5438 -> Diagnose active view`.
-5. Let initial analysis and the automatic `Recovering MSP430X indirect targets
-   and R12 string call sites` background task finish. Do not run a manual
-   analysis command for this smoke test.
+5. Let initial analysis and the automatic `Recovering MSP430X high-bank
+   functions, indirect targets, and R12 string call sites` background task
+   finish. Do not run a manual analysis command for this smoke test.
 6. Confirm `0x5c00` is the reset-handler function.
 7. Confirm `0x6000` is recovered as a function even though nothing references
    it.
@@ -91,11 +96,13 @@ Verify the loader and registration:
     `0x6e40` retains its original auto-inferred type.
 14. Confirm the long `0xff` ranges between code islands remain
     non-executable data.
-15. Open Pseudo C at `0x6f00` and confirm the unused hardware read remains
+15. Confirm non-erased flash section names use `.backed_N`, not `.code_N`;
+    this name intentionally covers both instructions and file-backed data.
+16. Open Pseudo C at `0x6f00` and confirm the unused hardware read remains
     visible as `mmio_read16(&DMACTL0)`. Confirm `DMACTL0` at `0x500` is a
     volatile two-byte data variable; the `_L`/`_H` aliases should remain
     navigable symbols without overlapping data variables.
-16. Spot-check reset/vector and other MSP430 header labels.
+17. Spot-check reset/vector and other MSP430 header labels.
 
 For a real raw slice whose first byte does not represent address `0` or
 `0x5c00`, choose the same mapped view in `Open With Options` and enter the
@@ -127,7 +134,8 @@ For `build/high-bank-raw.bin`, also verify:
    functions.
 4. The unreferenced bytes at `0x11400` look like a valid
    `push/nop/pop/ret` routine but remain data. This confirms mapped-raw linear
-   sweep is disabled and high-bank code requires reference/symbol evidence.
+   sweep is disabled and an isolated high-bank shape requires reference,
+   symbol, or analyst evidence.
 5. The wrapper at `0x7000` contains `CALLA &0x11500` followed by `RET`. The
    four-byte address-word slot at `0x11500` resolves to a function at `0x11600`,
    and the call has that full 20-bit indirect target without losing its
@@ -168,6 +176,11 @@ pass. If short junk strings remain after a plugin update, close the old view and
 reopen the original firmware; `Re-run MSP430X analysis` cannot remove entries
 already recorded by the core string scanner. Both mapped-raw and ELF executable
 views apply the inherited eight-character minimum automatically.
+
+Likewise, reopen the original firmware after updating from a release that
+coalesced a packed string pool into one large character array. On a fresh view,
+adjacent command names and descriptions must each render as their own string
+data variable even when one starts immediately after the preceding NUL byte.
 
 For a direct call preceded by a constant R12 string load in a newly opened
 mapped-raw or prepared ELF view, confirm the log reports automatic R12 string
@@ -218,7 +231,13 @@ For an already-open mapped or ELF file, run
 
 ```text
 Seeded N unreferenced MSP430X sparse code-island function(s).
+Seeded N clustered high-confidence MSP430X high-bank function(s).
 ```
+
+The second line appears only when a manual re-run finds a new qualifying
+cluster. On a fresh mapped view, the loader instead reports
+`clustered_high_bank_functions=N` because it performs that recovery before
+Binary Ninja's first analysis pass.
 
 On a fresh `build/high-bank-raw.bin` view, wait for automatic post-analysis
 recovery, then run `Tools -> MSP430F5438 -> Report unreferenced function
@@ -237,10 +256,15 @@ only then should Binary Ninja create the function.
 Before relying on changes to device mapping for a larger MSP430X target, test
 at least one image with real backed contents above `0x10000`. Confirm that:
 
-- backed high-bank flash is executable, read-only code;
+- backed high-bank flash retains its executable, read-only mapping without
+  treating every backed section as proven code;
 - unbacked or erased high-bank tails remain non-executable data;
 - direct calls and recovered functions use their full 20-bit addresses; and
-- strings or lookup tables in high banks are not seeded as functions.
+- strings or lookup tables in high banks are not seeded as functions;
+- three-or-more nearby erased-boundary `RETA` routines are recovered without
+  enabling linear sweep; and
+- isolated `RET`/`RETI` shapes inside calibration or packed-resource data are
+  not promoted.
 
 The bundled `build/high-bank-raw.bin` fixture automates these checks through
 `0x117ff`. Continue to repeat them on representative production firmware,

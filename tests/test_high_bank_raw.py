@@ -236,6 +236,33 @@ class HighBankRawTests(unittest.TestCase):
         self.assertFalse(unbacked.executable)
         self.assertEqual(unbacked.data_length, 0)
 
+    def test_non_erased_flash_sections_are_neutrally_named_backed(self):
+        backed_sections = {
+            name: section
+            for name, section in self.view.sections.items()
+            if ".backed_" in name
+        }
+        self.assertTrue(backed_sections)
+        self.assertFalse(
+            any(".code_" in name for name in self.view.sections),
+            "file-backed flash is not necessarily code",
+        )
+        self.assertTrue(
+            any(
+                section.start <= HIGH_BANK_FUNCTION_ADDRESS
+                < section.start + section.length
+                for section in backed_sections.values()
+            )
+        )
+        self.assertTrue(
+            any(
+                section.start <= HIGH_BANK_LOOKUP_TABLE_ADDRESS
+                < section.start + section.length
+                for section in backed_sections.values()
+            ),
+            "the same neutral section class must also cover backed data",
+        )
+
     def test_high_bank_string_and_lookup_table_remain_data(self):
         self.assertEqual(
             bytes(self.view.read(HIGH_BANK_STRING_ADDRESS, len(HIGH_BANK_STRING))),
