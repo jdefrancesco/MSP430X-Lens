@@ -220,6 +220,18 @@ For an already-open mapped or ELF file, run
 Seeded N unreferenced MSP430X sparse code-island function(s).
 ```
 
+On a fresh `build/high-bank-raw.bin` view, wait for automatic post-analysis
+recovery, then run `Tools -> MSP430F5438 -> Report unreferenced function
+candidates` and wait for its background task. Confirm the log says the report
+is read-only, lists `[strong] 0x011700` with `exit=reta` and a `0x011700
+<confirmed_function_name>` template, and does not list an address inside the
+string at `0x11200` or lookup table at `0x11300`. The deliberately code-shaped
+bytes at `0x11400` may appear only as `[ambiguous]`; do not import them. Confirm
+`0x11700` remains absent from the Functions list after the report. To test the
+separate confirmation path, replace the placeholder for `0x11700` with a
+chosen name and submit only that row through `Paste raw function symbols`;
+only then should Binary Ninja create the function.
+
 ## Larger-firmware readiness
 
 Before relying on changes to device mapping for a larger MSP430X target, test

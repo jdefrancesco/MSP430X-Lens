@@ -210,6 +210,18 @@ class _RawHelperCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class _RawOrphanFunctionCandidate:
+    """One bounded F5438 routine candidate requiring analyst confirmation."""
+
+    address: int
+    length: int
+    termination_kind: str
+    instruction_count: int
+    confidence: str
+    reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _RoutineShape:
     """Conservative bounds and terminal-flow kind for one decoded routine."""
 
@@ -283,6 +295,7 @@ STRING_CALL_RECOVERY_MAX_PASSES = 4
 RAW_HELPER_CANDIDATE_MIN_CALL_SITES = 2
 RAW_HELPER_CANDIDATE_MAX_RESULTS = 64
 RAW_HELPER_CANDIDATE_CALLERS_PER_LINE = 12
+RAW_ORPHAN_CANDIDATE_MAX_RESULTS = 64
 RAW_FUNCTION_SYMBOL_PASTE_EXAMPLE = (
     "# Paste one confirmed function mapping per line:\n"
     "# 0x008c20 __MSP430_mpyi\n"
@@ -3508,10 +3521,15 @@ def _file_backed_spans(
     return tuple(_merge_spans(spans))
 
 
-def _flash_backed_chunks(bv: BinaryView) -> tuple[tuple[int, bytes], ...]:
+def _flash_backed_chunks(
+    bv: BinaryView,
+    *,
+    spec: Optional[DeviceSpec] = None,
+) -> tuple[tuple[int, bytes], ...]:
     """Read only backed flash islands for data/code classification passes."""
 
-    spec = _device_spec_for_view(bv)
+    if spec is None:
+        spec = _device_spec_for_view(bv)
     chunks = []
     for start, end in _file_backed_spans(
         bv,
@@ -4973,6 +4991,27 @@ def _selected_address_word_recovery_spec(bv: BinaryView) -> Optional[DeviceSpec]
     return None
 
 
+def _selected_device_spec_read_only(bv: BinaryView) -> Optional[DeviceSpec]:
+    """Resolve an explicit F5438 profile without detecting or storing one."""
+
+    spec = getattr(bv, "spec", None)
+    if isinstance(spec, DeviceSpec):
+        return spec
+    try:
+        variant = bv.query_metadata(DEVICE_VARIANT_METADATA_KEY)
+    except Exception:
+        variant = None
+    if isinstance(variant, str):
+        spec_name = DEVICE_SPEC_ALIASES.get(variant.upper())
+        if spec_name is not None:
+            return DEVICE_SPEC_BY_NAME[spec_name]
+    if _is_msp430f5438_mapped_view(bv):
+        # The registered raw view's documented no-TLV fallback is F5438. A
+        # valid F5438A selection is stored by the loader before analysis.
+        return DEFAULT_DEVICE_SPEC
+    return None
+
+
 def _function_instruction_addresses(func) -> tuple[int, ...]:
     """Return deduplicated addresses from Binary Ninja's analyzed instruction list."""
 
@@ -6140,6 +6179,317 @@ def _seed_sparse_code_island_functions(bv: BinaryView, verbose: bool = False) ->
     if verbose and created:
         print(f"Seeded {created} unreferenced MSP430X sparse code-island function(s).")
     return created
+
+
+def _analyzed_function_code_spans(bv: BinaryView) -> tuple[AddressSpan, ...]:
+    """Return analyzed basic-block spans without treating unknown ends as infinite."""
+
+    spans = []
+    for func in getattr(bv, "functions", ()):
+        found_block = False
+        try:
+            blocks = tuple(func.basic_blocks)
+        except Exception:
+            blocks = ()
+        for block in blocks:
+            start = getattr(block, "start", None)
+            end = getattr(block, "end", None)
+            if not isinstance(start, int) or not isinstance(end, int) or end <= start:
+                continue
+            spans.append((start, end))
+            found_block = True
+        if found_block:
+            continue
+
+        start = getattr(func, "start", None)
+        if not isinstance(start, int):
+            continue
+        highest = getattr(func, "highest_address", None)
+        if isinstance(highest, int) and highest >= start:
+            spans.append((start, highest + 2))
+        else:
+            # A mock, imported declaration, or not-yet-analyzed function still
+            # blocks its exact start without hiding the rest of flash.
+            spans.append((start, start + 2))
+    return tuple(_merge_spans(spans))
+
+
+def _raw_orphan_candidate_data_spans(
+    bv: BinaryView,
+    spec: DeviceSpec,
+) -> tuple[AddressSpan, ...]:
+    """Collect data evidence that must win over orphan-code resemblance."""
+
+    # Candidate reporting is intentionally stricter than Binary Ninja's
+    # Strings sidebar. Preserve useful four-to-seven-character C strings here
+    # without lowering the global eight-character noise threshold.
+    chunks = _flash_backed_chunks(bv, spec=spec)
+    short_string_spans = tuple(
+        span
+        for base, data in chunks
+        for span in _ascii_string_spans(data, base, min_len=4)
+    )
+    return tuple(
+        _merge_spans(
+            (
+                *short_string_spans,
+                *(
+                    span
+                    for base, data in chunks
+                    for span in _ascii_string_cluster_spans(data, base)
+                ),
+                *(
+                    span
+                    for base, data in chunks
+                    for span in _numeric_lookup_table_spans(data, base)
+                ),
+                *(
+                    span
+                    for base, data in chunks
+                    for span in _address_jump_table_spans(data, base)
+                ),
+                *(
+                    span
+                    for base, data in chunks
+                    for span in _cinit_table_spans(data, base)
+                ),
+                *_data_variable_spans(bv),
+                (spec.vector_start, spec.vector_end + 1),
+            )
+        )
+    )
+
+
+def _raw_orphan_candidate_confidence(
+    address: int,
+    shape: _RoutineShape,
+    spec: DeviceSpec,
+    *,
+    boundary_evidence: bool,
+) -> tuple[str, tuple[str, ...]]:
+    """Classify evidence without claiming that byte shape proves code."""
+
+    reasons = ["compiler-entry", "bounded-cfg", f"exit-{shape.termination_kind}"]
+    if boundary_evidence:
+        reasons.append("partition-boundary")
+
+    in_high_bank = address > spec.vector_end
+    if in_high_bank and shape.termination_kind == "ret":
+        reasons.append("high-bank-legacy-ret")
+        confidence = "ambiguous"
+    elif (
+        in_high_bank
+        and shape.termination_kind == "reta"
+        and boundary_evidence
+        and shape.instruction_count >= 4
+        and shape.length >= 8
+    ):
+        reasons.append("high-bank-reta")
+        confidence = "strong"
+    else:
+        confidence = "review"
+    return confidence, tuple(reasons)
+
+
+def _raw_orphan_function_candidates(
+    bv: BinaryView,
+    *,
+    spec: Optional[DeviceSpec] = None,
+    max_results: int = RAW_ORPHAN_CANDIDATE_MAX_RESULTS,
+) -> tuple[_RawOrphanFunctionCandidate, ...]:
+    """Report-only scan for bounded F5438 routines missed by recursive analysis.
+
+    Broad linear sweep is deliberately not enabled. Every row still requires
+    analyst confirmation: even a compiler-looking prologue and complete CFG can
+    occur in compressed data. Known strings, initializer records, lookup/jump
+    tables, vectors, existing data variables, and analyzed code always win.
+    """
+
+    try:
+        result_limit = int(max_results)
+    except (TypeError, ValueError):
+        return ()
+    if spec is None:
+        spec = _selected_device_spec_read_only(bv)
+    if spec is None or result_limit <= 0:
+        return ()
+
+    decoder, branch_edges = _msp430x_decode_api()
+    if decoder is None or branch_edges is None:
+        return ()
+
+    data_spans = _raw_orphan_candidate_data_spans(bv, spec)
+    function_spans = _analyzed_function_code_spans(bv)
+    blocked_spans = tuple(_merge_spans((*data_spans, *function_spans)))
+    function_starts = sorted(
+        {
+            int(start)
+            for func in getattr(bv, "functions", ())
+            if isinstance((start := getattr(func, "start", None)), int)
+        }
+    )
+    partition_boundaries = {
+        end
+        for start, end in blocked_spans
+        if spec.flash_start <= start <= spec.flash_end and end <= spec.flash_end + 1
+    }
+
+    candidates = {}
+    for island_start, island_end in _executable_backed_islands(bv):
+        scan_start = max(island_start, spec.flash_start)
+        scan_end = min(island_end, spec.flash_end + 1)
+        if scan_end - scan_start < 4:
+            continue
+        try:
+            data = bytes(bv.read(island_start, island_end - island_start))
+        except Exception:
+            continue
+        if len(data) != island_end - island_start:
+            continue
+
+        cursor = scan_start + (scan_start & 1)
+        while cursor + 4 <= scan_end:
+            if _addr_in_spans(cursor, blocked_spans):
+                cursor += 2
+                continue
+            offset = cursor - island_start
+            if not _looks_like_msp430_function_entry(data[offset:]):
+                cursor += 2
+                continue
+
+            window_end = _code_window_end(cursor, scan_end, blocked_spans)
+            next_function_index = bisect.bisect_right(function_starts, cursor)
+            if next_function_index < len(function_starts):
+                window_end = min(window_end, function_starts[next_function_index])
+            if window_end - cursor < 4:
+                cursor += 2
+                continue
+
+            shape = _decode_msp430_routine(
+                data[offset : offset + (window_end - cursor)],
+                cursor,
+                decoder=decoder,
+                branch_edges=branch_edges,
+            )
+            if shape is None:
+                cursor += 2
+                continue
+
+            candidate_end = cursor + shape.length
+            if any(
+                cursor < blocked_end and blocked_start < candidate_end
+                for blocked_start, blocked_end in blocked_spans
+            ):
+                cursor += 2
+                continue
+
+            boundary_evidence = (
+                cursor == scan_start
+                or cursor == island_start
+                or cursor in partition_boundaries
+            )
+            confidence, reasons = _raw_orphan_candidate_confidence(
+                cursor,
+                shape,
+                spec,
+                boundary_evidence=boundary_evidence,
+            )
+            candidates.setdefault(
+                cursor,
+                _RawOrphanFunctionCandidate(
+                    address=cursor,
+                    length=shape.length,
+                    termination_kind=shape.termination_kind,
+                    instruction_count=shape.instruction_count,
+                    confidence=confidence,
+                    reasons=reasons,
+                ),
+            )
+            cursor += 2
+
+    confidence_order = {"strong": 0, "review": 1, "ambiguous": 2}
+    ranked = sorted(
+        candidates.values(),
+        key=lambda candidate: (
+            confidence_order.get(candidate.confidence, 3),
+            candidate.address,
+        ),
+    )
+    selected = []
+    for candidate in ranked:
+        # A PUSH-like word inside a real routine can resemble a second entry
+        # whose decoded suffix reaches the same return. Ranking first keeps
+        # the stronger row (or the earlier row at equal confidence), and this
+        # interval check suppresses either direction of overlapping noise.
+        if any(
+            candidate.address < existing.address + existing.length
+            and existing.address < candidate.address + candidate.length
+            for existing in selected
+        ):
+            continue
+        selected.append(candidate)
+        if len(selected) >= result_limit:
+            break
+    return tuple(selected)
+
+
+def report_raw_orphan_function_candidates(
+    bv: BinaryView,
+    *,
+    max_results: int = RAW_ORPHAN_CANDIDATE_MAX_RESULTS,
+) -> None:
+    """Print non-mutating F5438 orphan candidates for manual confirmation."""
+
+    try:
+        result_limit = int(max_results)
+    except (TypeError, ValueError):
+        result_limit = 0
+    if result_limit <= 0:
+        print(
+            "No orphan function candidates requested because the result limit "
+            "is zero; no analysis changes were made."
+        )
+        return
+
+    spec = _selected_device_spec_read_only(bv)
+    if spec is None:
+        print(
+            "No explicit MSP430F5438/F5438A device profile is selected; "
+            "orphan candidate reporting made no analysis changes."
+        )
+        return
+    candidates_with_probe = _raw_orphan_function_candidates(
+        bv,
+        spec=spec,
+        max_results=result_limit + 1,
+    )
+    truncated = len(candidates_with_probe) > result_limit
+    candidates = candidates_with_probe[:result_limit]
+    if not candidates:
+        print(
+            f"No bounded {spec.name} orphan function candidates found. "
+            "Linear sweep remains disabled so mixed flash data is not invented as code."
+        )
+        return
+
+    count_text = (
+        f"Showing the first {len(candidates)} bounded {spec.name} orphan function "
+        "candidate(s); additional candidates were omitted by the result limit."
+        if truncated
+        else f"Found {len(candidates)} bounded {spec.name} orphan function candidate(s)."
+    )
+    print(
+        f"{count_text} Read-only; no analysis changes were made. Inspect each row "
+        "before pasting confirmed address/name lines with 'Paste raw function symbols'."
+    )
+    for candidate in candidates:
+        reasons = ",".join(candidate.reasons)
+        print(
+            f"  [{candidate.confidence}] {candidate.address:#08x} "
+            f"length={candidate.length:#x} instructions={candidate.instruction_count} "
+            f"exit={candidate.termination_kind} evidence={reasons}"
+        )
+        print(f"    {candidate.address:#08x} <confirmed_function_name>")
 
 
 def _seed_address_jump_table_target_functions(
@@ -7853,6 +8203,14 @@ try:
         report_raw_msp430_helper_candidates,
     )
     PluginCommand.register(
+        "MSP430F5438\\Report unreferenced function candidates",
+        "Read-only scan for bounded F5438 routines missed by recursive analysis without enabling linear sweep.",
+        _background_command(
+            report_raw_orphan_function_candidates,
+            "Scanning MSP430F5438 unreferenced function candidates",
+        ),
+    )
+    PluginCommand.register(
         "MSP430F5438\\Report MSP430 ABI helper names",
         "Print the MSP430 ABI helper names accepted by raw symbol import commands.",
         report_msp430_abi_helper_names,
@@ -7926,6 +8284,14 @@ try:
         "MSP430F5438A\\Report raw helper candidates",
         "Print repeated direct-call targets that may be raw MSP430 runtime helper functions.",
         report_raw_msp430_helper_candidates,
+    )
+    PluginCommand.register(
+        "MSP430F5438A\\Report unreferenced function candidates",
+        "Read-only scan for bounded F5438A routines missed by recursive analysis without enabling linear sweep.",
+        _background_command(
+            report_raw_orphan_function_candidates,
+            "Scanning MSP430F5438A unreferenced function candidates",
+        ),
     )
     PluginCommand.register(
         "MSP430F5438A\\Report MSP430 ABI helper names",

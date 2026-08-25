@@ -10,6 +10,8 @@ core features include:
 - Vector-table seeding, Flash/RAM/Peripheral sections, and typed TI SFR labels.
 - Conservative 20-bit indirect `CALLA`/`BRA` target recovery from referenced
   flash address-word slots.
+- Read-only F5438/F5438A reporting for bounded function candidates missed by
+  recursive analysis, without enabling linear sweep.
 - Typed factory TLV calibration/device records with stored CRC16 validation.
 - Collapsing and simplifying the decompilation output without all the
 artifacts that Ghidra generally leaves.
@@ -125,6 +127,7 @@ Useful commands include:
 - `Apply memory map (full image @ 0)`
 - `Diagnose active view`
 - `Report CPUX fallback instructions`
+- `Report unreferenced function candidates`
 - `Report TLV device descriptors and CRC16`
 - `Re-run MSP430X analysis`
 - `Apply MSP430 header labels`
@@ -188,6 +191,17 @@ decodes as plausible MSP430 code. Within the F5438/F5438A flash banks above
 `0xffff`, functions therefore need stronger evidence: a `CALLA`/branch,
 imported symbol, or an existing function anchor. Generic executable ranges
 outside the selected device profile retain bounded sparse-island recovery.
+
+To review backed F5438/F5438A flash that recursive analysis does not reach,
+use `Tools -> MSP430F5438 -> Report unreferenced function candidates` (or the
+F5438A equivalent). This read-only scan reports bounded routine shapes outside
+analyzed code and known strings, initializer records, lookup/jump tables,
+vectors, and data variables; it never enables linear sweep or creates
+functions. Evidence tiers are review hints, not proof. Inspect each candidate,
+replace `<confirmed_function_name>` in only the rows you accept, and submit
+those edited address/name lines separately with `Paste raw function symbols`.
+If linear sweep has already populated the view, reopen the original image
+before running the report so those speculative functions do not mask candidates.
 
 After initial analysis identifies a memory-indirect `CALLA` or address-width
 `BRA`, MSP430X Lens follows only that instruction's explicit flash slot. A

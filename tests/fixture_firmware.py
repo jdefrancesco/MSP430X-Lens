@@ -32,6 +32,7 @@ HIGH_BANK_LOOKUP_TABLE_ADDRESS = 0x11300
 HIGH_BANK_PROLOGUE_DATA_ADDRESS = 0x11400
 HIGH_BANK_INDIRECT_CALLA_POINTER_ADDRESS = 0x11500
 HIGH_BANK_INDIRECT_CALLA_TARGET_ADDRESS = 0x11600
+HIGH_BANK_ORPHAN_FUNCTION_ADDRESS = 0x11700
 HIGH_BANK_BACKED_ERASED_ADDRESS = 0x11100
 HIGH_BANK_BACKED_END = 0x11800
 HIGH_BANK_UNBACKED_ADDRESS = 0x12000
@@ -89,6 +90,16 @@ HIGH_BANK_INDIRECT_CALLA_WRAPPER = (
 HIGH_BANK_INDIRECT_CALLA_POINTER = bytes.fromhex("00 16 01 00")
 HIGH_BANK_INDIRECT_CALLA_TARGET = bytes.fromhex(
     "04 12 03 43 34 41 10 01"
+)
+
+# An ordinary, bounded high-bank leaf routine with no incoming references:
+# push r4; push r5; mov #0x1234,r4; add #1,r4; pop r5; pop r4; reta.  The
+# nested push deliberately resembles a second entry inside the same routine.
+# Broad linear sweep can find both shapes, but conservative discovery should
+# report only the enclosing candidate until stronger evidence justifies
+# creating a function.
+HIGH_BANK_ORPHAN_FUNCTION = bytes.fromhex(
+    "04 12 05 12 34 40 34 12 14 53 35 41 34 41 10 01"
 )
 
 # An unreferenced high-bank data island deliberately passes both the sparse
@@ -260,6 +271,7 @@ def build_high_bank_raw_firmware() -> bytes:
         HIGH_BANK_INDIRECT_CALLA_TARGET_ADDRESS,
         HIGH_BANK_INDIRECT_CALLA_TARGET,
     )
+    place(HIGH_BANK_ORPHAN_FUNCTION_ADDRESS, HIGH_BANK_ORPHAN_FUNCTION)
     return bytes(image)
 
 
@@ -596,6 +608,10 @@ def main(argv: list[str] | None = None) -> int:
             "Expected address-word CALLA recovery: "
             f"{HIGH_BANK_INDIRECT_CALLA_POINTER_ADDRESS:#x} -> "
             f"{HIGH_BANK_INDIRECT_CALLA_TARGET_ADDRESS:#x}"
+        )
+        print(
+            "Expected unreferenced bounded routine candidate: "
+            f"{HIGH_BANK_ORPHAN_FUNCTION_ADDRESS:#x}"
         )
     print(f"Expected reset function: {RESET_HANDLER:#x}")
     print(f"Expected recovered sparse function: {SPARSE_FUNCTION_ADDRESS:#x}")
