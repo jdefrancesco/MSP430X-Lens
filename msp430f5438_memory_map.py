@@ -3185,7 +3185,7 @@ def _default_platform_assignment_is_safe() -> bool:
         return False
 
     major, minor = (int(match.group(1)), int(match.group(2)))
-    return (major, minor) < (5, 4)
+    return (major, minor) != (5, 4)
 
 
 def _set_load_setting_default(
@@ -5460,6 +5460,56 @@ def _register_parameter_names(func) -> set[str]:
     return names
 
 
+def _parameter_location_register_name(arch, parameter) -> Optional[str]:
+    """Return a single register-backed parameter location across BN APIs."""
+
+    location = getattr(parameter, "location", None)
+    if location is None:
+        return None
+
+    try:
+        if bool(getattr(location, "indirect", False)):
+            return None
+    except Exception:
+        return None
+
+    components = getattr(location, "components", None)
+    if components is not None:
+        try:
+            if len(tuple(components)) != 1:
+                return None
+        except Exception:
+            return None
+
+    source_type = getattr(location, "source_type", None)
+    storage = getattr(location, "storage", None)
+    if (
+        source_type == VariableSourceType.RegisterVariableSourceType
+        and storage is not None
+    ):
+        try:
+            return str(arch.get_reg_name(storage))
+        except Exception:
+            return None
+
+    variable_for_parameter = getattr(location, "variable_for_parameter", None)
+    if callable(variable_for_parameter):
+        try:
+            variable = variable_for_parameter(0)
+        except Exception:
+            return None
+        if (
+            getattr(variable, "source_type", None)
+            == VariableSourceType.RegisterVariableSourceType
+        ):
+            try:
+                return str(arch.get_reg_name(variable.storage))
+            except Exception:
+                return None
+
+    return None
+
+
 def _preservable_auto_parameters(func) -> Optional[tuple]:
     """Keep only the narrow auto-prototype shape that causes lost string inputs.
 
@@ -5480,16 +5530,8 @@ def _preservable_auto_parameters(func) -> Optional[tuple]:
     if not parameters:
         return parameters
     for parameter in parameters:
-        location = getattr(parameter, "location", None)
-        if (
-            location is None
-            or getattr(location, "source_type", None)
-            != VariableSourceType.RegisterVariableSourceType
-        ):
-            return None
-        try:
-            register_name = str(arch.get_reg_name(location.storage))
-        except Exception:
+        register_name = _parameter_location_register_name(arch, parameter)
+        if register_name is None:
             return None
         if register_name not in _MSP430_CALLEE_SAVED_REGS:
             return None
