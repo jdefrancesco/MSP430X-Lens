@@ -122,6 +122,10 @@ class AutomaticStringRecoveryTests(unittest.TestCase):
             return_value=(3, 0),
         ) as stabilize, mock.patch.object(
             memory_map,
+            "_recover_msp430x_structures",
+            return_value=0,
+        ) as structures, mock.patch.object(
+            memory_map,
             "_refresh_msp430x_analysis",
         ) as full_refresh:
             memory_map._run_automatic_string_call_recovery(view)
@@ -130,6 +134,7 @@ class AutomaticStringRecoveryTests(unittest.TestCase):
         helpers.assert_called_once_with(view, verbose=False)
         stabilize.assert_called_once()
         self.assertIs(stabilize.call_args.args[0], view)
+        structures.assert_called_once_with(view, verbose=False)
         full_refresh.assert_not_called()
 
     def test_background_action_reanalyzes_new_indirect_targets_once(self):
@@ -147,6 +152,41 @@ class AutomaticStringRecoveryTests(unittest.TestCase):
             memory_map,
             "_stabilize_direct_string_call_parameters",
             return_value=(0,),
+        ), mock.patch.object(
+            memory_map,
+            "_recover_msp430x_structures",
+            return_value=0,
+        ), mock.patch.object(
+            memory_map,
+            "_update_analysis",
+        ) as update:
+            memory_map._run_automatic_string_call_recovery(view)
+
+        update.assert_called_once_with(view)
+
+    def test_background_action_reanalyzes_recovered_structures_once(self):
+        view = object()
+
+        with mock.patch.object(
+            memory_map,
+            "_seed_strong_raw_orphan_function_clusters",
+            return_value=0,
+        ), mock.patch.object(
+            memory_map,
+            "_seed_referenced_address_word_targets",
+            return_value=(0, 0, 0),
+        ), mock.patch.object(
+            memory_map,
+            "_apply_msp430_abi_helper_metadata",
+            return_value=0,
+        ), mock.patch.object(
+            memory_map,
+            "_stabilize_direct_string_call_parameters",
+            return_value=(0,),
+        ), mock.patch.object(
+            memory_map,
+            "_recover_msp430x_structures",
+            return_value=2,
         ), mock.patch.object(
             memory_map,
             "_update_analysis",
