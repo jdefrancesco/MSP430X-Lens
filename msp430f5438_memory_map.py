@@ -35,7 +35,12 @@ from binaryninja import (
     log_info,
     log_warn,
 )
-from binaryninja.enums import FunctionUpdateType, RegisterValueType, VariableSourceType
+from binaryninja.enums import (
+    FunctionUpdateType,
+    RegisterValueType,
+    TypeClass,
+    VariableSourceType,
+)
 
 try:
     from .msp430_tlv import (
@@ -210,6 +215,30 @@ class _RawHelperCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class _StructFieldCandidate:
+    """One unambiguous fixed-offset field inferred from mapped MLIL."""
+
+    offset: int
+    width: int
+
+
+@dataclass(frozen=True, slots=True)
+class _StructCandidate:
+    """One parameter whose memory accesses support an automatic structure."""
+
+    function_start: int
+    parameter_index: int
+    parameter_name: str
+    pointer_width: int
+    type_name: str
+    fields: tuple[_StructFieldCandidate, ...]
+
+    @property
+    def width(self) -> int:
+        return max(field.offset + field.width for field in self.fields)
+
+
+@dataclass(frozen=True, slots=True)
 class _RawOrphanFunctionCandidate:
     """One bounded F5438 routine candidate requiring analyst confirmation."""
 
@@ -292,6 +321,10 @@ EXECUTABLE_SEGMENT_SCAN_MAX_BYTES = 0x200000
 ASCII_STRING_MIN_LEN = 8
 STRING_CALL_MAX_BYTES = 0x400
 STRING_CALL_RECOVERY_MAX_PASSES = 4
+STRUCT_RECOVERY_MAX_OFFSET = 0x100
+STRUCT_RECOVERY_MAX_FIELDS = 64
+STRUCT_RECOVERY_MIN_FIELDS = 2
+STRUCT_RECOVERY_AUTO_TYPE_SOURCE = "msp430x-lens:structure-recovery"
 RAW_HELPER_CANDIDATE_MIN_CALL_SITES = 2
 RAW_HELPER_CANDIDATE_MAX_RESULTS = 64
 RAW_HELPER_CANDIDATE_CALLERS_PER_LINE = 12
@@ -5784,6 +5817,515 @@ def _stabilize_direct_string_call_parameters(
     return tuple(recovered_per_pass)
 
 
+def _mlil_operation_name(expr) -> str:
+    operation = getattr(expr, "operation", None)
+    return str(getattr(operation, "name", operation or ""))
+
+
+def _mlil_signed_constant(expr) -> Optional[int]:
+    if _mlil_operation_name(expr) not in ("MLIL_CONST", "MLIL_CONST_PTR"):
+        return None
+    try:
+        value = int(expr.constant)
+        width = max(1, int(expr.size))
+    except Exception:
+        return None
+    bits = width * 8
+    sign = 1 << (bits - 1)
+    mask = (1 << bits) - 1
+    value &= mask
+    return value - (1 << bits) if value & sign else value
+
+
+def _mlil_ssa_var_origins(
+    il,
+    ssa_var,
+    parameter_indexes: dict,
+    *,
+    depth: int,
+    seen: frozenset,
+) -> frozenset[tuple[int, int]]:
+    """Resolve one SSA value to parameter-index/constant-offset origins."""
+
+    if depth > 16 or ssa_var in seen:
+        return frozenset()
+    next_seen = seen | {ssa_var}
+    try:
+        definition = il.get_ssa_var_definition(ssa_var)
+    except Exception:
+        definition = None
+    if definition is None:
+        parameter_index = parameter_indexes.get(getattr(ssa_var, "var", None))
+        if parameter_index is None or int(getattr(ssa_var, "version", -1)) != 0:
+            return frozenset()
+        return frozenset(((parameter_index, 0),))
+
+    operation = _mlil_operation_name(definition)
+    if operation == "MLIL_SET_VAR_SSA":
+        return _mlil_pointer_origins(
+            il,
+            definition.src,
+            parameter_indexes,
+            depth=depth + 1,
+            seen=next_seen,
+        )
+    if operation == "MLIL_VAR_PHI":
+        origins = set()
+        for source in definition.src:
+            origins.update(
+                _mlil_ssa_var_origins(
+                    il,
+                    source,
+                    parameter_indexes,
+                    depth=depth + 1,
+                    seen=next_seen,
+                )
+            )
+        return frozenset(origins)
+    return frozenset()
+
+
+def _offset_mlil_origins(
+    origins: frozenset[tuple[int, int]], delta: int
+) -> frozenset[tuple[int, int]]:
+    return frozenset(
+        (parameter_index, offset + delta)
+        for parameter_index, offset in origins
+    )
+
+
+def _mlil_pointer_origins(
+    il,
+    expr,
+    parameter_indexes: dict,
+    *,
+    depth: int = 0,
+    seen: frozenset = frozenset(),
+) -> frozenset[tuple[int, int]]:
+    """Resolve pointer arithmetic without changing the IL shown to users."""
+
+    if expr is None or depth > 16:
+        return frozenset()
+    operation = _mlil_operation_name(expr)
+    if operation == "MLIL_VAR_SSA":
+        return _mlil_ssa_var_origins(
+            il,
+            expr.src,
+            parameter_indexes,
+            depth=depth,
+            seen=seen,
+        )
+    if operation in ("MLIL_ZX", "MLIL_SX", "MLIL_LOW_PART"):
+        return _mlil_pointer_origins(
+            il,
+            expr.src,
+            parameter_indexes,
+            depth=depth + 1,
+            seen=seen,
+        )
+    if operation in ("MLIL_ADD", "MLIL_SUB"):
+        left_constant = _mlil_signed_constant(expr.left)
+        right_constant = _mlil_signed_constant(expr.right)
+        if right_constant is not None:
+            origins = _mlil_pointer_origins(
+                il,
+                expr.left,
+                parameter_indexes,
+                depth=depth + 1,
+                seen=seen,
+            )
+            delta = right_constant if operation == "MLIL_ADD" else -right_constant
+            return _offset_mlil_origins(origins, delta)
+        if operation == "MLIL_ADD" and left_constant is not None:
+            origins = _mlil_pointer_origins(
+                il,
+                expr.right,
+                parameter_indexes,
+                depth=depth + 1,
+                seen=seen,
+            )
+            return _offset_mlil_origins(origins, left_constant)
+        return frozenset()
+    if operation == "MLIL_AND":
+        left_constant = _mlil_signed_constant(expr.left)
+        right_constant = _mlil_signed_constant(expr.right)
+        masks = {-1, 0xFFFF, 0xFFFFF, 0xFFFFFFFF}
+        if right_constant in masks:
+            return _mlil_pointer_origins(
+                il,
+                expr.left,
+                parameter_indexes,
+                depth=depth + 1,
+                seen=seen,
+            )
+        if left_constant in masks:
+            return _mlil_pointer_origins(
+                il,
+                expr.right,
+                parameter_indexes,
+                depth=depth + 1,
+                seen=seen,
+            )
+    return frozenset()
+
+
+def _function_parameter_variables(func) -> tuple:
+    try:
+        variables = func.parameter_vars
+        return tuple(getattr(variables, "vars", variables))
+    except Exception:
+        return ()
+
+
+def _struct_accesses_by_parameter(func) -> dict[int, list[tuple[int, int]]]:
+    """Collect bounded field offsets and widths from mapped MLIL SSA."""
+
+    if bool(getattr(func, "has_user_type", False)):
+        return {}
+    try:
+        il = func.mapped_medium_level_il
+        if il is None:
+            return {}
+        il = il.ssa_form
+    except Exception:
+        return {}
+
+    parameter_variables = _function_parameter_variables(func)
+    try:
+        parameter_count = len(tuple(func.type.parameters))
+    except Exception:
+        return {}
+    parameter_indexes = {
+        variable: index
+        for index, variable in enumerate(parameter_variables[:parameter_count])
+    }
+    if not parameter_indexes:
+        return {}
+
+    accesses: dict[int, list[tuple[int, int]]] = {}
+    seen_expressions = set()
+    for block in il:
+        for instruction in block:
+            for expr in instruction.traverse(lambda item: item):
+                expr_index = getattr(expr, "expr_index", None)
+                if expr_index in seen_expressions:
+                    continue
+                seen_expressions.add(expr_index)
+                operation = _mlil_operation_name(expr)
+                address_expr = None
+                width = 0
+                extra_offset = 0
+                if operation in ("MLIL_LOAD_SSA", "MLIL_LOAD"):
+                    address_expr = expr.src
+                    width = int(expr.size)
+                elif operation in ("MLIL_STORE_SSA", "MLIL_STORE"):
+                    address_expr = expr.dest
+                    width = int(expr.size)
+                elif operation in ("MLIL_LOAD_STRUCT_SSA", "MLIL_LOAD_STRUCT"):
+                    address_expr = expr.src
+                    width = int(expr.size)
+                    extra_offset = int(expr.offset)
+                elif operation in ("MLIL_STORE_STRUCT_SSA", "MLIL_STORE_STRUCT"):
+                    address_expr = expr.dest
+                    width = int(expr.size)
+                    extra_offset = int(expr.offset)
+                elif operation in ("MLIL_INTRINSIC_SSA", "MLIL_INTRINSIC"):
+                    intrinsic_name = str(getattr(expr.intrinsic, "name", ""))
+                    if intrinsic_name not in ("load20", "store20"):
+                        continue
+                    params = tuple(expr.params)
+                    if not params:
+                        continue
+                    address_expr = params[0]
+                    width = 4
+                else:
+                    continue
+
+                if address_expr is None or width not in (1, 2, 4):
+                    continue
+                origins = _mlil_pointer_origins(
+                    il,
+                    address_expr,
+                    parameter_indexes,
+                )
+                if len(origins) != 1:
+                    continue
+                parameter_index, offset = next(iter(origins))
+                offset += extra_offset
+                if (
+                    offset < 0
+                    or offset > STRUCT_RECOVERY_MAX_OFFSET
+                    or offset + width > STRUCT_RECOVERY_MAX_OFFSET + 1
+                ):
+                    continue
+                accesses.setdefault(parameter_index, []).append((offset, width))
+    return accesses
+
+
+def _unambiguous_struct_fields(
+    accesses: Sequence[tuple[int, int]],
+) -> tuple[_StructFieldCandidate, ...]:
+    widths_by_offset: dict[int, set[int]] = {}
+    for offset, width in accesses:
+        widths_by_offset.setdefault(offset, set()).add(width)
+
+    fields = [
+        _StructFieldCandidate(offset, next(iter(widths)))
+        for offset, widths in widths_by_offset.items()
+        if len(widths) == 1
+    ]
+    overlapping = set()
+    for index, field in enumerate(fields):
+        for other in fields[index + 1 :]:
+            if (
+                field.offset < other.offset + other.width
+                and other.offset < field.offset + field.width
+            ):
+                overlapping.add(field.offset)
+                overlapping.add(other.offset)
+    return tuple(
+        sorted(
+            (field for field in fields if field.offset not in overlapping),
+            key=lambda field: field.offset,
+        )
+    )
+
+
+def _fields_look_like_array(fields: Sequence[_StructFieldCandidate]) -> bool:
+    if len(fields) < 3 or len({field.width for field in fields}) != 1:
+        return False
+    width = fields[0].width
+    return all(
+        right.offset - left.offset == width
+        for left, right in zip(fields, fields[1:])
+    )
+
+
+def _struct_candidate_for_parameter(
+    func,
+    parameter_index: int,
+    accesses: Sequence[tuple[int, int]],
+) -> Optional[_StructCandidate]:
+    fields = _unambiguous_struct_fields(accesses)
+    if (
+        len(fields) < STRUCT_RECOVERY_MIN_FIELDS
+        or len(fields) > STRUCT_RECOVERY_MAX_FIELDS
+        or _fields_look_like_array(fields)
+    ):
+        return None
+    try:
+        parameters = tuple(func.type.parameters)
+        parameter = parameters[parameter_index]
+    except Exception:
+        return None
+    pointer_width = int(getattr(parameter.type, "width", 0))
+    if pointer_width not in (2, 4):
+        return None
+
+    variables = _function_parameter_variables(func)
+    register_name = None
+    if parameter_index < len(variables):
+        variable = variables[parameter_index]
+        if (
+            getattr(variable, "source_type", None)
+            == VariableSourceType.RegisterVariableSourceType
+        ):
+            try:
+                register_name = str(func.arch.get_reg_name(variable.storage))
+            except Exception:
+                register_name = None
+    suffix = register_name or f"arg{parameter_index + 1}"
+    suffix = re.sub(r"[^A-Za-z0-9_]", "_", suffix)
+    type_name = f"msp430x_auto_struct_{int(func.start):05x}_{suffix}"
+    return _StructCandidate(
+        int(func.start),
+        parameter_index,
+        str(parameter.name or f"arg{parameter_index + 1}"),
+        pointer_width,
+        type_name,
+        fields,
+    )
+
+
+def _msp430x_struct_candidates(func) -> tuple[_StructCandidate, ...]:
+    accesses = _struct_accesses_by_parameter(func)
+    candidates = []
+    for parameter_index, parameter_accesses in sorted(accesses.items()):
+        candidate = _struct_candidate_for_parameter(
+            func,
+            parameter_index,
+            parameter_accesses,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
+def _structure_layout(var_type) -> tuple:
+    try:
+        return (
+            int(var_type.width),
+            tuple(
+                (member.offset, member.type.width, member.name)
+                for member in var_type.members
+            ),
+        )
+    except Exception:
+        return ()
+
+
+def _candidate_structure(candidate: _StructCandidate):
+    return StructureBuilder.create(
+        members=[
+            StructureMember(
+                Type.int(field.width, False),
+                f"field_{field.offset:02x}",
+                field.offset,
+            )
+            for field in candidate.fields
+        ],
+        width=candidate.width,
+    )
+
+
+def _replaceable_auto_parameter_type(parameter_type, desired_pointer) -> bool:
+    if str(parameter_type) == str(desired_pointer):
+        return True
+    try:
+        if parameter_type.type_class == TypeClass.IntegerTypeClass:
+            return parameter_type.width in (2, 4)
+        if parameter_type.type_class != TypeClass.PointerTypeClass:
+            return False
+        return parameter_type.target.type_class == TypeClass.VoidTypeClass
+    except Exception:
+        return False
+
+
+def _apply_msp430x_struct_candidate(
+    bv: BinaryView,
+    func,
+    candidate: _StructCandidate,
+) -> bool:
+    if bool(getattr(func, "has_user_type", False)):
+        return False
+    type_id = Type.generate_auto_type_id(
+        STRUCT_RECOVERY_AUTO_TYPE_SOURCE,
+        candidate.type_name,
+    )
+    try:
+        registered_name = bv.get_type_name_by_id(type_id)
+    except Exception:
+        registered_name = None
+    desired_structure = _candidate_structure(candidate)
+    type_changed = False
+    if registered_name is None:
+        registered_name = bv.define_type(
+            type_id,
+            candidate.type_name,
+            desired_structure,
+        )
+        type_changed = True
+    else:
+        existing_structure = bv.get_type_by_name(registered_name)
+        is_auto = True
+        try:
+            is_auto = bool(bv.is_type_auto_defined(registered_name))
+        except Exception:
+            pass
+        if is_auto and _structure_layout(existing_structure) != _structure_layout(
+            desired_structure
+        ):
+            registered_name = bv.define_type(
+                type_id,
+                candidate.type_name,
+                desired_structure,
+            )
+            type_changed = True
+
+    named_structure = Type.named_type_from_registered_type(bv, registered_name)
+    desired_pointer = Type.pointer_of_width(candidate.pointer_width, named_structure)
+    try:
+        parameters = list(func.type.parameters)
+        current_parameter = parameters[candidate.parameter_index]
+    except Exception:
+        return type_changed
+    if not _replaceable_auto_parameter_type(current_parameter.type, desired_pointer):
+        return type_changed
+    if str(current_parameter.type) == str(desired_pointer):
+        return type_changed
+
+    parameters[candidate.parameter_index] = FunctionParameter(
+        desired_pointer,
+        current_parameter.name,
+        current_parameter.location,
+        current_parameter.location_source,
+    )
+    function_type = func.type.mutable_copy()
+    function_type.parameters = parameters
+    setter = getattr(func, "apply_auto_discovered_type", None)
+    if setter is not None:
+        setter(function_type)
+    elif hasattr(func, "set_auto_type"):
+        func.set_auto_type(function_type)
+    else:
+        return type_changed
+    marker = getattr(func, "mark_updates_required", None)
+    if marker is not None:
+        try:
+            marker(FunctionUpdateType.IncrementalAutoFunctionUpdate)
+        except Exception:
+            pass
+    return True
+
+
+def _recover_msp430x_structures(
+    bv: BinaryView,
+    *,
+    verbose: bool = False,
+) -> int:
+    """Create conservative auto structures from fixed parameter accesses."""
+
+    recovered = 0
+    try:
+        functions = tuple(bv.functions)
+    except Exception:
+        return 0
+    for func in functions:
+        if str(getattr(func, "arch", "")).lower() != "msp430x":
+            continue
+        for candidate in _msp430x_struct_candidates(func):
+            try:
+                changed = _apply_msp430x_struct_candidate(bv, func, candidate)
+            except Exception as exc:
+                log_warn(
+                    f"Could not recover MSP430X structure for {func.name} "
+                    f"parameter {candidate.parameter_name}: {exc}"
+                )
+                continue
+            if changed:
+                recovered += 1
+                if verbose:
+                    offsets = ", ".join(
+                        f"{field.offset:#x}:{field.width}"
+                        for field in candidate.fields
+                    )
+                    print(
+                        f"Recovered {candidate.type_name} for {func.name} "
+                        f"parameter {candidate.parameter_name} ({offsets})."
+                    )
+    return recovered
+
+
+def recover_msp430x_structures(bv: BinaryView) -> None:
+    """User command for rerunning conservative MSP430X structure recovery."""
+
+    recovered = _recover_msp430x_structures(bv, verbose=True)
+    if recovered:
+        _update_analysis(bv)
+    else:
+        print("No new conservative MSP430X structure candidates were found.")
+
+
 def _decoded_return_kind(ins) -> Optional[str]:
     """Return the architectural return kind for a decoded instruction."""
 
@@ -7680,6 +8222,9 @@ def _refresh_msp430x_analysis(
         bv,
         verbose=verbose,
     )
+    recovered_structures = _recover_msp430x_structures(bv, verbose=verbose)
+    if recovered_structures:
+        _update_analysis(bv)
 
     if verbose and arch is None:
         print(
@@ -7698,7 +8243,8 @@ def _refresh_msp430x_analysis(
         f"clustered_high_bank_functions={clustered_high_bank_functions}, "
         f"address_word_recovery={address_word_recovery}, "
         f"abi_helper_functions={abi_helper_functions}, "
-        f"string_call_recovery_passes={string_call_recovery_passes}"
+        f"string_call_recovery_passes={string_call_recovery_passes}, "
+        f"recovered_structures={recovered_structures}"
     )
     return vector_functions
 
@@ -7983,18 +8529,23 @@ def _run_automatic_string_call_recovery(bv: BinaryView) -> None:
         bv,
         verbose=False,
     )
+    recovered_structures = _recover_msp430x_structures(bv, verbose=False)
+    if recovered_structures:
+        _update_analysis(bv)
     if (
         orphan_cluster_functions
         or any(address_word_recovery)
         or abi_helper_functions
         or any(recovered_per_pass)
+        or recovered_structures
     ):
         log_info(
             "Automatically applied MSP430X post-analysis recovery; "
             f"clustered_high_bank_functions={orphan_cluster_functions}, "
             f"address_word_recovery={address_word_recovery}, "
             f"abi_helper_functions={abi_helper_functions}, "
-            f"string_recovery_passes={recovered_per_pass}"
+            f"string_recovery_passes={recovered_per_pass}, "
+            f"recovered_structures={recovered_structures}"
         )
 
 
@@ -8007,7 +8558,7 @@ def _schedule_automatic_string_call_recovery(bv: BinaryView):
         bv,
         progress_text=(
             "Recovering MSP430X high-bank functions, indirect targets, "
-            "and R12 string call sites"
+            "R12 string call sites, and structures"
         ),
         action=_run_automatic_string_call_recovery,
     )
@@ -8513,6 +9064,14 @@ try:
         "MSP430F5438\\Report TLV device descriptors and CRC16",
         "Print factory device descriptors, calibration records, peripheral IDs, and stored TLV CRC16 validity.",
         report_msp430_tlv,
+    )
+    PluginCommand.register(
+        "MSP430F5438\\Recover inferred structures",
+        "Create conservative auto structures from fixed-offset MSP430X parameter accesses without replacing user types.",
+        _background_command(
+            recover_msp430x_structures,
+            "Recovering conservative MSP430X structures",
+        ),
     )
     PluginCommand.register(
         "MSP430F5438\\Re-run MSP430X analysis",
