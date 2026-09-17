@@ -110,6 +110,10 @@ class AutomaticStringRecoveryTests(unittest.TestCase):
 
         with mock.patch.object(
             memory_map,
+            "_stabilize_false_callee_saved_parameters",
+            return_value=(0,),
+        ) as signatures, mock.patch.object(
+            memory_map,
             "_seed_referenced_address_word_targets",
             return_value=(0, 0, 0),
         ) as indirect_targets, mock.patch.object(
@@ -132,6 +136,7 @@ class AutomaticStringRecoveryTests(unittest.TestCase):
 
         indirect_targets.assert_called_once_with(view, verbose=False)
         helpers.assert_called_once_with(view, verbose=False)
+        signatures.assert_called_once_with(view, verbose=False)
         stabilize.assert_called_once()
         self.assertIs(stabilize.call_args.args[0], view)
         structures.assert_called_once_with(view, verbose=False)
@@ -141,6 +146,10 @@ class AutomaticStringRecoveryTests(unittest.TestCase):
         view = object()
 
         with mock.patch.object(
+            memory_map,
+            "_stabilize_false_callee_saved_parameters",
+            return_value=(0,),
+        ), mock.patch.object(
             memory_map,
             "_seed_referenced_address_word_targets",
             return_value=(1, 1, 1),
@@ -173,6 +182,10 @@ class AutomaticStringRecoveryTests(unittest.TestCase):
             return_value=0,
         ), mock.patch.object(
             memory_map,
+            "_stabilize_false_callee_saved_parameters",
+            return_value=(0,),
+        ), mock.patch.object(
+            memory_map,
             "_seed_referenced_address_word_targets",
             return_value=(0, 0, 0),
         ), mock.patch.object(
@@ -194,6 +207,41 @@ class AutomaticStringRecoveryTests(unittest.TestCase):
             memory_map._run_automatic_string_call_recovery(view)
 
         update.assert_called_once_with(view)
+
+    def test_background_action_does_not_duplicate_signature_cleanup_updates(self):
+        view = object()
+
+        with mock.patch.object(
+            memory_map,
+            "_seed_strong_raw_orphan_function_clusters",
+            return_value=0,
+        ), mock.patch.object(
+            memory_map,
+            "_seed_referenced_address_word_targets",
+            return_value=(0, 0, 0),
+        ), mock.patch.object(
+            memory_map,
+            "_apply_msp430_abi_helper_metadata",
+            return_value=0,
+        ), mock.patch.object(
+            memory_map,
+            "_stabilize_false_callee_saved_parameters",
+            return_value=(2, 0),
+        ), mock.patch.object(
+            memory_map,
+            "_stabilize_direct_string_call_parameters",
+            return_value=(0,),
+        ), mock.patch.object(
+            memory_map,
+            "_recover_msp430x_structures",
+            return_value=0,
+        ), mock.patch.object(
+            memory_map,
+            "_update_analysis",
+        ) as update:
+            memory_map._run_automatic_string_call_recovery(view)
+
+        update.assert_not_called()
 
     def test_initial_analysis_callback_registration_is_process_wide_and_once(self):
         marker = memory_map._AUTO_STRING_RECOVERY_MARKER

@@ -238,14 +238,24 @@ string tables from decompiling into noisy carry/flag-heavy pseudocode or tiny
 individual character arrays instead of coalescing the entire pool into one
 outer variable that hides interior strings.
 
+Binary Ninja can infer an entry value saved by an MSP430 prologue as a custom
+R4-R10 parameter even when the function only restores that register before
+returning. The post-analysis pass removes an auto parameter only when its entry
+SSA value has exactly one use in a contiguous prologue `PUSH`/`PUSHM` and its
+exit value is proven to be the same entry register. User function types,
+semantic register uses, uncertain exits, and non-prologue saves are unchanged.
+The common `SUBC Rn,Rn` carry-to-mask idiom is lifted directly as `C - 1`, so
+its canceled register value does not become a spurious input; its address-width
+form uses a compact intrinsic instead of exposing a raw `0xfffff` mask.
+
 Binary Ninja can also hide a valid string load when an untyped callee is
-auto-inferred with no parameters or with false R4-R10 inputs from its
-save/restore prologue: the call prototype omits R12, so HLIL removes the proven
-R12 assignment as dead. After initial analysis completes for a mapped-raw or
-prepared ELF view, MSP430X Lens automatically recovers direct CALL/CALLA sites
-whose R12 value points to a fully backed, printable C string. It adds a durable
-local call-site type adjustment to the proven call while retaining uncertain
-auto-inferred inputs and no-return behavior. Strings with printf-style
+auto-inferred with no parameters: the call prototype omits R12, so HLIL removes
+the proven R12 assignment as dead. After initial analysis completes for a
+mapped-raw or prepared ELF view, MSP430X Lens automatically recovers
+direct CALL/CALLA sites whose R12 value points to a fully backed, printable C
+string. It adds a durable local call-site type adjustment to the proven call
+while retaining uncertain auto-inferred inputs and no-return behavior. Strings
+with printf-style
 conversions are named `format`, but the pass does not infer ellipsis or extra
 arguments from `%` text alone. Per the MSP430 EABI, variadic calls place the
 last declared argument and all following arguments on the stack; a string proven

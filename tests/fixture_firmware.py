@@ -154,9 +154,9 @@ CINIT_PAYLOAD_ADDRESSES = tuple(
 INDIRECT_CALL_WRAPPER = bytes.fromhex("1b 42 00 e0 8b 12 30 41")
 INDIRECT_CALL_TARGET = bytes.fromhex("03 43 30 41")
 
-# A reduced version of the real R12 string-call failure. Binary Ninja infers
-# the target's callee-save PUSH/POP pairs as R4-R6 parameters and otherwise
-# drops the proven R12 string assignment from HLIL.
+# A reduced version of the real R12 string-call failure. The target has no R12
+# formal parameter, so Binary Ninja otherwise drops the proven string
+# assignment from HLIL. Its save/restore pairs must not become false inputs.
 STRING_CALLER = bytes.fromhex(
     "04 12 05 12 06 12 "
     "3c 40 00 6a "

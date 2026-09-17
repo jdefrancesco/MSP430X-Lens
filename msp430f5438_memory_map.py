@@ -23,6 +23,7 @@ from binaryninja import (
     SegmentFlag,
     Settings,
     SettingsScope,
+    SSAVariable,
     StructureBuilder,
     StructureMember,
     Symbol,
@@ -321,6 +322,7 @@ EXECUTABLE_SEGMENT_SCAN_MAX_BYTES = 0x200000
 ASCII_STRING_MIN_LEN = 8
 STRING_CALL_MAX_BYTES = 0x400
 STRING_CALL_RECOVERY_MAX_PASSES = 4
+CALLEE_SAVE_PARAMETER_CLEANUP_MAX_PASSES = 4
 STRUCT_RECOVERY_MAX_OFFSET = 0x100
 STRUCT_RECOVERY_MAX_FIELDS = 64
 STRUCT_RECOVERY_MIN_FIELDS = 2
@@ -5543,14 +5545,233 @@ def _parameter_location_register_name(arch, parameter) -> Optional[str]:
     return None
 
 
+def _decoded_push_registers(ins) -> tuple[int, ...]:
+    """Return registers saved by one exact PUSH/PUSHM instruction."""
+
+    if (
+        getattr(ins, "fmt", None) == "single"
+        and getattr(ins, "mnemonic", None) == "push"
+        and getattr(getattr(ins, "src", None), "kind", None) == "reg"
+    ):
+        return (int(ins.src.reg),)
+
+    if (
+        getattr(ins, "fmt", None) == "multi"
+        and str(getattr(ins, "mnemonic", "")).startswith("pushm.")
+        and getattr(getattr(ins, "src", None), "kind", None) == "imm"
+        and getattr(getattr(ins, "dst", None), "kind", None) == "reg"
+    ):
+        try:
+            count = int(ins.src.value)
+            first_register = int(ins.dst.reg)
+        except (TypeError, ValueError):
+            return ()
+        if not 1 <= count <= 16:
+            return ()
+        return tuple((first_register - index) & 0xF for index in range(count))
+
+    return ()
+
+
+def _callee_save_prologue_pushes(bv: BinaryView, func, decoder) -> dict[int, set[int]]:
+    """Map registers to exact save addresses in a contiguous entry prologue."""
+
+    try:
+        addr = int(func.start)
+        instruction_addresses = set(_function_instruction_addresses(func))
+        arch = func.arch
+    except Exception:
+        return {}
+
+    pushes: dict[int, set[int]] = {}
+    while addr in instruction_addresses:
+        data = _read_contiguous_backed_bytes(bv, addr, 16)
+        if len(data) < 2:
+            break
+        try:
+            ins = decoder(data, addr)
+            registers = _decoded_push_registers(ins)
+            length = int(ins.length)
+        except Exception:
+            break
+        if not registers or length < 2:
+            break
+        try:
+            register_names = {str(arch.get_reg_name(reg)) for reg in registers}
+        except Exception:
+            break
+        if not register_names.issubset(_MSP430_CALLEE_SAVED_REGS):
+            break
+        for register in registers:
+            pushes.setdefault(register, set()).add(addr)
+        addr += length
+    return pushes
+
+
+def _false_callee_save_parameter_registers(
+    bv: BinaryView,
+    func,
+    decoder,
+) -> frozenset[str]:
+    """Prove which inferred parameters are only callee-save bookkeeping.
+
+    A candidate must be an auto parameter in R4-R10, have exactly one entry-SSA
+    use at an exact contiguous prologue PUSH/PUSHM, and leave the function with
+    its original entry value. Any semantic use, uncertain exit, or API failure
+    keeps the parameter.
+    """
+
+    if bool(getattr(func, "has_user_type", False)):
+        return frozenset()
+    try:
+        arch = func.arch
+        parameters = tuple(func.type.parameters)
+        parameter_vars = getattr(func.parameter_vars, "vars", func.parameter_vars)
+        parameter_vars = tuple(parameter_vars)
+        ssa = func.mlil.ssa_form
+    except Exception:
+        return frozenset()
+
+    prologue_pushes = _callee_save_prologue_pushes(bv, func, decoder)
+    if not prologue_pushes:
+        return frozenset()
+
+    variables_by_storage = {}
+    for variable in parameter_vars:
+        if (
+            getattr(variable, "source_type", None)
+            != VariableSourceType.RegisterVariableSourceType
+        ):
+            continue
+        storage = getattr(variable, "storage", None)
+        if storage is None or storage in variables_by_storage:
+            continue
+        variables_by_storage[storage] = variable
+
+    removable = set()
+    for parameter in parameters:
+        register_name = _parameter_location_register_name(arch, parameter)
+        if register_name not in _MSP430_CALLEE_SAVED_REGS:
+            continue
+        try:
+            storage = int(arch.get_reg_index(register_name))
+            variable = variables_by_storage[storage]
+            uses = tuple(ssa.get_ssa_var_uses(SSAVariable(variable, 0)))
+            exit_value = func.get_reg_value_at_exit(register_name)
+        except Exception:
+            continue
+        if len(uses) != 1 or int(getattr(uses[0], "address", -1)) not in (
+            prologue_pushes.get(storage) or ()
+        ):
+            continue
+        if (
+            getattr(exit_value, "type", None) != RegisterValueType.EntryValue
+            or int(getattr(exit_value, "value", -1)) != storage
+        ):
+            continue
+        removable.add(register_name)
+    return frozenset(removable)
+
+
+def _remove_false_callee_saved_parameters(
+    bv: BinaryView,
+    *,
+    verbose: bool = False,
+) -> int:
+    """Remove only auto parameters proven to be callee-save artifacts."""
+
+    decoder, _branch_edges = _msp430x_decode_api()
+    if decoder is None:
+        return 0
+
+    removed = 0
+    try:
+        functions = tuple(bv.functions)
+    except Exception:
+        return 0
+    for func in functions:
+        if str(getattr(func, "arch", "")).lower() != "msp430x":
+            continue
+        registers = _false_callee_save_parameter_registers(bv, func, decoder)
+        if not registers or bool(getattr(func, "has_user_type", False)):
+            continue
+        try:
+            parameters = tuple(func.type.parameters)
+            retained = [
+                parameter
+                for parameter in parameters
+                if _parameter_location_register_name(func.arch, parameter)
+                not in registers
+            ]
+            if len(retained) == len(parameters):
+                continue
+            function_type = func.type.mutable_copy()
+            function_type.parameters = retained
+            setter = getattr(func, "apply_auto_discovered_type", None)
+            if setter is not None:
+                setter(function_type)
+            elif hasattr(func, "set_auto_type"):
+                func.set_auto_type(function_type)
+            else:
+                continue
+        except Exception as exc:
+            log_warn(
+                f"Could not remove false callee-save parameters from "
+                f"{getattr(func, 'name', '<unknown>')}: {exc}"
+            )
+            continue
+
+        marker = getattr(func, "mark_updates_required", None)
+        if marker is not None:
+            try:
+                marker(FunctionUpdateType.IncrementalAutoFunctionUpdate)
+            except Exception:
+                pass
+        count = len(parameters) - len(retained)
+        removed += count
+        if verbose:
+            names = ", ".join(sorted(registers))
+            print(
+                f"Removed {count} false callee-save parameter(s) from "
+                f"{func.name}: {names}."
+            )
+    return removed
+
+
+def _stabilize_false_callee_saved_parameters(
+    bv: BinaryView,
+    *,
+    verbose: bool = False,
+    max_passes: int = CALLEE_SAVE_PARAMETER_CLEANUP_MAX_PASSES,
+) -> tuple[int, ...]:
+    """Remove newly provable callee-save artifacts to a bounded fixed point."""
+
+    if max_passes <= 0:
+        return ()
+
+    removed_per_pass = []
+    for _pass_index in range(max_passes):
+        removed = _remove_false_callee_saved_parameters(bv, verbose=verbose)
+        removed_per_pass.append(removed)
+        if removed == 0:
+            return tuple(removed_per_pass)
+        _update_analysis(bv)
+
+    log_warn(
+        "Callee-save parameter cleanup reached its bounded analysis-pass limit "
+        f"({max_passes}); run Re-run MSP430X analysis again if a proven "
+        "save/restore artifact remains."
+    )
+    return tuple(removed_per_pass)
+
+
 def _preservable_auto_parameters(func) -> Optional[tuple]:
     """Keep only the narrow auto-prototype shape that causes lost string inputs.
 
-    Binary Ninja can infer either no inputs or PUSH/POP preservation of R4-R10
-    as formal inputs for this 20-bit architecture. We retain those uncertain
-    inputs rather than deleting them, but refuse to rewrite a user type or an
-    auto prototype containing stack, implicit, caller-saved, or otherwise
-    meaningful parameters.
+    Older databases and noncanonical save/restore forms can contain R4-R10 as
+    formal inputs. We retain those uncertain inputs rather than deleting them,
+    but refuse to rewrite a user type or an auto prototype containing stack,
+    implicit, caller-saved, or otherwise meaningful parameters.
     """
 
     if bool(getattr(func, "has_user_type", False)):
@@ -8234,6 +8455,10 @@ def _refresh_msp430x_analysis(
     abi_helper_functions = _apply_msp430_abi_helper_metadata(bv, verbose=verbose)
     if abi_helper_functions:
         _update_analysis(bv)
+    callee_save_cleanup_passes = _stabilize_false_callee_saved_parameters(
+        bv,
+        verbose=verbose,
+    )
     string_call_recovery_passes = _stabilize_direct_string_call_parameters(
         bv,
         verbose=verbose,
@@ -8259,6 +8484,7 @@ def _refresh_msp430x_analysis(
         f"clustered_high_bank_functions={clustered_high_bank_functions}, "
         f"address_word_recovery={address_word_recovery}, "
         f"abi_helper_functions={abi_helper_functions}, "
+        f"callee_save_cleanup_passes={callee_save_cleanup_passes}, "
         f"string_call_recovery_passes={string_call_recovery_passes}, "
         f"recovered_structures={recovered_structures}"
     )
@@ -8541,6 +8767,10 @@ def _run_automatic_string_call_recovery(bv: BinaryView) -> None:
         or abi_helper_functions
     ):
         _update_analysis(bv)
+    callee_save_cleanup_passes = _stabilize_false_callee_saved_parameters(
+        bv,
+        verbose=False,
+    )
     recovered_per_pass = _stabilize_direct_string_call_parameters(
         bv,
         verbose=False,
@@ -8552,6 +8782,7 @@ def _run_automatic_string_call_recovery(bv: BinaryView) -> None:
         orphan_cluster_functions
         or any(address_word_recovery)
         or abi_helper_functions
+        or any(callee_save_cleanup_passes)
         or any(recovered_per_pass)
         or recovered_structures
     ):
@@ -8560,6 +8791,7 @@ def _run_automatic_string_call_recovery(bv: BinaryView) -> None:
             f"clustered_high_bank_functions={orphan_cluster_functions}, "
             f"address_word_recovery={address_word_recovery}, "
             f"abi_helper_functions={abi_helper_functions}, "
+            f"callee_save_cleanup_passes={callee_save_cleanup_passes}, "
             f"string_recovery_passes={recovered_per_pass}, "
             f"recovered_structures={recovered_structures}"
         )
@@ -8574,7 +8806,7 @@ def _schedule_automatic_string_call_recovery(bv: BinaryView):
         bv,
         progress_text=(
             "Recovering MSP430X high-bank functions, indirect targets, "
-            "R12 string call sites, and structures"
+            "function signatures, R12 string call sites, and structures"
         ),
         action=_run_automatic_string_call_recovery,
     )

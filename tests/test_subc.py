@@ -97,6 +97,46 @@ class SubcTests(unittest.TestCase):
         self.assertEqual(il[0].operation.name, "LLIL_SET_REG")
         self.assertEqual(str(il[0].dest), "temp51")
 
+    def test_self_subc_does_not_read_the_old_register_value(self):
+        # Exact firmware bytes from lcd_draw_text: SUBC R9,R9 is C - 1, so R9's
+        # incoming value cancels and must not become a false function input.
+        il = self._lift(bytes.fromhex("09 79"))
+        r9_reads = [
+            node
+            for _instruction_index, node in self._nested_operations(il)
+            if node.operation.name == "LLIL_REG" and str(node.src) == "r9"
+        ]
+
+        self.assertEqual(r9_reads, [])
+        self.assertEqual(self._carry_reads(il), [(0, "flag:c")])
+        self.assertEqual(str(self._flag_write(il, "v").src), "0")
+
+    def test_self_subc_result_and_flags_depend_only_on_input_carry(self):
+        il = self._lift(bytes.fromhex("09 79"))
+
+        self.assertIn("zx.w(temp51.b) - 1", str(il[-1]))
+        self.assertEqual(str(self._flag_write(il, "z").src), "temp51.b != 0")
+        self.assertEqual(str(self._flag_write(il, "n").src), "temp51.b == 0")
+        self.assertEqual(str(self._flag_write(il, "c").src), "temp51.b != 0")
+
+        # MOV #0,R4; CMP #1,R4 establishes C=0, so SUBC R9,R9 is 0xffff.
+        program = bytes.fromhex("04 43 14 93 09 79 30 41")
+        value = self._reg_value_after(program, 0x4, "r9")
+        self.assertEqual(value.value, 0xFFFF)
+
+    def test_address_self_subc_uses_clean_twenty_bit_intrinsic(self):
+        il = self._lift(bytes.fromhex("00 18 49 79"))
+        text = "\n".join(str(instruction) for instruction in il.instructions)
+        r9_reads = [
+            node
+            for _instruction_index, node in self._nested_operations(il)
+            if node.operation.name == "LLIL_REG" and str(node.src) == "r9"
+        ]
+
+        self.assertEqual(r9_reads, [])
+        self.assertIn("subc_self20", text)
+        self.assertNotIn("0xfffff", text)
+
     def test_subc_uses_full_precision_carry_and_original_source_for_overflow(self):
         cases = (
             ("76 73", "0xff", "0x80"),

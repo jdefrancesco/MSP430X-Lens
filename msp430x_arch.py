@@ -1134,6 +1134,22 @@ def is_popx_alias(ins: Decoded) -> bool:
     )
 
 
+def is_pop_alias(ins: Decoded) -> bool:
+    return (
+        ins.fmt == "double"
+        and ins.ext is None
+        and ins.mnemonic == "mov"
+        and ins.size == 2
+        and ins.src is not None
+        and ins.src.kind == "indirect"
+        and ins.src.reg == 1
+        and ins.src.autoinc
+        and ins.dst is not None
+        and ins.dst.kind in ("reg", "mem", "indexed")
+        and not (ins.dst.kind == "reg" and ins.dst.reg == 0)
+    )
+
+
 def is_pushx_alias(ins: Decoded) -> bool:
     return ins.fmt == "single" and ins.ext is not None and ins.mnemonic == "push"
 
@@ -1426,6 +1442,10 @@ class MSP430XArchitecture(Architecture):
             ],
             [Type.int(4, False), Type.int(1, False), Type.int(1, False)],
         ),
+        "subc_self20": IntrinsicInfo(
+            [IntrinsicInput(Type.int(1, False), "carry")],
+            [Type.int(4, False)],
+        ),
         "rpt_subcw": IntrinsicInfo(
             [
                 IntrinsicInput(Type.int(2, False), "lhs"),
@@ -1555,6 +1575,10 @@ class MSP430XArchitecture(Architecture):
             if is_bra_alias(ins):
                 tokens.extend([tt("inst", "bra"), tt("text", " ")])
                 tokens.extend(operand_tokens(ins.src))
+                return tokens, ins.length
+            if is_pop_alias(ins):
+                tokens.extend([tt("inst", "pop"), tt("text", " ")])
+                tokens.extend(operand_tokens(ins.dst))
                 return tokens, ins.length
             if is_popx_alias(ins):
                 tokens.extend([tt("inst", "popx" + suffix), tt("text", " ")])
@@ -2377,25 +2401,56 @@ class MSP430XArchitecture(Architecture):
         elif op == "subc":
             carry_value = il.const(1, 0) if ins.subc_zero_carry else il.zero_extend(1, il.flag("c"))
             carry_in = self._temp_value(il, 1, 51, carry_value)
-            lhs = self._temp_value(il, size, 18, self._flag_mask_expr(il, size, dst))
-            rhs = self._temp_value(il, size, 19, self._flag_mask_expr(il, size, src))
-            complement = il.xor_expr(size, rhs, il.const(size, mask_for_size(size)))
-            lhs_full = lhs if size == 4 else il.zero_extend(4, lhs)
-            complement_full = complement if size == 4 else il.zero_extend(4, complement)
-            full_result = self._temp_value(
-                il,
-                4,
-                52,
-                il.add(4, il.add(4, lhs_full, complement_full), il.zero_extend(4, carry_in)),
+            # dst + ~dst + C is C - 1; retaining either register read invents
+            # a live-in parameter even though the old value cancels exactly.
+            self_register = (
+                ins.src.kind == "reg"
+                and ins.dst.kind == "reg"
+                and ins.src.reg == ins.dst.reg
+                and ins.dst.reg >= 4
             )
-            result_expr = (
-                il.and_expr(4, full_result, il.const(4, ADDR_MASK))
-                if size == 4
-                else il.low_part(size, full_result)
-            )
-            value = self._temp_value(il, size, 20, result_expr)
-            if update_flags:
-                self._set_subc_flags(il, size, lhs, rhs, value, full_result)
+            if self_register:
+                carry_set = il.compare_not_equal(1, carry_in, il.const(1, 0))
+                carry_clear = il.compare_equal(1, carry_in, il.const(1, 0))
+                if size == 4:
+                    result = LLIL_TEMP(53)
+                    il.append(il.intrinsic([result], "subc_self20", [carry_in]))
+                    value = il.reg(4, result)
+                else:
+                    value = il.sub(
+                        size,
+                        il.zero_extend(size, carry_in),
+                        il.const(size, 1),
+                    )
+                if update_flags:
+                    self._set_flag(il, "z", carry_set)
+                    self._set_flag(il, "n", carry_clear)
+                    self._set_flag(il, "c", carry_set)
+                    self._set_flag(il, "v", il.const(0, 0))
+            else:
+                lhs = self._temp_value(il, size, 18, self._flag_mask_expr(il, size, dst))
+                rhs = self._temp_value(il, size, 19, self._flag_mask_expr(il, size, src))
+                complement = il.xor_expr(size, rhs, il.const(size, mask_for_size(size)))
+                lhs_full = lhs if size == 4 else il.zero_extend(4, lhs)
+                complement_full = complement if size == 4 else il.zero_extend(4, complement)
+                full_result = self._temp_value(
+                    il,
+                    4,
+                    52,
+                    il.add(
+                        4,
+                        il.add(4, lhs_full, complement_full),
+                        il.zero_extend(4, carry_in),
+                    ),
+                )
+                result_expr = (
+                    il.and_expr(4, full_result, il.const(4, ADDR_MASK))
+                    if size == 4
+                    else il.low_part(size, full_result)
+                )
+                value = self._temp_value(il, size, 20, result_expr)
+                if update_flags:
+                    self._set_subc_flags(il, size, lhs, rhs, value, full_result)
             self._write_operand(il, ins.dst, size, value, write_addr=dst_write_addr)
         elif op == "bit":
             value = self._mask_expr(il, size, il.and_expr(size, dst, src))
@@ -2988,7 +3043,7 @@ class MSP430XArchitecture(Architecture):
                     self._set_logic_flags(il, 2, value)
                     self._write_operand(il, ins.dst, 2, value)
             elif ins.mnemonic == "push":
-                if is_pushx_alias(ins) and size in (2, 4) and ins.src.kind == "reg":
+                if size in (2, 4) and ins.src.kind == "reg":
                     il.append(il.push(size, self._reg_value(il, ins.src.reg, size)))
                 else:
                     src = self._read_operand(il, ins.src, size)
@@ -3015,6 +3070,10 @@ class MSP430XArchitecture(Architecture):
                 return ins.length
 
             op = ins.mnemonic
+            if is_pop_alias(ins) and ins.dst.kind == "reg":
+                self._write_reg_value(il, ins.dst.reg, 2, il.pop(2))
+                return ins.length
+
             if is_popx_alias(ins) and size in (2, 4) and ins.dst.kind == "reg":
                 self._write_reg_value(il, ins.dst.reg, size, il.pop(size))
                 return ins.length

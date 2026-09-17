@@ -222,6 +222,10 @@ class RawLoaderIntegrationTests(unittest.TestCase):
                 memory_map._register_parameter_names(string_target),
             )
             self.assertEqual(
+                memory_map._register_parameter_names(string_target),
+                set(),
+            )
+            self.assertEqual(
                 memory_map._recover_direct_string_call_parameters(view),
                 0,
             )

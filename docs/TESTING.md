@@ -214,6 +214,13 @@ changes made after the automatic pass. Reopening an executable MSP430X ELF
 BNDB should schedule the same recovery even though Binary Ninja does not save
 the plugin's auto preparation marker in databases.
 
+At fixture function `0x6e40`, confirm the automatic type has no R4-R6
+parameters: those registers are only saved by the opening `PUSH` instructions
+and restored before `RET`. The call at `0x6e0a` should consequently show only
+its recovered string argument, with no trailing callee-save register argument.
+An auto parameter must remain when its entry value has any semantic SSA use,
+and user-authored function types must never be changed by this cleanup.
+
 The raw fixtures include this exact structure case at `0x6f40`. More generally,
 firmware with two or more non-overlapping fixed-offset accesses from one
 function parameter should receive a stable `msp430x_auto_struct_*` pointer

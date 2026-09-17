@@ -89,6 +89,11 @@ class StringCallRecoveryTests(unittest.TestCase):
         self.assertIsNotNone(view.add_function(CALLER_ADDRESS))
         self.assertIsNotNone(view.add_function(CALLEE_ADDRESS))
         view.update_analysis_and_wait()
+        self.assertEqual(
+            memory_map._remove_false_callee_saved_parameters(view),
+            6,
+        )
+        view.update_analysis_and_wait()
         return view
 
     def _new_zero_parameter_view(self):
@@ -137,7 +142,7 @@ class StringCallRecoveryTests(unittest.TestCase):
             self.assertNotIn("boot_validate_header", self._hlil_text(caller))
             self.assertEqual(
                 memory_map._register_parameter_names(callee),
-                {"r4", "r5", "r6"},
+                set(),
             )
             decoder, _ = memory_map._msp430x_decode_api()
             self.assertIn(CALL_ADDRESS, [site.address for site in caller.call_sites])
@@ -189,7 +194,7 @@ class StringCallRecoveryTests(unittest.TestCase):
             self.assertEqual(str(callee.type), original_callee_type)
             self.assertEqual(
                 memory_map._register_parameter_names(callee),
-                {"r4", "r5", "r6"},
+                set(),
             )
 
             # The durable call adjustment survives later analysis and makes a
