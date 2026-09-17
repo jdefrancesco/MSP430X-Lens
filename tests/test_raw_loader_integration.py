@@ -36,6 +36,8 @@ from tests.fixture_firmware import (
     STRING_CALL_ARGUMENT_ADDRESS,
     STRING_CALLER_ADDRESS,
     STRING_CALL_TARGET_ADDRESS,
+    STRUCT_ACCESS_FUNCTION,
+    STRUCT_ACCESS_FUNCTION_ADDRESS,
     build_sparse_raw_firmware,
 )
 
@@ -96,6 +98,7 @@ class RawLoaderIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(recovery_view, view)
                 self.assertIn("R12", progress_text)
+                self.assertIn("structures", progress_text)
 
                 # Execute the captured background action deterministically.
                 # Its internal analysis update must not recursively fire the
@@ -245,6 +248,42 @@ class RawLoaderIntegrationTests(unittest.TestCase):
             )
             self.assertIn("mmio_read16", mmio_hlil_text)
             self.assertIn("DMACTL0", mmio_hlil_text)
+
+            struct_access = view.get_function_at(STRUCT_ACCESS_FUNCTION_ADDRESS)
+            self.assertIsNotNone(struct_access)
+            self.assertEqual(
+                bytes(
+                    view.read(
+                        STRUCT_ACCESS_FUNCTION_ADDRESS,
+                        len(STRUCT_ACCESS_FUNCTION),
+                    )
+                ),
+                STRUCT_ACCESS_FUNCTION,
+            )
+            self.assertEqual(
+                str(struct_access.type.parameters[0].type),
+                "struct msp430x_auto_struct_06f40_r12*",
+            )
+            recovered_structure = view.get_type_by_name(
+                "msp430x_auto_struct_06f40_r12"
+            )
+            self.assertIsNotNone(recovered_structure)
+            self.assertEqual(
+                [
+                    (member.offset, member.type.width)
+                    for member in recovered_structure.members
+                ],
+                [(2, 1), (4, 2), (6, 2), (8, 4), (12, 4)],
+            )
+            struct_hlil_text = "\n".join(
+                str(instruction)
+                for block in struct_access.hlil
+                for instruction in block
+            )
+            self.assertIn("load20(&arg1->field_08)", struct_hlil_text)
+            self.assertIn("store20(&arg1->field_0c", struct_hlil_text)
+            self.assertNotIn("fffff", struct_hlil_text.lower())
+            self.assertEqual(memory_map._recover_msp430x_structures(view), 0)
         finally:
             raw.file.close()
 
