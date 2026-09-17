@@ -184,6 +184,35 @@ class StructRecoveryTests(unittest.TestCase):
         finally:
             view.file.close()
 
+    def test_specific_auto_pointer_type_is_not_replaced_or_shadowed(self):
+        view = self._new_view(MIXED_STRUCT_BYTES)
+        try:
+            function = view.get_function_at(FUNCTION_ADDRESS)
+            pointer_width = function.type.parameters[0].type.width
+            auto_type = Type.function(
+                Type.void(),
+                [
+                    FunctionParameter(
+                        Type.pointer_of_width(pointer_width, Type.char()),
+                        "bytes",
+                    )
+                ],
+                calling_convention=self.arch.default_calling_convention,
+            )
+            function.set_auto_type(auto_type)
+            view.update_analysis_and_wait()
+
+            self.assertFalse(function.has_user_type)
+            self.assertEqual(memory_map._recover_msp430x_structures(view), 0)
+            function = view.get_function_at(FUNCTION_ADDRESS)
+            self.assertEqual(function.type.parameters[0].name, "bytes")
+            self.assertEqual(str(function.type.parameters[0].type), "char*")
+            self.assertIsNone(
+                view.get_type_by_name("msp430x_auto_struct_00100_r12")
+            )
+        finally:
+            view.file.close()
+
 
 if __name__ == "__main__":
     unittest.main()
