@@ -107,7 +107,12 @@ Verify the loader and registration:
     visible as `mmio_read16(&DMACTL0)`. Confirm `DMACTL0` at `0x500` is a
     volatile two-byte data variable; the `_L`/`_H` aliases should remain
     navigable symbols without overlapping data variables.
-17. Spot-check reset/vector and other MSP430 header labels.
+17. Open Pseudo C at `0x6f40` and confirm its first parameter is
+    `struct msp430x_auto_struct_06f40_r12*`. The body must contain
+    `load20(&arg1->field_08)` and `store20(&arg1->field_0c, ...)`, with no
+    exposed `0xfffff` masks. Running `Recover inferred structures` again must
+    not create a duplicate type.
+18. Spot-check reset/vector and other MSP430 header labels.
 
 For a real raw slice whose first byte does not represent address `0` or
 `0x5c00`, choose the same mapped view in `Open With Options` and enter the
@@ -209,12 +214,12 @@ changes made after the automatic pass. Reopening an executable MSP430X ELF
 BNDB should schedule the same recovery even though Binary Ninja does not save
 the plugin's auto preparation marker in databases.
 
-On representative firmware with two or more non-overlapping fixed-offset
-accesses from one function parameter, automatic recovery should assign a
-stable `msp430x_auto_struct_*` pointer type and expose named `field_XX`
-members. Address-width `.A` accesses must remain visible as
-`load20(&arg1->field_XX)` or `store20(&arg1->field_XX, ...)`; Pseudo C must not
-gain `0xfffff` masks. Run `Tools -> MSP430F5438 -> Recover inferred
+The raw fixtures include this exact structure case at `0x6f40`. More generally,
+firmware with two or more non-overlapping fixed-offset accesses from one
+function parameter should receive a stable `msp430x_auto_struct_*` pointer
+type and named `field_XX` members. Address-width `.A` accesses must remain
+visible as `load20(&arg1->field_XX)` or `store20(&arg1->field_XX, ...)`; Pseudo
+C must not gain `0xfffff` masks. Run `Tools -> MSP430F5438 -> Recover inferred
 structures` (or the F5438A equivalent) a second time and confirm that it finds
 no new candidates or duplicate types. Existing user types, specific inferred
 pointer types, conflicting field widths, overlaps, and regular same-width

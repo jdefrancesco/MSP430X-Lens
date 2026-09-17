@@ -25,6 +25,7 @@ STRING_CALL_ARGUMENT_ADDRESS = 0x6A00
 STRING_CALLER_ADDRESS = 0x6E00
 STRING_CALL_TARGET_ADDRESS = 0x6E40
 MMIO_READ_FUNCTION_ADDRESS = 0x6F00
+STRUCT_ACCESS_FUNCTION_ADDRESS = 0x6F40
 ERASED_GAP_ADDRESS = 0x6050
 HIGH_BANK_FUNCTION_ADDRESS = 0x11000
 HIGH_BANK_STRING_ADDRESS = 0x11200
@@ -58,10 +59,12 @@ HIGH_BANK_LOOKUP_TABLE = bytes(range(0x20))
 # exercise loader setup without creating references to absent sections.
 ELF_RESET_FUNCTION = bytes.fromhex("03 43 30 41")
 
-# call #0x7de0; call #0x6d00; call #0x6e00; call #0x6f00; ret. Direct
-# references make the integration helpers deterministic analysis roots.
+# call #0x7de0; call #0x6d00; call #0x6e00; call #0x6f00;
+# call #0x6f40; ret. Direct references make the integration helpers
+# deterministic analysis roots.
 RESET_FUNCTION = bytes.fromhex(
-    "b0 12 e0 7d b0 12 00 6d b0 12 00 6e b0 12 00 6f 30 41"
+    "b0 12 e0 7d b0 12 00 6d b0 12 00 6e b0 12 00 6f "
+    "b0 12 40 6f 30 41"
 )
 
 # CALLA #0x11000 proves that the mapped-raw path preserves a direct 20-bit
@@ -172,6 +175,19 @@ MMIO_READ_FUNCTION = bytes.fromhex(
     "0c 12 1c 42 00 05 3c 41 30 41"
 )
 
+# mov.b 2(r12),r13; mov.w 4(r12),r14; mov.w r15,6(r12);
+# mova 8(r12),r13; mova r14,0xc(r12); ret. The mixed field widths provide a
+# deterministic UI example for automatic structure recovery, including clean
+# address-width load20/store20 rendering without exposed 20-bit masks.
+STRUCT_ACCESS_FUNCTION = bytes.fromhex(
+    "5d 4c 02 00 "
+    "1e 4c 04 00 "
+    "8c 4f 06 00 "
+    "3d 0c 08 00 "
+    "7c 0e 0c 00 "
+    "30 41"
+)
+
 # Synthetic MSP430F5438A values arranged like the datasheet's descriptor table.
 # The CRC word at 0x1a02 is little-endian CRC-16/CCITT-FALSE over the inclusive
 # range 0x1a04..0x1aff.  Keeping the literal checksum here (rather than deriving
@@ -224,6 +240,7 @@ def build_sparse_raw_firmware() -> bytes:
     place(STRING_CALLER_ADDRESS, STRING_CALLER)
     place(STRING_CALL_TARGET_ADDRESS, STRING_CALL_TARGET)
     place(MMIO_READ_FUNCTION_ADDRESS, MMIO_READ_FUNCTION)
+    place(STRUCT_ACCESS_FUNCTION_ADDRESS, STRUCT_ACCESS_FUNCTION)
     place(
         INDIRECT_CALL_POINTER_ADDRESS,
         INDIRECT_CALL_TARGET_ADDRESS.to_bytes(2, "little"),
@@ -625,6 +642,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"Expected retained DMACTL0 read in Pseudo C: {MMIO_READ_FUNCTION_ADDRESS:#x}"
+    )
+    print(
+        "Expected recovered structure in Pseudo C: "
+        f"{STRUCT_ACCESS_FUNCTION_ADDRESS:#x}"
     )
     return 0
 

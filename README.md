@@ -159,6 +159,10 @@ After installing or changing plugin registration code:
 7. Spot-check that reset/vector labels and header-derived peripheral labels are present.
 8. For an unused peripheral read, confirm Pseudo C retains a side-effecting
    expression such as `mmio_read16(&DMACTL0)` instead of deleting the access.
+9. Open Pseudo C at `0x6f40` in `build/sparse-code-islands.bin` and confirm its
+   first parameter is `struct msp430x_auto_struct_06f40_r12*`, with
+   `load20(&arg1->field_08)` and `store20(&arg1->field_0c, ...)` accesses and
+   no exposed `0xfffff` masks.
 
 If the options dialog shows ARM/Thumb, close that view and reopen with the
 exact MSP430F5438 view type. The generic firmware loader is not this plugin.
