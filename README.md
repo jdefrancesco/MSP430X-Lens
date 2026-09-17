@@ -13,6 +13,8 @@ core features include:
 - Conservative automatic recovery for coherent clusters of bounded high-bank
   `RETA` routines, plus read-only reporting for isolated candidates missed by
   recursive analysis, without enabling linear sweep.
+- Conservative automatic structure recovery from fixed-offset function
+  parameter accesses, including clean 20-bit address-field rendering.
 - Typed factory TLV calibration/device records with stored CRC16 validation.
 - Collapsing and simplifying the decompilation output without all the
 artifacts that Ghidra generally leaves.
@@ -134,6 +136,7 @@ Useful commands include:
 - `Report CPUX fallback instructions`
 - `Report unreferenced function candidates`
 - `Report TLV device descriptors and CRC16`
+- `Recover inferred structures`
 - `Re-run MSP430X analysis`
 - `Apply MSP430 header labels`
 
@@ -254,6 +257,18 @@ automatic pass, including older databases that predate the recovery feature.
 when refreshing an older already-open view. Long map/re-run menu commands use
 the same background-task path so analysis never blocks the UI thread.
 
+The same post-analysis task conservatively recovers local structure types from
+fixed-offset loads and stores based on a function parameter. It follows
+register aliases in mapped SSA IL, combines byte, word, and address-width
+accesses, and gives accepted layouts stable `msp430x_auto_struct_*` names.
+Conflicting or overlapping accesses, regular array-shaped strides, excessive
+offsets, and functions with user-authored or already-specific parameter types
+are left unchanged. Run `Tools -> MSP430F5438 -> Recover inferred structures`
+(or the F5438A equivalent) after later type or analysis changes. Address-width
+fields continue to render through the architecture's `load20`/`store20`
+intrinsics, such as `load20(&arg1->field_08)`, so adding field names does not
+reintroduce raw `0xfffff` masks into Pseudo C.
+
 Named MSP430 EABI helper functions from the ABI document are normalized and
 annotated after analysis. Imported or user-supplied helper aliases such as
 `__MSP430_mpyi` are renamed to canonical `__mspabi_*` names, ordinary helper
@@ -362,6 +377,13 @@ Indirect target recovery currently handles explicit absolute or symbolic
 flash address-word operands. Register-derived and indexed runtime function
 pointers remain visible as indirect control flow but are not guessed from
 nearby data.
+
+Automatic structure recovery is local and intraprocedural. It does not yet
+merge layouts across callers, infer global or heap object types, or promote
+regular indexed accesses that are more likely arrays. Binary Ninja can also
+lose field syntax when a 16-bit pointer is copied through a 20-bit register;
+the inferred type is retained without inventing a wider ABI pointer or exposing
+the architecture's address masks.
 
 The implementation status and deliberately conservative CPUX fallbacks are
 tracked in [docs/CPUX_SIDE_EFFECT_AUDIT.md](docs/CPUX_SIDE_EFFECT_AUDIT.md).

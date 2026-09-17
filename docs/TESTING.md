@@ -31,7 +31,11 @@ larger F5438A image additionally verify that three nearby erased-boundary
 `RETA` routines are recovered as a cluster, while a standalone `RETA`, legacy
 `RET`, and accidental calibration-table `RETI` remain unseeded. A packed
 command-name/descriptor pair from the same image verifies that touching
-NUL-terminated strings remain separate data variables.
+NUL-terminated strings remain separate data variables. Exact instruction-byte
+tests also verify conservative structure recovery from parameter-relative
+byte, word, and address-width accesses, register-alias tracking, clean
+`load20`/`store20` field rendering, idempotence, and rejection of conflicting,
+array-shaped, user-typed, or already-specific pointer candidates.
 
 The ELF factory-path integration test constructs a dependency-free ELF32
 `EM_MSP430` executable and verifies that `msp430x`, string filtering, vectors,
@@ -73,8 +77,9 @@ Verify the loader and registration:
 3. Confirm the `Tools -> MSP430F5438` commands are present.
 4. Run `Tools -> MSP430F5438 -> Diagnose active view`.
 5. Let initial analysis and the automatic `Recovering MSP430X high-bank
-   functions, indirect targets, and R12 string call sites` background task
-   finish. Do not run a manual analysis command for this smoke test.
+   functions, indirect targets, R12 string call sites, and structures`
+   background task finish. Do not run a manual analysis command for this smoke
+   test.
 6. Confirm `0x5c00` is the reset-handler function.
 7. Confirm `0x6000` is recovered as a function even though nothing references
    it.
@@ -203,6 +208,17 @@ command remains the fallback for older already-open views and for analysis
 changes made after the automatic pass. Reopening an executable MSP430X ELF
 BNDB should schedule the same recovery even though Binary Ninja does not save
 the plugin's auto preparation marker in databases.
+
+On representative firmware with two or more non-overlapping fixed-offset
+accesses from one function parameter, automatic recovery should assign a
+stable `msp430x_auto_struct_*` pointer type and expose named `field_XX`
+members. Address-width `.A` accesses must remain visible as
+`load20(&arg1->field_XX)` or `store20(&arg1->field_XX, ...)`; Pseudo C must not
+gain `0xfffff` masks. Run `Tools -> MSP430F5438 -> Recover inferred
+structures` (or the F5438A equivalent) a second time and confirm that it finds
+no new candidates or duplicate types. Existing user types, specific inferred
+pointer types, conflicting field widths, overlaps, and regular same-width
+array strides must remain unchanged.
 
 When external symbols identify MSP430 EABI helpers, use
 `Tools -> MSP430F5438 -> Import raw function symbols` for a linker map or `nm`

@@ -9168,6 +9168,14 @@ try:
         prompt_paste_raw_msp430_function_symbols,
     )
     PluginCommand.register(
+        "MSP430F5438A\\Recover inferred structures",
+        "Create conservative auto structures from fixed-offset MSP430X parameter accesses without replacing user types.",
+        _background_command(
+            recover_msp430x_structures,
+            "Recovering conservative MSP430X structures",
+        ),
+    )
+    PluginCommand.register(
         "MSP430F5438A\\Import MSP430 ABI helper symbols",
         "Import recognized __mspabi helper names from a linker map, nm output, or simple address/name CSV.",
         prompt_import_msp430_abi_helper_symbols,
