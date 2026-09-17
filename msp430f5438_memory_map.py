@@ -6188,8 +6188,11 @@ def _candidate_structure(candidate: _StructCandidate):
     )
 
 
-def _replaceable_auto_parameter_type(parameter_type, desired_pointer) -> bool:
-    if str(parameter_type) == str(desired_pointer):
+def _replaceable_auto_parameter_type(
+    parameter_type,
+    desired_pointer=None,
+) -> bool:
+    if desired_pointer is not None and str(parameter_type) == str(desired_pointer):
         return True
     try:
         if parameter_type.type_class == TypeClass.IntegerTypeClass:
@@ -6208,6 +6211,11 @@ def _apply_msp430x_struct_candidate(
 ) -> bool:
     if bool(getattr(func, "has_user_type", False)):
         return False
+    try:
+        parameters = list(func.type.parameters)
+        current_parameter = parameters[candidate.parameter_index]
+    except Exception:
+        return False
     type_id = Type.generate_auto_type_id(
         STRUCT_RECOVERY_AUTO_TYPE_SOURCE,
         candidate.type_name,
@@ -6216,6 +6224,21 @@ def _apply_msp430x_struct_candidate(
         registered_name = bv.get_type_name_by_id(type_id)
     except Exception:
         registered_name = None
+    if registered_name is None:
+        if not _replaceable_auto_parameter_type(current_parameter.type):
+            return False
+    else:
+        registered_type = Type.named_type_from_registered_type(bv, registered_name)
+        registered_pointer = Type.pointer_of_width(
+            candidate.pointer_width,
+            registered_type,
+        )
+        if not _replaceable_auto_parameter_type(
+            current_parameter.type,
+            registered_pointer,
+        ):
+            return False
+
     desired_structure = _candidate_structure(candidate)
     type_changed = False
     if registered_name is None:
@@ -6244,13 +6267,6 @@ def _apply_msp430x_struct_candidate(
 
     named_structure = Type.named_type_from_registered_type(bv, registered_name)
     desired_pointer = Type.pointer_of_width(candidate.pointer_width, named_structure)
-    try:
-        parameters = list(func.type.parameters)
-        current_parameter = parameters[candidate.parameter_index]
-    except Exception:
-        return type_changed
-    if not _replaceable_auto_parameter_type(current_parameter.type, desired_pointer):
-        return type_changed
     if str(current_parameter.type) == str(desired_pointer):
         return type_changed
 
