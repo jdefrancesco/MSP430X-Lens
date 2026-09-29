@@ -274,6 +274,68 @@ def ext_repeat_reg(ext: Optional[int]) -> Optional[int]:
     return ext & 0xF
 
 
+def cpux_fallback(word: int) -> Decoded:
+    """Return an explicit two-byte fallback for an unsupported CPUX word."""
+
+    ins = Decoded(word)
+    ins.fmt = "cpux"
+    ins.length = 2
+    return ins
+
+
+def valid_extended_format_ii(
+    ext: int,
+    op: int,
+    bw: int,
+    reg: int,
+    as_bits: int,
+) -> bool:
+    """Validate an extension word used with a Format-II instruction.
+
+    SLAU391F Figure 1-31 assigns two different meanings to the extension
+    word. Register operands use ZC/repeat fields, while every non-register
+    operand reserves bits 10:7 and stores its address/index/immediate high
+    nibble in bits 3:0. Keeping that distinction here prevents high addresses
+    from being mistaken for repeat counts.
+    """
+
+    register_mode = as_bits == 0
+    if register_mode:
+        # Bits 10:9 and 5:4 are reserved in the register-mode extension.
+        if ext & 0x0630:
+            return False
+    else:
+        # Format-II has no source field: bits 10:7 and 5:4 are reserved.
+        if ext & 0x07B0:
+            return False
+        # Indirect, autoincrement, and constant-generator forms have no
+        # following operand word whose high nibble could occupy bits 3:0.
+        if not needs_source_word(reg, as_bits) and (ext & 0xF):
+            return False
+
+    # Only these classic Format-II operations have extension-word forms.
+    # CALLA uses its own 0x13xx encoding and RETI cannot be extended.
+    if op not in (0, 1, 2, 3, 4):
+        return False
+
+    al = (ext >> 6) & 1
+    if op in (1, 3):
+        # SWPBX/SXTX use A/L=0,B/W=0 for .A and A/L=1,B/W=0
+        # for .W. Neither instruction has a byte form.
+        return bw == 0
+
+    # RRCX, RRAX, and PUSHX use the normal width table, where 00 is
+    # reserved, 01 is .A, 10 is .W, and 11 is .B.
+    if al == 0 and bw == 0:
+        return False
+
+    # ZC selects RRUX only for the register form; RRUX has no memory form.
+    if op == 0 and ext_zero_carry(ext) and not register_mode:
+        return False
+
+    return True
+
+
 def supports_repeat_prefix(src: Operand, dst: Operand) -> bool:
     """Return whether repeat lifting supports this operand pairing."""
 
@@ -352,10 +414,12 @@ def source_operand(
     reg: int,
     as_bits: int,
     ext: Optional[int],
+    *,
+    high_nibble: Optional[int] = None,
 ) -> Tuple[Operand, int]:
     """Decode a Format I/II source operand and return its next word index."""
 
-    hi = ext_src_hi(ext)
+    hi = ext_src_hi(ext) if high_nibble is None else high_nibble
 
     if reg == 3:
         constants = {0: 0, 1: 1, 2: 2, 3: -1}
@@ -928,6 +992,8 @@ def decode(data: bytes, addr: int) -> Optional[Decoded]:
             return address_ins
 
     if (word & 0xE000) == 0x2000:
+        if ext is not None:
+            return cpux_fallback(first)
         cond = (word >> 10) & 0x7
         mnemonic, sem = JUMP_CONDS[cond]
         target = (addr + 2 + (2 * s10(word))) & 0xFFFFF
@@ -978,6 +1044,14 @@ def decode(data: bytes, addr: int) -> Optional[Decoded]:
         bw = (word >> 6) & 1
         as_bits = (word >> 4) & 0x3
         reg = word & 0xF
+        if ext is not None and not valid_extended_format_ii(
+            ext,
+            op,
+            bw,
+            reg,
+            as_bits,
+        ):
+            return cpux_fallback(first)
         ins.mnemonic = SINGLE_OPS.get(op, "???")
         if ext is not None:
             if op == 0:
@@ -991,18 +1065,28 @@ def decode(data: bytes, addr: int) -> Optional[Decoded]:
         if op == 6:
             ins.length = 2
             return ins
-        operand, idx = source_operand(words, 1, addr + (2 if ext is not None else 0), reg, as_bits, ext)
+        operand, idx = source_operand(
+            words,
+            1,
+            addr + (2 if ext is not None else 0),
+            reg,
+            as_bits,
+            ext,
+            high_nibble=ext_dst_hi(ext) if ext is not None else None,
+        )
         ins.src = operand
         ins.dst = operand
         ins.length = base_len + 2 * (idx - 1)
-        if ext is not None and ins.mnemonic in ("rrcx", "rrax", "rrux"):
+        if (
+            ext is not None
+            and as_bits == 0
+            and ins.mnemonic in ("rrcx", "rrax", "rrux")
+        ):
             ins.rpt_count = ext_repeat_count(ext)
             ins.rpt_reg = ext_repeat_reg(ext)
         return ins
 
-    ins.fmt = "cpux"
-    ins.length = 2
-    return ins
+    return cpux_fallback(first if ext is not None else word)
 
 
 def tt(kind, text, value=None):

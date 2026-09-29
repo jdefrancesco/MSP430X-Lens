@@ -21,6 +21,7 @@ INDIRECT_CALL_WRAPPER_ADDRESS = 0x6D00
 INDIRECT_CALL_TARGET_ADDRESS = 0x7DE0
 INDIRECT_CALL_POINTER_ADDRESS = 0xE000
 HIGH_BANK_INDIRECT_CALLA_WRAPPER_ADDRESS = 0x7000
+HIGH_BANK_FORMAT_II_FUNCTION_ADDRESS = 0x7040
 STRING_CALL_ARGUMENT_ADDRESS = 0x6A00
 STRING_CALLER_ADDRESS = 0x6E00
 STRING_CALL_TARGET_ADDRESS = 0x6E40
@@ -54,10 +55,11 @@ STRING_CALL_ARGUMENT = b"module=startup state=%u result=%u\x00"
 HIGH_BANK_STRING = b"high-bank diagnostics remain data, not code\x00"
 HIGH_BANK_LOOKUP_TABLE = bytes(range(0x20))
 
-# A small, ordinary leaf function for the ELF entry point.  Keeping this
-# independent of the raw fixture's call graph makes the ELF factory-path test
-# exercise loader setup without creating references to absent sections.
-ELF_RESET_FUNCTION = bytes.fromhex("03 43 30 41")
+# PUSHX.W &0x11200; POP R4; RET. The high-bank read exercises the same CPUX
+# Format-II decoding through Binary Ninja's stock ELF loader without relying
+# on the raw view's device mapping.
+ELF_FORMAT_II_PUSHX_ADDRESS = RESET_HANDLER
+ELF_RESET_FUNCTION = bytes.fromhex("41 18 12 12 00 12 34 41 30 41")
 
 # call #0x7de0; call #0x6d00; call #0x6e00; call #0x6f00;
 # call #0x6f40; ret. Direct references make the integration helpers
@@ -73,13 +75,30 @@ RESET_FUNCTION = bytes.fromhex(
 HIGH_BANK_CALLA = bytes.fromhex("b1 13 00 10")
 HIGH_BANK_CALLA_ADDRESS = RESET_HANDLER + len(RESET_FUNCTION) - 2
 HIGH_BANK_INDIRECT_CALLA_WRAPPER_CALL = bytes.fromhex("b0 12 00 70")
+HIGH_BANK_FORMAT_II_FUNCTION_CALL = bytes.fromhex("b0 12 40 70")
 HIGH_BANK_RESET_FUNCTION = (
     RESET_FUNCTION[:-2]
     + HIGH_BANK_CALLA
     + HIGH_BANK_INDIRECT_CALLA_WRAPPER_CALL
+    + HIGH_BANK_FORMAT_II_FUNCTION_CALL
     + RESET_FUNCTION[-2:]
 )
 HIGH_BANK_FUNCTION = bytes.fromhex("03 43 10 01")
+
+# PUSHX.A &0x11200; POP R4; POP R4; PUSHX.W &0x11200; POP R4; RET.
+# Both extension words carry address bits 19:16 in bits 3:0. The paired pops
+# balance the four-byte address-word push and two-byte word push so analysis
+# retains an ordinary returning function.
+HIGH_BANK_FORMAT_II_PUSHX_A = bytes.fromhex("01 18 52 12 00 12")
+HIGH_BANK_FORMAT_II_PUSHX_A_ADDRESS = HIGH_BANK_FORMAT_II_FUNCTION_ADDRESS
+HIGH_BANK_FORMAT_II_PUSHX_W = bytes.fromhex("41 18 12 12 00 12")
+HIGH_BANK_FORMAT_II_PUSHX_W_ADDRESS = HIGH_BANK_FORMAT_II_FUNCTION_ADDRESS + 10
+HIGH_BANK_FORMAT_II_FUNCTION = (
+    HIGH_BANK_FORMAT_II_PUSHX_A
+    + bytes.fromhex("34 41 34 41")
+    + HIGH_BANK_FORMAT_II_PUSHX_W
+    + bytes.fromhex("34 41 30 41")
+)
 
 # CALLA &0x11500; RET. The absolute CALLA operand names a file-backed
 # address-word slot, whose low word and following high-nibble word resolve to
@@ -276,6 +295,7 @@ def build_high_bank_raw_firmware() -> bytes:
         HIGH_BANK_INDIRECT_CALLA_WRAPPER_ADDRESS,
         HIGH_BANK_INDIRECT_CALLA_WRAPPER,
     )
+    place(HIGH_BANK_FORMAT_II_FUNCTION_ADDRESS, HIGH_BANK_FORMAT_II_FUNCTION)
     place(HIGH_BANK_FUNCTION_ADDRESS, HIGH_BANK_FUNCTION)
     place(HIGH_BANK_STRING_ADDRESS, HIGH_BANK_STRING)
     place(HIGH_BANK_LOOKUP_TABLE_ADDRESS, HIGH_BANK_LOOKUP_TABLE)
@@ -300,7 +320,7 @@ def build_msp430_elf_firmware() -> bytes:
     """Return a minimal linked ELF32/MSP430 image for factory-path tests.
 
     The fixture is assembled directly so the test suite does not depend on an
-    MSP430 compiler or linker.  It contains only standard ELF headers, four
+    MSP430 compiler or linker.  It contains only standard ELF headers, five
     loadable device sections, and a conventional ``_start`` function symbol.
     """
 
@@ -327,6 +347,7 @@ def build_msp430_elf_firmware() -> bytes:
         (".tlv", TLV_DESCRIPTOR_ADDRESS, TLV_DESCRIPTOR, 4, 2),
         (".text", RESET_HANDLER, ELF_RESET_FUNCTION, 5, 6),
         (".rodata", SHORT_JUNK_STRING_ADDRESS, bytes(rodata), 4, 2),
+        (".upper_rodata", HIGH_BANK_STRING_ADDRESS, HIGH_BANK_STRING, 4, 2),
         (".vectors", 0xFF80, bytes(vectors), 4, 2),
     )
 
@@ -390,6 +411,7 @@ def build_msp430_elf_firmware() -> bytes:
         ".tlv",
         ".text",
         ".rodata",
+        ".upper_rodata",
         ".vectors",
         ".symtab",
         ".strtab",
@@ -487,6 +509,18 @@ def build_msp430_elf_firmware() -> bytes:
             SHORT_JUNK_STRING_ADDRESS,
             offsets[".rodata"],
             len(rodata),
+            0,
+            0,
+            1,
+            0,
+        ),
+        (
+            section_name_offsets[".upper_rodata"],
+            1,
+            2,
+            HIGH_BANK_STRING_ADDRESS,
+            offsets[".upper_rodata"],
+            len(HIGH_BANK_STRING),
             0,
             0,
             1,

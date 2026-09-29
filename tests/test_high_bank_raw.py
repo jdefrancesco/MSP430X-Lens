@@ -9,6 +9,12 @@ from tests.fixture_firmware import (
     HIGH_BANK_BACKED_ERASED_ADDRESS,
     HIGH_BANK_CALLA,
     HIGH_BANK_CALLA_ADDRESS,
+    HIGH_BANK_FORMAT_II_FUNCTION,
+    HIGH_BANK_FORMAT_II_FUNCTION_ADDRESS,
+    HIGH_BANK_FORMAT_II_PUSHX_A,
+    HIGH_BANK_FORMAT_II_PUSHX_A_ADDRESS,
+    HIGH_BANK_FORMAT_II_PUSHX_W,
+    HIGH_BANK_FORMAT_II_PUSHX_W_ADDRESS,
     HIGH_BANK_FUNCTION,
     HIGH_BANK_FUNCTION_ADDRESS,
     HIGH_BANK_INDIRECT_CALLA,
@@ -220,6 +226,68 @@ class HighBankRawTests(unittest.TestCase):
             )
         }
         self.assertIn(target, indirect_targets)
+
+    def test_format_ii_operands_keep_full_high_bank_data_address(self):
+        function = self.view.get_function_at(HIGH_BANK_FORMAT_II_FUNCTION_ADDRESS)
+        self.assertIsNotNone(function)
+        self.assertEqual(
+            bytes(
+                self.view.read(
+                    HIGH_BANK_FORMAT_II_FUNCTION_ADDRESS,
+                    len(HIGH_BANK_FORMAT_II_FUNCTION),
+                )
+            ),
+            HIGH_BANK_FORMAT_II_FUNCTION,
+        )
+
+        cases = (
+            (
+                HIGH_BANK_FORMAT_II_PUSHX_A_ADDRESS,
+                HIGH_BANK_FORMAT_II_PUSHX_A,
+                "pushx.a &0x11200",
+            ),
+            (
+                HIGH_BANK_FORMAT_II_PUSHX_W_ADDRESS,
+                HIGH_BANK_FORMAT_II_PUSHX_W,
+                "pushx.w &0x11200",
+            ),
+        )
+        for address, expected_bytes, expected_text in cases:
+            with self.subTest(address=address):
+                data = bytes(self.view.read(address, len(expected_bytes)))
+                decoded = architecture.decode(data, address)
+                self.assertIsNotNone(decoded)
+                self.assertEqual(decoded.length, len(expected_bytes))
+                self.assertEqual(decoded.src.addr, HIGH_BANK_STRING_ADDRESS)
+                self.assertIsNone(decoded.rpt_count)
+                tokens, length = self.view.arch.get_instruction_text(data, address)
+                self.assertEqual(length, len(expected_bytes))
+                self.assertEqual(
+                    "".join(token.text for token in tokens),
+                    expected_text,
+                )
+                il_text = "\n".join(
+                    str(instruction)
+                    for instruction in function.get_low_level_ils_at(address)
+                )
+                self.assertIn("0x11200", il_text)
+                self.assertNotIn("0x1200", il_text.replace("0x11200", ""))
+
+        self.assertIsNotNone(self.view.get_data_var_at(HIGH_BANK_STRING_ADDRESS))
+        self.assertIsNone(self.view.get_function_at(HIGH_BANK_STRING_ADDRESS))
+        self.assertIsNone(self.view.get_function_at(HIGH_BANK_STRING_ADDRESS & 0xFFFF))
+        full_refs = {
+            reference.address
+            for reference in self.view.get_code_refs(HIGH_BANK_STRING_ADDRESS)
+        }
+        truncated_refs = {
+            reference.address
+            for reference in self.view.get_code_refs(
+                HIGH_BANK_STRING_ADDRESS & 0xFFFF
+            )
+        }
+        self.assertIn(HIGH_BANK_FORMAT_II_PUSHX_W_ADDRESS, full_refs)
+        self.assertNotIn(HIGH_BANK_FORMAT_II_PUSHX_W_ADDRESS, truncated_refs)
 
     def test_erased_and_unbacked_high_bank_ranges_are_not_executable(self):
         erased = self.view.get_segment_at(HIGH_BANK_BACKED_ERASED_ADDRESS)

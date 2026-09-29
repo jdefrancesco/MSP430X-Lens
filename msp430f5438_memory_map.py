@@ -9106,6 +9106,94 @@ def _prepare_msp430x_elf_view(bv: BinaryView) -> bool:
     return True
 
 
+def _is_little_endian_msp430_elf(bv: BinaryView) -> bool:
+    """Verify the ELF identity without trusting the loader's chosen arch.
+
+    Binary Ninja's built-in ELF recognizer can select its plain ``msp430``
+    architecture before a third-party platform recognizer wins.  The ELF
+    header remains authoritative in that case.  Read it from the raw parent so
+    virtual address zero in a linked image is never confused with file offset
+    zero.
+    """
+
+    if _view_type_name(bv) != "ELF":
+        return False
+
+    raw = getattr(bv, "parent_view", None)
+    if raw is None:
+        try:
+            raw = bv.file.raw
+        except Exception:
+            return False
+    if raw is None:
+        return False
+
+    try:
+        header = bytes(raw.read(0, 20))
+    except Exception:
+        return False
+    return (
+        len(header) >= 20
+        and header[:4] == b"\x7fELF"
+        and header[4] == 1  # ELFCLASS32
+        and header[5] == 1  # ELFDATA2LSB
+        and int.from_bytes(header[18:20], "little") == EM_MSP430
+    )
+
+
+def _select_msp430x_for_elf(bv: BinaryView) -> bool:
+    """Ensure a verified MSP430 ELF uses this plugin's MSP430X superset."""
+
+    if not _is_little_endian_msp430_elf(bv):
+        return False
+
+    current_arch = str(getattr(bv, "arch", "")).lower()
+    if current_arch == "msp430x":
+        return True
+    if current_arch not in ("", "msp430"):
+        return False
+
+    stale_functions = tuple(
+        function
+        for function in bv.functions
+        if str(getattr(function, "arch", "")).lower() == "msp430"
+    )
+    stale_starts = tuple(dict.fromkeys(function.start for function in stale_functions))
+    arch = _configure_architecture(bv, "msp430x", False, set_platform=True)
+    selected = str(arch).lower() == "msp430x" and str(
+        getattr(bv, "arch", "")
+    ).lower() == "msp430x"
+    if selected:
+        # ELF may have materialized STT_FUNC/entry-point functions under the
+        # built-in platform before finalization.  Retain their loader-owned
+        # symbols, but replace the stale function objects so one address never
+        # has parallel msp430 and msp430x analysis.
+        for function in stale_functions:
+            try:
+                bv.remove_function(function)
+            except Exception as exc:
+                log_warn(
+                    f"Could not remove stale MSP430 ELF function at "
+                    f"{function.start:#x}: {exc}"
+                )
+        for start in stale_starts:
+            try:
+                if not any(
+                    str(getattr(function, "arch", "")).lower() == "msp430x"
+                    for function in bv.get_functions_at(start)
+                ):
+                    bv.add_function(start)
+            except Exception as exc:
+                log_warn(
+                    f"Could not recreate MSP430X ELF function at {start:#x}: {exc}"
+                )
+        log_info(
+            "Promoted Binary Ninja's generic MSP430 ELF selection to msp430x "
+            "before initial analysis."
+        )
+    return selected
+
+
 def _recognize_msp430x_elf_platform(_view: BinaryView, _metadata):
     """Select the MSP430X superset platform for little-endian EM_MSP430 ELF."""
 
@@ -9117,6 +9205,8 @@ def _prepare_finalized_msp430x_elf(bv: BinaryView) -> None:
     """BinaryView-finalization callback retained at module scope for BN."""
 
     try:
+        if not _select_msp430x_for_elf(bv):
+            return
         _prepare_msp430x_elf_view(bv)
     except Exception as exc:
         log_warn(f"Could not prepare MSP430X ELF before analysis: {exc}")

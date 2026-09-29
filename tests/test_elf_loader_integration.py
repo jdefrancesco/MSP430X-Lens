@@ -4,6 +4,7 @@ from unittest import mock
 from binaryninja import (
     BinaryView,
     BinaryViewType,
+    LowLevelILOperation,
     SectionSemantics,
     Settings,
     SettingsScope,
@@ -13,9 +14,12 @@ from binaryninja import (
 import msp430f5438_memory_map as memory_map
 from tests.fixture_firmware import (
     ELF_RESET_FUNCTION,
+    ELF_FORMAT_II_PUSHX_ADDRESS,
     ELF_STRING_REGION_END,
     EXACT_MIN_STRING_ADDRESS,
     LONG_STRING_ADDRESS,
+    HIGH_BANK_STRING,
+    HIGH_BANK_STRING_ADDRESS,
     RESET_HANDLER,
     RESET_VECTOR,
     SHORT_JUNK_STRING_ADDRESS,
@@ -112,6 +116,13 @@ class ElfLoaderIntegrationTests(unittest.TestCase):
                     False,
                     False,
                 ),
+                (
+                    HIGH_BANK_STRING_ADDRESS,
+                    HIGH_BANK_STRING_ADDRESS + len(HIGH_BANK_STRING),
+                    True,
+                    False,
+                    False,
+                ),
                 (0xFF80, 0x10000, True, False, False),
             )
             for start, end, readable, writable, executable in expected_segments:
@@ -128,6 +139,7 @@ class ElfLoaderIntegrationTests(unittest.TestCase):
                 ".tlv": SectionSemantics.ReadOnlyDataSectionSemantics,
                 ".text": SectionSemantics.ReadOnlyCodeSectionSemantics,
                 ".rodata": SectionSemantics.ReadOnlyDataSectionSemantics,
+                ".upper_rodata": SectionSemantics.ReadOnlyDataSectionSemantics,
                 ".vectors": SectionSemantics.ReadOnlyDataSectionSemantics,
             }
             for name, semantics in expected_sections.items():
@@ -142,6 +154,10 @@ class ElfLoaderIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 bytes(view.read(RESET_HANDLER, len(ELF_RESET_FUNCTION))),
                 ELF_RESET_FUNCTION,
+            )
+            self.assertEqual(
+                bytes(view.read(HIGH_BANK_STRING_ADDRESS, len(HIGH_BANK_STRING))),
+                HIGH_BANK_STRING,
             )
             self.assertEqual(
                 int.from_bytes(view.read(RESET_VECTOR, 2), "little"),
@@ -264,7 +280,7 @@ class ElfLoaderIntegrationTests(unittest.TestCase):
         finally:
             view.file.close()
 
-    def test_explicit_builtin_msp430_platform_override_is_preserved(self):
+    def test_elf_finalizer_upgrades_builtin_msp430_loader_selection(self):
         view = load(
             build_msp430_elf_firmware(),
             update_analysis=False,
@@ -272,13 +288,35 @@ class ElfLoaderIntegrationTests(unittest.TestCase):
         )
         self.assertIsNotNone(view)
         try:
-            self.assertEqual(str(view.arch), "msp430")
-            self.assertEqual(str(view.platform), "msp430")
-            with self.assertRaises(KeyError):
+            self.assertEqual(str(view.arch), "msp430x")
+            self.assertEqual(str(view.platform), "msp430x")
+            self.assertTrue(
                 view.query_metadata(memory_map.ELF_PREPARED_METADATA_KEY)
-            self.assertEqual(view.get_symbols_by_raw_name("WDTCTL"), [])
+            )
+            self.assert_symbol_at(view, "WDTCTL", 0x015C)
+
+            reset_functions = [
+                function
+                for function in view.functions
+                if function.start == RESET_HANDLER
+            ]
+            self.assertEqual(len(reset_functions), 1)
+            self.assertEqual(str(reset_functions[0].arch), "msp430x")
         finally:
             view.file.close()
+
+    def test_zero_eflags_msp430_elf_still_selects_msp430x(self):
+        image = bytearray(build_msp430_elf_firmware())
+        image[36:40] = b"\x00\x00\x00\x00"
+        raw, view = self._create_elf_view(bytes(image))
+        try:
+            self.assertEqual(str(view.arch), "msp430x")
+            self.assertEqual(str(view.platform), "msp430x")
+            self.assertTrue(
+                view.query_metadata(memory_map.ELF_PREPARED_METADATA_KEY)
+            )
+        finally:
+            raw.file.close()
 
     def test_elf_first_analysis_uses_hook_results_without_duplicate_functions(self):
         raw, view = self._create_elf_view()
@@ -304,6 +342,62 @@ class ElfLoaderIntegrationTests(unittest.TestCase):
             self.assertEqual(str(reset_functions[0].arch), "msp430x")
             self.assertEqual(str(reset_functions[0].platform), "msp430x")
             self.assertEqual(reset_functions[0].name, "_start")
+        finally:
+            raw.file.close()
+
+    def test_elf_analysis_keeps_format_ii_high_bank_data_reference(self):
+        raw, view = self._create_elf_view()
+        try:
+            view.update_analysis_and_wait()
+            function = view.get_function_at(RESET_HANDLER)
+            self.assertIsNotNone(function)
+
+            data = bytes(view.read(ELF_FORMAT_II_PUSHX_ADDRESS, 6))
+            tokens, length = view.arch.get_instruction_text(
+                data,
+                ELF_FORMAT_II_PUSHX_ADDRESS,
+            )
+            self.assertEqual(length, 6)
+            self.assertEqual(
+                "".join(token.text for token in tokens),
+                "pushx.w &0x11200",
+            )
+
+            low_level_ils = function.get_low_level_ils_at(
+                ELF_FORMAT_II_PUSHX_ADDRESS
+            )
+            self.assertTrue(low_level_ils)
+            self.assertNotIn(
+                LowLevelILOperation.LLIL_UNIMPL,
+                {instruction.operation for instruction in low_level_ils},
+            )
+            il_text = "\n".join(str(instruction) for instruction in low_level_ils)
+            self.assertIn("0x11200", il_text)
+            self.assertNotIn("0x1200", il_text.replace("0x11200", ""))
+
+            full_refs = {
+                reference.address
+                for reference in view.get_code_refs(HIGH_BANK_STRING_ADDRESS)
+            }
+            truncated_refs = {
+                reference.address
+                for reference in view.get_code_refs(
+                    HIGH_BANK_STRING_ADDRESS & 0xFFFF
+                )
+            }
+            self.assertIn(ELF_FORMAT_II_PUSHX_ADDRESS, full_refs)
+            self.assertNotIn(ELF_FORMAT_II_PUSHX_ADDRESS, truncated_refs)
+            self.assertIsNone(view.get_function_at(HIGH_BANK_STRING_ADDRESS))
+            self.assertIsNone(
+                view.get_function_at(HIGH_BANK_STRING_ADDRESS & 0xFFFF)
+            )
+            segment = view.get_segment_at(HIGH_BANK_STRING_ADDRESS)
+            self.assertIsNotNone(segment)
+            self.assertFalse(segment.executable)
+            self.assertEqual(
+                view.sections[".upper_rodata"].semantics,
+                SectionSemantics.ReadOnlyDataSectionSemantics,
+            )
         finally:
             raw.file.close()
 

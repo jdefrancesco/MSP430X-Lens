@@ -150,6 +150,9 @@ For `build/high-bank-raw.bin`, also verify:
    four-byte address-word slot at `0x11500` resolves to a function at `0x11600`,
    and the call has that full 20-bit indirect target without losing its
    returning fallthrough.
+6. The rooted function at `0x7040` contains `PUSHX.A &0x11200` and
+   `PUSHX.W &0x11200`. Both disassembly and LLIL must retain `0x11200`, with
+   no repeat prefix and no truncated reference to `0x1200`.
 
 The synthetic descriptor order and peripheral payload follow the device
 descriptor table in TI's
@@ -161,11 +164,14 @@ before running any manual plugin command:
 1. Architecture and platform are both `msp430x`.
 2. `_start` remains the single function at `0x5c00`; there is no parallel
    built-in `msp430` function.
-3. `.tlv`, `.text`, `.rodata`, and `.vectors` retain their ELF permissions.
+3. `.tlv`, `.text`, `.rodata`, `.upper_rodata`, and `.vectors` retain their
+   ELF permissions; `.upper_rodata` at `0x11200` remains non-executable.
 4. The F5438A TLV types/CRC comment, `vector_reset`, and `WDTCTL` label are
    already present.
 5. The five-character string at `0x6800` is absent while the strings at
    `0x6820` and `0x6840` are present.
+6. `_start` begins with `PUSHX.W &0x11200`; its disassembly, LLIL, and code
+   reference must use the full address rather than `0x1200`.
 
 The fixture carries a CRC-valid F5438A TLV block, which is why the device labels
 appear automatically. An MSP430 ELF without a supported descriptor still opens
@@ -175,6 +181,10 @@ command to select that profile explicitly. To select it before initial analysis,
 set `MSP430 ELF Device Profile` in Open With Options (or Binary Ninja Settings)
 before opening the ELF. `Auto` does not infer a device from flash bounds alone:
 multiple MSP430 variants share the F5438 memory size and address range.
+
+Some stripped TI/GNU ELF files leave `e_flags` at zero. They must still open as
+`msp430x`: the plugin verifies the little-endian ELF32 `EM_MSP430` header and
+upgrades Binary Ninja's generic `msp430` fallback before initial analysis.
 
 For the three `.bin` fixtures only: if `Open With Options` predicts ARM/Thumb,
 close the view and reopen it with the exact MSP430F5438 raw view type. Do not

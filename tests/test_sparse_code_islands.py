@@ -31,9 +31,10 @@ AEGIS_HIGH_BANK_RETA_ROUTINES = (
 )
 
 # Exact calibration records at 0x3a880 in the same image.  The bytes beginning
-# at 0x3a8bc happen to decode as a compiler-entry-shaped, RETI-terminated
-# routine by crossing the boundary between records 0x22 and 0x23.  It is still
-# random-looking table data and therefore provides only review evidence.
+# at 0x3a8bc once appeared to decode as a compiler-entry-shaped,
+# RETI-terminated routine by crossing the boundary between records 0x22 and
+# 0x23. Strict Format-II validation now rejects an illegal extension-word form
+# inside that path, providing stronger evidence that the bytes are data.
 AEGIS_CALIBRATION_WINDOW_ADDRESS = 0x3A880
 AEGIS_CALIBRATION_WINDOW_BYTES = bytes.fromhex(
     "22 00 30 fe 6b 7f 80 00 4d 5c 97 12 80 29 9f 0b "
@@ -154,7 +155,7 @@ class SparseCodeIslandTests(unittest.TestCase):
         )
         self.assertEqual(view.functions, [])
 
-    def test_random_calibration_reti_is_review_only_and_not_auto_seeded(self):
+    def test_random_calibration_with_invalid_cpux_is_not_auto_seeded(self):
         offset = AEGIS_CALIBRATION_RETI_ADDRESS - AEGIS_CALIBRATION_WINDOW_ADDRESS
         self.assertEqual(
             AEGIS_CALIBRATION_WINDOW_BYTES[
@@ -166,17 +167,7 @@ class SparseCodeIslandTests(unittest.TestCase):
             AEGIS_CALIBRATION_WINDOW_BYTES[offset:],
             AEGIS_CALIBRATION_RETI_ADDRESS,
         )
-        self.assertIsNotNone(shape)
-        self.assertEqual(shape.length, len(AEGIS_CALIBRATION_RETI_BYTES))
-        self.assertEqual(shape.termination_kind, "reti")
-        confidence, reasons = memory_map._raw_orphan_candidate_confidence(
-            AEGIS_CALIBRATION_RETI_ADDRESS,
-            shape,
-            memory_map.DEFAULT_DEVICE_SPEC,
-            boundary_evidence=False,
-        )
-        self.assertEqual(confidence, "review")
-        self.assertIn("exit-reti", reasons)
+        self.assertIsNone(shape)
 
         view = _erased_spaced_view(
             (AEGIS_CALIBRATION_WINDOW_ADDRESS,),
