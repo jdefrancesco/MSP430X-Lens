@@ -1313,6 +1313,10 @@ class MSP430XArchitecture(Architecture):
     max_instr_length = MAX_INSTR_LENGTH
     opcode_display_length = OPCODE_DISPLAY_LENGTH
     intrinsics = {
+        "add20": IntrinsicInfo(
+            [IntrinsicInput(Type.int(4, False), "lhs"), IntrinsicInput(Type.int(4, False), "rhs")],
+            [Type.int(4, False)],
+        ),
         "sra20": IntrinsicInfo(
             [IntrinsicInput(Type.int(4, False), "value"), IntrinsicInput(Type.int(4, False), "count")],
             [Type.int(4, False)],
@@ -2072,6 +2076,11 @@ class MSP430XArchitecture(Architecture):
     def _align2_20_expr(self, il, value):
         temp = LLIL_TEMP(32)
         il.append(il.intrinsic([temp], "align2_20", [value]))
+        return il.reg(4, temp)
+
+    def _add20_expr(self, il, lhs, rhs, temp_id: int):
+        temp = LLIL_TEMP(temp_id)
+        il.append(il.intrinsic([temp], "add20", [lhs, rhs]))
         return il.reg(4, temp)
 
     def _sxt_20_expr(self, il, src):
@@ -2965,7 +2974,13 @@ class MSP430XArchitecture(Architecture):
             value = self._wordpair20_expr(il, il.zero_extend(4, low), il.zero_extend(4, high))
             self._write_reg_value(il, ins.imm, 2, low)
             self._write_operand(il, ins.dst, 4, value)
-            self._write_reg_value(il, ins.src.reg, 4, il.add(4, base, il.const(4, 4)))
+            advanced_base = self._add20_expr(
+                il,
+                base,
+                il.const(4, 4),
+                54,
+            )
+            self._write_reg_value(il, ins.src.reg, 4, advanced_base)
             self._set_wordpair20_load_flags(il, high)
             return
 
@@ -3025,8 +3040,19 @@ class MSP430XArchitecture(Architecture):
 
         if ins.mnemonic == "advptr20.w":
             offset = self._sext20_word_expr(il, il.zero_extend(4, self._reg_value(il, ins.imm, 2)))
-            advanced_base = self._temp_value(il, 4, 36, il.add(4, self._reg(il, ins.src.reg), offset))
-            aligned = self._align2_20_expr(il, il.add(4, advanced_base, il.const(4, 1)))
+            advanced_base = self._add20_expr(
+                il,
+                self._reg(il, ins.src.reg),
+                offset,
+                36,
+            )
+            rounded_base = self._add20_expr(
+                il,
+                advanced_base,
+                il.const(4, 1),
+                37,
+            )
+            aligned = self._align2_20_expr(il, rounded_base)
             self._write_reg_value(il, ins.imm, 4, offset)
             self._write_reg_value(il, ins.src.reg, 4, advanced_base)
             self._write_operand(il, ins.dst, 4, aligned)

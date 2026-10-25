@@ -200,6 +200,7 @@ Read the common name parts as follows:
 | `lsr32w(low, high, count)` / `lsl32w(...)` | Join the word pair as `high:low`, perform a logical 32-bit shift, and return the shifted pair. These summarize repeated carry propagation through `R13:R12`. |
 | `msbmaskw(value)` | Expand word bit 15 into a full word: `0xffff` when set, otherwise `0`. |
 | `align2_20(value)` | Clear bit 0 of a 20-bit value, rounding it down to an even address. In `advptr20.w`, it is applied after adding one, which rounds the pointer up to even alignment. |
+| `add20(lhs, rhs)` | Add two address-width values and wrap the result to the MSP430X 20-bit address space. It keeps pointer updates exact without exposing a manual `& 0xfffff` mask. |
 | `load20(addr)` / `store20(addr, value)` | Read or write the MSP430X address-word memory layout: a low word at `addr` and address bits 19:16 in the following word. These are not ordinary 32-bit memory accesses. |
 | `mmio_read8/16/20(address)` | Perform a volatile hardware-register read of the named width. The explicit intrinsic prevents Binary Ninja from deleting an otherwise unused MMIO read. |
 | `daddb/daddw/dadd20(lhs, rhs, carry)` | Perform packed-BCD decimal addition at byte, word, or address width and produce both the result and final carry. |

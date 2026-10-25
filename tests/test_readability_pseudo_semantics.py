@@ -159,7 +159,10 @@ class ReadabilityPseudoSemanticTests(unittest.TestCase):
     def test_pseudo_value_flow_stays_free_of_exposed_twenty_bit_masks(self):
         for words, _expected_registers, _expected_flags in PSEUDO_CONTRACTS:
             with self.subTest(first_word=f"{words[0]:#06x}"):
-                il_text = "\n".join(str(instruction) for instruction in self._lift(words))
+                il = self._lift(words)
+                il_text = "\n".join(
+                    str(instruction) for instruction in il.instructions
+                )
                 self.assertNotIn("0xfffff", il_text.lower())
 
     def test_ld20_flags_match_the_unfolded_repeated_addx_sequence(self):
@@ -250,7 +253,10 @@ class ReadabilityPseudoSemanticTests(unittest.TestCase):
 
         for words, expected_adds in cases:
             with self.subTest(first_word=f"{words[0]:#06x}"):
-                il_text = "\n".join(str(instruction) for instruction in self._lift(words))
+                il = self._lift(words)
+                il_text = "\n".join(
+                    str(instruction) for instruction in il.instructions
+                )
                 self.assertEqual(il_text.count("add20"), expected_adds)
                 self.assertNotIn("0xfffff", il_text.lower())
 
