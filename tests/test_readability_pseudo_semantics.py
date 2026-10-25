@@ -4,78 +4,13 @@ from binaryninja import Architecture
 from binaryninja.lowlevelil import LowLevelILFunction
 
 import msp430x_arch as architecture
-
-
-def encode_words(*words: int) -> bytes:
-    return b"".join(word.to_bytes(2, "little") for word in words)
-
-
-def signed_index_words(src: int, dst: int, bias: int = 0x24) -> tuple[int, ...]:
-    return (
-        (src << 8) | 0xC0 | dst,
-        0x0650 | dst,
-        0x0250 | src,
-        0x5000 | (src << 8) | dst,
-        0x5030 | dst,
-        bias,
-        0x0E40 | dst,
-        0x0D40 | dst,
-    )
-
-
-def wordpair_load_words(base: int, low: int, dst: int) -> tuple[int, ...]:
-    return (
-        0x4030 | (base << 8) | low,
-        0x4030 | (base << 8) | dst,
-        0x180F,
-        0x5040 | (dst << 8) | dst,
-        0x1800,
-        0xD040 | (low << 8) | dst,
-    )
-
-
-def msb_mask_words(src: int, scratch: int, dst: int) -> tuple[int, ...]:
-    return (
-        0x00C0 | (src << 8) | scratch,
-        0xB030 | scratch,
-        0x8000,
-        0x7000 | (dst << 8) | dst,
-        0xE330 | dst,
-    )
-
-
-def aligned_advance_words(offset: int, base: int, dst: int) -> tuple[int, ...]:
-    return (
-        0x0E40 | offset,
-        0x0D40 | offset,
-        (offset << 8) | 0x00E0 | base,
-        0x00C0 | (base << 8) | dst,
-        0x00A0 | dst,
-        0x0001,
-        0x1F80,
-        0xF070 | dst,
-        0xFFFE,
-    )
-
-
-UNSIGNED_INDEX_WORDS = (
-    0x430C,
-    0x0FCD,
-    0x0CCE,
-    0x025D,
-    0x6E0E,
-    0x025F,
-    0x6C0C,
-    0x025F,
-    0x6C0C,
-    0x5D0F,
-    0x6E0C,
-    0x180F,
-    0x5C4C,
-    0x1800,
-    0xDF4C,
-    0x00AC,
-    0x7000,
+from tests.readability_pseudo_fixtures import (
+    UNSIGNED_INDEX_WORDS,
+    aligned_advance_words,
+    encode_words,
+    msb_mask_words,
+    signed_index_words,
+    wordpair_load_words,
 )
 
 
@@ -122,6 +57,36 @@ def evaluate_flag_expression(expr, registers: dict[str, int]):
             expr.right,
             registers,
         )
+    if operation == "LLIL_OR":
+        return evaluate_flag_expression(expr.left, registers) | evaluate_flag_expression(
+            expr.right,
+            registers,
+        )
+    if operation == "LLIL_XOR":
+        return evaluate_flag_expression(expr.left, registers) ^ evaluate_flag_expression(
+            expr.right,
+            registers,
+        )
+    if operation == "LLIL_ADD":
+        value = evaluate_flag_expression(expr.left, registers) + evaluate_flag_expression(
+            expr.right,
+            registers,
+        )
+        return value & ((1 << (expr.size * 8)) - 1)
+    if operation == "LLIL_LSL":
+        value = evaluate_flag_expression(expr.left, registers) << evaluate_flag_expression(
+            expr.right,
+            registers,
+        )
+        return value & ((1 << (expr.size * 8)) - 1)
+    if operation == "LLIL_LSR":
+        return evaluate_flag_expression(expr.left, registers) >> evaluate_flag_expression(
+            expr.right,
+            registers,
+        )
+    if operation in ("LLIL_LOW_PART", "LLIL_ZX"):
+        value = evaluate_flag_expression(expr.src, registers)
+        return value & ((1 << (expr.size * 8)) - 1)
     if operation == "LLIL_CMP_E":
         return evaluate_flag_expression(expr.left, registers) == evaluate_flag_expression(
             expr.right,
@@ -160,6 +125,17 @@ class ReadabilityPseudoSemanticTests(unittest.TestCase):
         if len(writes) != 1:
             raise AssertionError(f"expected one write to {name}, got {len(writes)}")
         return writes[0]
+
+    def _flag_values(self, il, registers: dict[str, int]) -> dict[str, bool]:
+        return {
+            name: bool(
+                evaluate_flag_expression(
+                    self._flag_write(il, name).src,
+                    registers,
+                )
+            )
+            for name in ("z", "n", "c", "v")
+        }
 
     def test_pseudos_preserve_their_register_and_flag_write_contracts(self):
         for words, expected_registers, expected_flags in PSEUDO_CONTRACTS:
@@ -207,6 +183,76 @@ class ReadabilityPseudoSemanticTests(unittest.TestCase):
                 }
                 with self.subTest(high=high_word, low=low_word):
                     self.assertEqual(actual, expected)
+
+    def test_wordpair_shift_flags_match_independent_32bit_emulation(self):
+        cases = (
+            (
+                (0x035D, 0x005C, 0x035D, 0x005C),
+                "right",
+                ("temp41", "temp42", "temp40"),
+            ),
+            (
+                (0x025C, 0x6D0D, 0x025C, 0x6D0D),
+                "left",
+                ("temp44", "temp45", "temp43"),
+            ),
+        )
+        values = (
+            (0, 0),
+            (1, 0),
+            (0x8000, 0),
+            (0xFFFF, 0),
+            (0, 1),
+            (0, 0x4000),
+            (0, 0x8000),
+            (0xFFFF, 0xFFFF),
+        )
+
+        for words, direction, temps in cases:
+            il = self._lift(words)
+            low_temp, high_temp, result_temp = temps
+            for low_word, high_word in values:
+                combined = (high_word << 16) | low_word
+                if direction == "right":
+                    result = combined >> 2
+                    expected = {
+                        "z": (result & 0xFFFF) == 0,
+                        "n": bool(result & 0x8000),
+                        "c": bool(combined & 0x2),
+                        "v": False,
+                    }
+                else:
+                    result = (combined << 2) & 0xFFFFFFFF
+                    expected = {
+                        "z": ((result >> 16) & 0xFFFF) == 0,
+                        "n": bool(result & 0x80000000),
+                        "c": bool(combined & 0x40000000),
+                        "v": bool(combined & 0x40000000)
+                        != bool(combined & 0x20000000),
+                    }
+                registers = {
+                    low_temp: low_word,
+                    high_temp: high_word,
+                    result_temp: result,
+                }
+                with self.subTest(
+                    direction=direction,
+                    low=low_word,
+                    high=high_word,
+                ):
+                    self.assertEqual(self._flag_values(il, registers), expected)
+
+    def test_pointer_updates_use_clean_twenty_bit_addition(self):
+        cases = (
+            (wordpair_load_words(10, 14, 12), 1),
+            (aligned_advance_words(14, 12, 15), 2),
+        )
+
+        for words, expected_adds in cases:
+            with self.subTest(first_word=f"{words[0]:#06x}"):
+                il_text = "\n".join(str(instruction) for instruction in self._lift(words))
+                self.assertEqual(il_text.count("add20"), expected_adds)
+                self.assertNotIn("0xfffff", il_text.lower())
 
 
 if __name__ == "__main__":
