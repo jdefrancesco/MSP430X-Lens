@@ -2308,6 +2308,29 @@ class MSP430XArchitecture(Architecture):
     def _bit_flag_expr(self, il, size: int, value, bit: int):
         return il.compare_not_equal(size, il.and_expr(size, value, il.const(size, 1 << bit)), il.const(size, 0))
 
+    def _set_wordpair20_load_flags(self, il, high_word) -> None:
+        """Preserve the flags from ``RPT #16; ADDX.A high,high``.
+
+        The following BISX.A combines the low word without changing flags.
+        After sixteen 20-bit doublings, the result uses input bits 3:0,
+        carry is input bit 4, and overflow compares input bits 4 and 3.
+        """
+
+        negative = self._bit_flag_expr(il, 2, high_word, 3)
+        carry = self._bit_flag_expr(il, 2, high_word, 4)
+        self._set_flag(
+            il,
+            "z",
+            il.compare_equal(
+                2,
+                il.and_expr(2, high_word, il.const(2, 0xF)),
+                il.const(2, 0),
+            ),
+        )
+        self._set_flag(il, "n", negative)
+        self._set_flag(il, "c", carry)
+        self._set_flag(il, "v", il.compare_not_equal(0, carry, negative))
+
     def _lift_compact_shift(self, il, ins: Decoded) -> None:
         """Lift compact CPUX shifts and their final architectural flags."""
 
@@ -2943,7 +2966,7 @@ class MSP430XArchitecture(Architecture):
             self._write_reg_value(il, ins.imm, 2, low)
             self._write_operand(il, ins.dst, 4, value)
             self._write_reg_value(il, ins.src.reg, 4, il.add(4, base, il.const(4, 4)))
-            self._set_logic_flags(il, 4, value, masked=True)
+            self._set_wordpair20_load_flags(il, high)
             return
 
         if ins.mnemonic == "lsr32.w":
