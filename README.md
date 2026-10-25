@@ -167,6 +167,59 @@ After installing or changing plugin registration code:
 If the options dialog shows ARM/Thumb, close that view and reopen with the
 exact MSP430F5438 view type. The generic firmware loader is not this plugin.
 
+## Reading MSP430X Intrinsics
+
+Pseudo C may contain names such as `sxtidx6w`, `load20`, or `rpt_rrcx20`.
+These are Binary Ninja intrinsics emitted by MSP430X Lens, not calls to hidden
+firmware functions. They give one readable name to an exact instruction or a
+recognized compiler sequence that would otherwise expand into carry chains,
+flag temporaries, and repeated 20-bit masks. Adjacent IL still models any
+register writes, memory effects, or flags that matter.
+
+Read the common name parts as follows:
+
+- `b` means an 8-bit byte and `w` means a 16-bit word.
+- `20` means an MSP430X 20-bit address-width value. Binary Ninja carries that
+  value in a 32-bit IL container; it does not make the operation 32-bit.
+- `rpt_` means the CPUX `RPT` prefix was folded into one operation. The `count`
+  argument is the number of executions, and hidden additional results preserve
+  the final carry/overflow state when required.
+- The `x` in `rrcx`, `rrax`, and `rrux` is the CPUX extended-instruction name;
+  it does not mean multiplication or an unknown value.
+- Local pseudo-instructions use assembly-style dots, such as `sxtidx6.w`, while
+  their intrinsic identifiers omit the dot, such as `sxtidx6w`.
+
+| Intrinsic | Read it as |
+| --- | --- |
+| `sxtidx6w(value, bias)` | Compute the low-word expression `value * 6 + bias`, wrap it to 16 bits, then sign-extend that word into a 20-bit MSP430X value. For example, `r12 = sxtidx6w(r14, 0x24)` is a signed scale-by-six table index plus `0x24`, not a function call. |
+| `idx6w(value)` | Zero-extend the input word and multiply it by six to form an unsigned 20-bit table index. |
+| `sext20w(value)` | Sign-extend the low 16-bit word into the 20-bit register form. |
+| `sra20(value, count)` | Arithmetic-right-shift a signed 20-bit value by `count`, using bit 19 as the sign bit. |
+| `swpbw(value)` / `swpb20(value)` | Swap the two bytes of the low word; the `20` form also preserves address bits 19:16. |
+| `wordpair20w(low, high)` | Rebuild an address word as the low 16 bits plus the low nibble of `high` in bits 19:16. This is the value-producing part of the local `ld20.w` pseudo-instruction. |
+| `lsr32w(low, high, count)` / `lsl32w(...)` | Join the word pair as `high:low`, perform a logical 32-bit shift, and return the shifted pair. These summarize repeated carry propagation through `R13:R12`. |
+| `msbmaskw(value)` | Expand word bit 15 into a full word: `0xffff` when set, otherwise `0`. |
+| `align2_20(value)` | Clear bit 0 of a 20-bit value, rounding it down to an even address. In `advptr20.w`, it is applied after adding one, which rounds the pointer up to even alignment. |
+| `load20(addr)` / `store20(addr, value)` | Read or write the MSP430X address-word memory layout: a low word at `addr` and address bits 19:16 in the following word. These are not ordinary 32-bit memory accesses. |
+| `mmio_read8/16/20(address)` | Perform a volatile hardware-register read of the named width. The explicit intrinsic prevents Binary Ninja from deleting an otherwise unused MMIO read. |
+| `daddb/daddw/dadd20(lhs, rhs, carry)` | Perform packed-BCD decimal addition at byte, word, or address width and produce both the result and final carry. |
+| `subc_self20(carry)` | The address-width `SUBC Rn,Rn` result. The old register cancels, leaving `carry - 1` modulo 20 bits: `0` when C is set and all 20 bits set when C is clear. |
+| `rpt_rrcx*`, `rpt_rrax*`, `rpt_rrux*` | Repeat rotate-right-through-carry, arithmetic-right-shift, or logical-right-shift and preserve the final carry. `*` is `b`, `w`, or `20`. |
+| `rpt_add*`, `rpt_sub*`, `rpt_xor*`, `rpt_selfadd*` | Repeat the named arithmetic/logical operation `count` times and preserve its final result and flags. `selfadd` is the common `ADD dst,dst` form. |
+| `rpt_addc*`, `rpt_subc*`, `rpt_dadd*` | Repeat a carry-chained binary or packed-BCD operation, starting with the supplied carry and feeding carry between iterations. |
+
+Some folded idioms also modify source or scratch registers. Those effects
+remain as adjacent assignments: for example, `sxtidx6.w` leaves its source word
+doubled, while `idx6.w` preserves the original helper-register writes. Such an
+assignment is part of the matched firmware sequence, not a second application
+of the intrinsic.
+
+The local pseudo-instructions and their exact side effects are documented in
+[`docs/CPUX_SIDE_EFFECT_AUDIT.md`](docs/CPUX_SIDE_EFFECT_AUDIT.md). When an
+intrinsic appears in suspicious code, use the disassembly beside Pseudo C to
+confirm the folded instruction sequence and its separately visible side
+effects.
+
 ## Workflow Notes
 
 If a suspicious `cpux 0x....` mnemonic appears in code, use
