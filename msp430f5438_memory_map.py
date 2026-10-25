@@ -4294,7 +4294,8 @@ def _address_jump_tables(data: bytes, base: int = 0) -> tuple[AddressJumpTable, 
         reg = first & 0xF
         ext = _u16_from_le(data, cursor + 4)
         if (
-            _u16_from_le(data, cursor + 2) != (0x0540 | reg)
+            reg < 4
+            or _u16_from_le(data, cursor + 2) != (0x0540 | reg)
             or not _is_address_word_ext(ext)
             or _u16_from_le(data, cursor + 6) != (0x4050 | (reg << 8))
         ):

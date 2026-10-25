@@ -393,6 +393,12 @@ def reg_name(reg: int) -> str:
     return REG_NAMES[reg & 0xF]
 
 
+def are_general_registers(*regs: int) -> bool:
+    """Return whether every register is a normal R4-R15 data register."""
+
+    return all(4 <= reg < len(REG_NAMES) for reg in regs)
+
+
 def needs_source_word(reg: int, as_bits: int) -> bool:
     if reg == 2 and as_bits in (1,):
         return True
@@ -527,7 +533,12 @@ def decode_address_instruction(words: List[int], word: int) -> Optional[Decoded]
     ins.fmt = "double"
     ins.size = 4
 
-    if mode == 0x4 and high == 0xE and len(words) >= 2:
+    if (
+        mode == 0x4
+        and high == 0xE
+        and are_general_registers(low)
+        and len(words) >= 2
+    ):
         next_word = words[1]
         next_group = (next_word >> 12) & 0xF
         next_mode = (next_word >> 4) & 0xF
@@ -621,6 +632,7 @@ def decode_scaled_index_sign_extend(words: List[int], word: int) -> Optional[Dec
     if (
         (word >> 12) != 0
         or mode != 0xC
+        or not are_general_registers(src_reg, dst_reg)
         or src_reg == dst_reg
         or words[1] != (0x0650 | dst_reg)
         or words[2] != (0x0250 | src_reg)
@@ -692,12 +704,13 @@ def decode_wordpair20_load(words: List[int], word: int) -> Optional[Decoded]:
     low_reg = word & 0xF
     dst_reg = words[1] & 0xF
     if (
-        words[1] != (0x4030 | (base_reg << 8) | dst_reg)
+        not are_general_registers(base_reg, low_reg, dst_reg)
+        or len({base_reg, low_reg, dst_reg}) != 3
+        or words[1] != (0x4030 | (base_reg << 8) | dst_reg)
         or words[2] != 0x180F
         or words[3] != (0x5040 | (dst_reg << 8) | dst_reg)
         or words[4] != 0x1800
         or words[5] != (0xD040 | (low_reg << 8) | dst_reg)
-        or low_reg == dst_reg
     ):
         return None
 
@@ -768,7 +781,8 @@ def decode_msb_mask(words: List[int], word: int) -> Optional[Decoded]:
     scratch_reg = word & 0xF
     dst_reg = words[3] & 0xF
     if (
-        words[1] != (0xB030 | scratch_reg)
+        not are_general_registers(src_reg, scratch_reg, dst_reg)
+        or words[1] != (0xB030 | scratch_reg)
         or words[2] != 0x8000
         or words[3] != (0x7000 | (dst_reg << 8) | dst_reg)
         or words[4] != (0xE330 | dst_reg)
@@ -796,7 +810,9 @@ def decode_aligned_signed_advance(words: List[int], word: int) -> Optional[Decod
     base_reg = words[2] & 0xF
     dst_reg = words[3] & 0xF
     if (
-        words[1] != (0x0D40 | offset_reg)
+        not are_general_registers(offset_reg, base_reg, dst_reg)
+        or offset_reg == base_reg
+        or words[1] != (0x0D40 | offset_reg)
         or words[2] != ((offset_reg << 8) | 0x00E0 | base_reg)
         or words[3] != (0x00C0 | (base_reg << 8) | dst_reg)
         or words[4] != (0x00A0 | dst_reg)
@@ -839,7 +855,8 @@ def decode_indexed_bra_jump_table(words: List[int], word: int, addr: int) -> Opt
     reg = word & 0xF
     ext = words[2]
     if (
-        words[1] != (0x0540 | reg)
+        not are_general_registers(reg)
+        or words[1] != (0x0540 | reg)
         or not is_ext_word(ext)
         or ext_size(ext, 1) != 4
         or words[3] != (0x4050 | (reg << 8))

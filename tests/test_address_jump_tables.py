@@ -13,6 +13,10 @@ MALFORMED_ADDRESS_JUMP_TABLE = bytes.fromhex(
     "4c 0e 4c 05 00 18 50 4c 0a 60 "
     "00 62 10 00 00 63 00 00 00 64 00 00"
 )
+SPECIAL_REGISTER_ADDRESS_JUMP_TABLE = bytes.fromhex(
+    "40 0e 40 05 00 18 50 40 0a 60 "
+    "00 62 00 00 00 63 00 00 00 64 00 00"
+)
 
 
 class AddressJumpTableTests(unittest.TestCase):
@@ -45,6 +49,23 @@ class AddressJumpTableTests(unittest.TestCase):
         self.assertEqual(
             memory_map._address_jump_tables(
                 MALFORMED_ADDRESS_JUMP_TABLE,
+                DISPATCH_ADDRESS,
+            ),
+            (),
+        )
+
+    def test_special_index_register_does_not_fold_as_a_jump_table(self):
+        instruction = architecture.decode(
+            SPECIAL_REGISTER_ADDRESS_JUMP_TABLE,
+            DISPATCH_ADDRESS,
+        )
+
+        self.assertIsNotNone(instruction)
+        self.assertNotEqual(instruction.mnemonic, "brajt.a")
+        self.assertEqual(instruction.targets, ())
+        self.assertEqual(
+            memory_map._address_jump_tables(
+                SPECIAL_REGISTER_ADDRESS_JUMP_TABLE,
                 DISPATCH_ADDRESS,
             ),
             (),
